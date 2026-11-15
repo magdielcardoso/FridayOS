@@ -1457,50 +1457,39 @@ impl Render for FridayApp {
                 paint_arc(window, cx0, cy0, 88.0 * scale, 0.0, TAU, 0.6, 0x1c050a);
                 paint_arc(window, cx0, cy0, 120.0 * scale, 200.0 + angle * 20.0, 300.0 + angle * 20.0, 3.0, 0x8a0f20);
 
-                // Emblem: hollow inverted triangle (three trapezoid segments).
-                let emblem_cy = cy0 + 15.0 * scale;
-                let top_y = emblem_cy - 43.0 * scale;
+                // Inverted hollow triangle with a notch on the top edge.
+                let emblem_cy = cy0 + 10.0 * scale;
+                let top_y = emblem_cy - 42.0 * scale;
                 let bottom_y = emblem_cy + 42.0 * scale;
                 let half = 46.0 * scale;
-                let mut builder = gpui::PathBuilder::fill();
-                builder.move_to(point(px(cx0), px(top_y)));
-                builder.line_to(point(px(cx0 - half), px(bottom_y)));
-                builder.line_to(point(px(cx0 - half + 22.0 * scale), px(bottom_y)));
-                builder.line_to(point(px(cx0), px(top_y + 30.0 * scale)));
-                builder.line_to(point(px(cx0 + half - 22.0 * scale), px(bottom_y)));
-                builder.line_to(point(px(cx0 + half), px(bottom_y)));
-                if let Ok(path) = builder.build() {
+                let mut outer = gpui::PathBuilder::fill();
+                outer.move_to(point(px(cx0), px(bottom_y)));
+                outer.line_to(point(px(cx0 - half), px(top_y)));
+                outer.line_to(point(px(cx0 + half), px(top_y)));
+                if let Ok(path) = outer.build() {
                     window.paint_path(path, rgb(bright));
                 }
                 let mut inner = gpui::PathBuilder::fill();
-                inner.move_to(point(px(cx0), px(top_y + 26.0 * scale)));
-                inner.line_to(point(px(cx0 - 16.0 * scale), px(bottom_y - 16.0 * scale)));
-                inner.line_to(point(px(cx0 + 16.0 * scale), px(bottom_y - 16.0 * scale)));
+                inner.move_to(point(px(cx0), px(bottom_y - 20.0 * scale)));
+                inner.line_to(point(px(cx0 - 24.0 * scale), px(top_y + 18.0 * scale)));
+                inner.line_to(point(px(cx0 + 24.0 * scale), px(top_y + 18.0 * scale)));
                 if let Ok(path) = inner.build() {
                     window.paint_path(path, rgb(0x030304));
                 }
+                paint_line(
+                    window,
+                    cx0,
+                    top_y,
+                    top_y + 2.0 * scale,
+                    0.0,
+                    12.0 * scale,
+                    0.0,
+                    0x030304,
+                );
             },
         )
-        .size(sx(570.0));
+        .size(sx(520.0));
 
-        let logo = canvas(
-            |_bounds, _window, _cx| {},
-            move |bounds, _, window, _cx| {
-                let x = f32::from(bounds.origin.x);
-                let y = f32::from(bounds.origin.y);
-                let w = f32::from(bounds.size.width);
-                let h = f32::from(bounds.size.height);
-                let mut builder = gpui::PathBuilder::fill();
-                builder.move_to(point(px(x), px(y)));
-                builder.line_to(point(px(x + w), px(y)));
-                builder.line_to(point(px(x + w / 2.0), px(y + h)));
-                builder.line_to(point(px(x), px(y)));
-                if let Ok(path) = builder.build() {
-                    window.paint_path(path, rgb(0xff1738));
-                }
-            },
-        )
-        .size(sx(35.0));
 
         let speech = if !self.stream.is_empty() {
             self.stream.replace('\r', "")
@@ -1563,78 +1552,12 @@ impl Render for FridayApp {
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
                 this.on_key(event, cx)
             }))
-            // Header
-            .child(
-                div()
-                    .absolute()
-                    .left(lx(35.0))
-                    .top(ly(22.0))
-                    .child(logo),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .left(lx(92.0))
-                    .top(ly(20.0))
-                    .flex()
-                    .items_center()
-                    .gap(sx(14.0))
-                    .child(
-                        div()
-                            .text_size(sx(27.0))
-                            .text_color(rgb(0xf4f4f6))
-                            .child(SharedString::from("FRIDAY")),
-                    )
-                    .child(div().w(sx(1.0)).h(sx(20.0)).bg(rgb(0x64101d)))
-                    .child(
-                        div()
-                            .font_family("SF Mono")
-                            .text_size(sx(12.0))
-                            .text_color(rgb(0x85848c))
-                            .child(SharedString::from("ASSISTENTE PESSOAL DE IA")),
-                    ),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .right(lx(36.0))
-                    .top(ly(24.0))
-                    .flex()
-                    .items_center()
-                    .gap(sx(16.0))
-                    .font_family("SF Mono")
-                    .text_size(sx(12.0))
-                    .text_color(rgb(0x85848c))
-                    .child(div().w(sx(7.0)).h(sx(7.0)).rounded_full().bg(rgb(0xff1738)))
-                    .child(SharedString::from(if self.active_app.is_empty() {
-                        "FORA"
-                    } else {
-                        "EM CASA"
-                    }))
-                    .child(SharedString::from("≋"))
-                    .child(div().w(sx(1.0)).h(sx(16.0)).bg(rgb(0x64101d)))
-                    .child(
-                        div()
-                            .text_color(rgb(0xf4f4f6))
-                            .child(SharedString::from(clock_hhmm())),
-                    )
-                    .child(SharedString::from(date_label())),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .left(lx(20.0))
-                    .right(lx(20.0))
-                    .top(ly(66.0))
-                    .h(px(1.0))
-                    .bg(rgb(0x64101d)),
-            )
             // Orb
             .child(
                 div()
                     .absolute()
-                    .left(lx(483.0))
-                    .top(ly(45.0))
+                    .left(lx(508.0))
+                    .top(ly(24.0))
                     .child(orb),
             )
             // Processing indicator (left)
@@ -1642,7 +1565,7 @@ impl Render for FridayApp {
                 div()
                     .absolute()
                     .left(lx(155.0))
-                    .top(ly(280.0))
+                    .top(ly(250.0))
                     .flex()
                     .flex_col()
                     .gap(sx(8.0))
@@ -1689,7 +1612,7 @@ impl Render for FridayApp {
                 div()
                     .absolute()
                     .left(lx(1195.0))
-                    .top(ly(204.0))
+                    .top(ly(176.0))
                     .w(sx(300.0))
                     .rounded(sx(18.0))
                     .border_1()
@@ -1735,7 +1658,7 @@ impl Render for FridayApp {
                 div()
                     .absolute()
                     .left(lx(462.0))
-                    .top(ly(580.0))
+                    .top(ly(548.0))
                     .w(sx(610.0))
                     .h(sx(82.0))
                     .rounded(sx(41.0))
@@ -1771,7 +1694,7 @@ impl Render for FridayApp {
                 div()
                     .absolute()
                     .left(lx(518.0))
-                    .top(ly(708.0))
+                    .top(ly(676.0))
                     .w(sx(500.0))
                     .h(sx(80.0))
                     .flex()
