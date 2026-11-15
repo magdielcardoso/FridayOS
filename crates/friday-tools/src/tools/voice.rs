@@ -32,8 +32,14 @@ use crate::registry::{Registry, Tool, ToolCtx, ToolError, ToolResult, ToolSpec};
 pub const SPEECH_THRESHOLD: f32 = 0.03;
 /// RMS above this while Friday is speaking triggers barge-in.
 pub const BARGE_THRESHOLD: f32 = 0.18;
-/// How many consecutive silent frames end an utterance.
-pub const SILENCE_FRAMES_TO_END: u32 = 2;
+/// Silence that ends a short command (~0.75 s).
+pub const SHORT_HANGOVER_FRAMES: u32 = 3;
+/// Silence that ends a long thought (~1.5 s), where natural pauses are common.
+pub const LONG_HANGOVER_FRAMES: u32 = 6;
+/// Utterances longer than this get the long hangover (~2 s of speech).
+pub const LONG_UTTERANCE_FRAMES: usize = 8;
+/// Kept for compatibility with callers that referenced the old constant.
+pub const SILENCE_FRAMES_TO_END: u32 = SHORT_HANGOVER_FRAMES;
 /// Hard cap on an utterance (~30 s at 16 kHz / 4096-sample frames).
 pub const MAX_FRAMES: usize = 117;
 /// Samples per VAD frame.
@@ -309,6 +315,8 @@ struct VadState {
     voiced_run: u32,
     /// Frames kept before speech starts, so the first syllable is not clipped.
     pre_roll: std::collections::VecDeque<Vec<f32>>,
+    /// Fixed hangover override (`FRIDAY_VAD_HANGOVER_MS`) for tuning without a rebuild.
+    hangover_override: Option<u32>,
 }
 
 impl VadState {
@@ -326,6 +334,10 @@ impl VadState {
             barge_capturing: false,
             voiced_run: 0,
             pre_roll: std::collections::VecDeque::with_capacity(3),
+            hangover_override: std::env::var("FRIDAY_VAD_HANGOVER_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(|ms| ((ms as f32 / 256.0).ceil() as u32).clamp(1, 10)),
         }
     }
 
@@ -388,7 +400,10 @@ impl VadState {
             self.speaking_frames = 0;
         }
 
-        let voiced = rms >= gate;
+        // Hysteresis: while already in a sentence, quieter trailing syllables
+        // still count as speech. Onset keeps the stricter gate so clicks lose.
+        let sustain = gate * 0.6;
+        let voiced = rms >= if self.in_speech { sustain } else { gate };
 
         self.pre_roll.push_back(frame.to_vec());
         while self.pre_roll.len() > 3 {
@@ -424,9 +439,17 @@ impl VadState {
             self.silence_frames += 1;
         }
 
-        // 1 s of silence (4 frames) so natural pauses do not chop a sentence
-        // into meaningless fragments that transcribe as gibberish.
-        if self.silence_frames >= 2 || self.frames_captured >= MAX_FRAMES {
+        // Short commands close quickly; longer thoughts get room for a natural
+        // pause before the endpoint. A fixed value can be forced with
+        // FRIDAY_VAD_HANGOVER_MS (e.g. 1200).
+        let hangover = self.hangover_override.unwrap_or_else(|| {
+            if self.frames_captured >= LONG_UTTERANCE_FRAMES {
+                LONG_HANGOVER_FRAMES
+            } else {
+                SHORT_HANGOVER_FRAMES
+            }
+        });
+        if self.silence_frames >= hangover || self.frames_captured >= MAX_FRAMES {
             let captured = std::mem::take(&mut self.captured);
             let frames = self.frames_captured;
             self.in_speech = false;
