@@ -1586,13 +1586,13 @@ impl Render for FridayApp {
                     .child(
                         div()
                             .relative()
+                            .size(px(560.0))
+                            .flex_none()
                             .child(orb)
                             .child(
                                 div()
                                     .absolute()
-                                    .top_0()
-                                    .left_0()
-                                    .size_full()
+                                    .inset_0()
                                     .flex()
                                     .items_center()
                                     .justify_center()
