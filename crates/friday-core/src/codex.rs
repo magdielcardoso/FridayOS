@@ -160,6 +160,8 @@ pub enum CodexEvent {
     Delta(String),
     /// Streamed reasoning summary (rendered dimmer in the UI).
     Reasoning(String),
+    /// The thread was summarized to reclaim context.
+    Compacted,
     /// A tool/command step the UI can show.
     Step {
         id: String,
@@ -179,6 +181,8 @@ enum Command {
     /// Guidance for the turn that is already running.
     Steer(String),
     Cancel,
+    /// Ask the server to summarize the thread and shrink its context.
+    Compact,
     Shutdown,
 }
 
@@ -238,6 +242,11 @@ impl Codex {
         let _ = self.tx.send(Command::Cancel);
     }
 
+    /// Summarizes the thread to reclaim context without losing the session.
+    pub fn compact(&self) {
+        let _ = self.tx.send(Command::Compact);
+    }
+
     pub fn shutdown(&self) {
         let _ = self.tx.send(Command::Shutdown);
     }
@@ -287,6 +296,25 @@ async fn supervise(
                 match commands.recv().await {
                     Some(Command::Prompt(text)) | Some(Command::Steer(text)) => break text,
                     Some(Command::Cancel) => continue,
+                    Some(Command::Compact) => {
+                        let result = session
+                            .try_request(
+                                "thread/compact/start",
+                                json!({ "threadId": session.thread_id.clone() }),
+                            )
+                            .await;
+                        match result {
+                            Ok(_) => {
+                                let _ = events.send(CodexEvent::Compacted);
+                            }
+                            Err(error) => {
+                                let _ = events.send(CodexEvent::Error(format!(
+                                    "compactação do contexto falhou: {error}"
+                                )));
+                            }
+                        }
+                        continue;
+                    }
                     Some(Command::Shutdown) | None => {
                         session.kill().await;
                         return;
@@ -356,6 +384,7 @@ async fn supervise(
                             }));
                         }
                     }
+                    TurnEvent::Cmd(Some(Command::Compact)) => {}
                     TurnEvent::Cmd(Some(Command::Cancel)) => {
                         session.kill().await;
                         let _ = events.send(CodexEvent::Done {

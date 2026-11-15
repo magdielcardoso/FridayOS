@@ -54,6 +54,27 @@ impl Tool for DiagnoseTool {
     }
 
     fn call(&self, args: &Value, _ctx: &ToolCtx) -> ToolResult {
+        if self.spec.name == "context_compact" {
+            use std::io::{BufRead, BufReader, Write};
+            let socket = data_dir().join("overlay.sock");
+            let mut stream = std::os::unix::net::UnixStream::connect(&socket)
+                .map_err(|error| ToolError::failed(format!(
+                    "a interface da Friday não está aberta: {error}"
+                )))?;
+            stream
+                .write_all(b"{\"action\":\"compact\"}\n")
+                .map_err(|error| ToolError::failed(error.to_string()))?;
+            let mut reply = String::new();
+            let _ = BufReader::new(stream).read_line(&mut reply);
+            return Ok(json!({
+                "ok": reply.contains("\"ok\":true"),
+                "note": if reply.contains("\"ok\":true") {
+                    "compactação iniciada; o resumo aparece no próximo turno"
+                } else {
+                    "a interface não confirmou a compactação"
+                }
+            }));
+        }
         let lines = args
             .get("lines")
             .and_then(|value| value.as_u64())
@@ -145,6 +166,14 @@ impl Tool for DiagnoseTool {
 }
 
 pub fn register(registry: &mut Registry) {
+    registry.add(DiagnoseTool {
+        spec: ToolSpec {
+            name: "context_compact",
+            summary: "Resume o histórico do thread do Codex para liberar contexto sem perder a sessão; útil quando a conversa fica muito longa.",
+            risk: crate::policy::Risk::Reversible,
+            args: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        },
+    });
     registry.add(DiagnoseTool {
         spec: ToolSpec {
             name: "diagnose",

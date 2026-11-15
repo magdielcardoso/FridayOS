@@ -154,6 +154,7 @@ struct OverlayRequest {
 enum OverlayMsg {
     Show(OverlayRequest),
     Graph(Vec<String>),
+    Compact,
     Close,
 }
 
@@ -1029,6 +1030,12 @@ impl FridayApp {
                                 std::time::Instant::now() + Duration::from_secs(30),
                             );
                         }
+                        OverlayMsg::Compact => {
+                            if let Some(codex) = app.codex.as_ref() {
+                                log("contexto: compactação pedida");
+                                codex.compact();
+                            }
+                        }
                         OverlayMsg::Close => close_overlays(cx),
                     }
                 }
@@ -1379,6 +1386,14 @@ impl FridayApp {
                 mobile::assistant_done(&finished, self.notify_on_done);
                 self.notify_on_done = false;
                 let _ = finished;
+            }
+            CodexEvent::Compacted => {
+                log("contexto: thread compactado");
+                trace(json!({ "event": "compacted" }));
+                self.messages.push(Line {
+                    role: Role::System,
+                    text: "contexto compactado".into(),
+                });
             }
             CodexEvent::Error(error) => {
                 mobile::assistant_error(&error);
@@ -3470,7 +3485,12 @@ fn start_overlay_daemon() {
                 .get("action")
                 .and_then(|action| action.as_str())
                 .unwrap_or("show");
-            let reply = if action == "graph" {
+            let reply = if action == "compact" {
+                if let Ok(mut inbox) = overlay_inbox().lock() {
+                    inbox.push(OverlayMsg::Compact);
+                }
+                serde_json::json!({ "ok": true, "compact": true })
+            } else if action == "graph" {
                 let highlight: Vec<String> = value
                     .get("highlight")
                     .and_then(|items| items.as_array())
