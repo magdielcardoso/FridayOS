@@ -913,6 +913,7 @@ impl FridayApp {
             model: None,
             effort: Some("low".into()),
             developer_instructions: Some(persona()),
+            resume_thread: load_thread(),
             extra_args: Vec::new(),
             env,
         };
@@ -1125,6 +1126,7 @@ impl FridayApp {
         match event {
             CodexEvent::Online { thread_id } => {
                 self.status = Status::Online;
+                save_thread(&thread_id);
                 self.thread = Some(thread_id);
                 self.stream.clear();
             }
@@ -2021,6 +2023,31 @@ impl Render for FridayApp {
                     ),
             )
     }
+}
+
+fn thread_file() -> std::path::PathBuf {
+    let home = std::env::var_os("HOME").unwrap_or_default();
+    let account = friday_core::auth::active_account().unwrap_or_else(|| "default".into());
+    std::path::PathBuf::from(home)
+        .join("Library/Application Support/FridayOS")
+        .join(format!("thread-{account}.json"))
+}
+
+fn load_thread() -> Option<String> {
+    let raw = std::fs::read_to_string(thread_file()).ok()?;
+    serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()?
+        .get("id")?
+        .as_str()
+        .map(str::to_string)
+}
+
+fn save_thread(id: &str) {
+    let path = thread_file();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, serde_json::json!({ "id": id }).to_string());
 }
 
 fn clock_hhmm() -> String {

@@ -121,6 +121,8 @@ pub struct CodexConfig {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub developer_instructions: Option<String>,
+    /// Thread to resume if it still exists in the local Codex store.
+    pub resume_thread: Option<String>,
     /// Extra CLI args, e.g. `-c` overrides.
     pub extra_args: Vec<String>,
     /// Environment for the Codex child (mainly `CODEX_HOME`).
@@ -136,6 +138,7 @@ impl Default for CodexConfig {
             model: None,
             effort: None,
             developer_instructions: None,
+            resume_thread: None,
             extra_args: Vec::new(),
             env: Vec::new(),
         }
@@ -478,12 +481,34 @@ impl Session {
             params["developerInstructions"] = json!(instructions);
         }
 
-        let result = session.request("thread/start", params).await?;
-        let thread_id = result
-            .pointer("/thread/id")
-            .and_then(Value::as_str)
-            .ok_or("Codex não devolveu o id da thread")?
-            .to_string();
+        let mut resumed = None;
+        if let Some(previous) = config.resume_thread.as_deref() {
+            let mut resume = json!({
+                "threadId": previous,
+                "cwd": config.cwd,
+                "approvalPolicy": "on-request",
+                "sandbox": "workspace-write"
+            });
+            if let Some(model) = config.model.as_deref().filter(|m| *m != "default") {
+                resume["model"] = json!(model);
+            }
+            if let Ok(value) = session.try_request("thread/resume", resume).await {
+                if let Some(id) = value.pointer("/thread/id").and_then(Value::as_str) {
+                    resumed = Some(id.to_string());
+                }
+            }
+        }
+
+        let thread_id = if let Some(id) = resumed {
+            id
+        } else {
+            let result = session.request("thread/start", params).await?;
+            result
+                .pointer("/thread/id")
+                .and_then(Value::as_str)
+                .ok_or("Codex não devolveu o id da thread")?
+                .to_string()
+        };
         session.thread_id = thread_id.clone();
         let _ = session.events.send(CodexEvent::Online { thread_id });
         Ok(session)
@@ -699,6 +724,31 @@ impl Session {
             // handle() resolves pending requests; poll the channel.
             if let Ok(result) = rx.try_recv() {
                 return Ok(result);
+            }
+        }
+    }
+
+    /// Like `request`, but returns the server error instead of emitting it.
+    async fn try_request(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        let id = self.send_request(method, params).await?;
+        let (tx, mut rx) = oneshot::channel();
+        self.pending.insert(id, tx);
+        loop {
+            match self.next_message().await? {
+                Some(message) => {
+                    if message.get("id").and_then(Value::as_u64) == Some(id) {
+                        if let Some(error) = message.get("error") {
+                            return Err(error
+                                .get("message")
+                                .and_then(Value::as_str)
+                                .unwrap_or("erro")
+                                .to_string());
+                        }
+                        return Ok(message.get("result").cloned().unwrap_or(Value::Null));
+                    }
+                    self.handle(message).await;
+                }
+                None => return Err("processo encerrado".into()),
             }
         }
     }
