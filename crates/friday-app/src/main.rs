@@ -370,6 +370,8 @@ struct FridayApp {
     graph_points: Vec<(f32, f32)>,
     graph_edges: Vec<(u32, u32)>,
     last_answer: String,
+    assistant_selected: Option<String>,
+    assistant_busy: bool,
     warming: bool,
     prewarmed: bool,
     last_activity: std::time::Instant,
@@ -421,6 +423,8 @@ impl FridayApp {
             graph_points: Vec::new(),
             graph_edges: Vec::new(),
             last_answer: String::new(),
+            assistant_selected: None,
+            assistant_busy: false,
             warming: false,
             prewarmed: false,
             last_activity: std::time::Instant::now(),
@@ -1234,6 +1238,40 @@ impl FridayApp {
         }
     }
 
+    fn send_to_assistant(&mut self, name: String, task: String, cx: &mut Context<Self>) {
+        self.assistant_busy = true;
+        self.last_answer = format!("→ {name}: {task}");
+        Self::blocking(
+            cx,
+            move || {
+                let registry = friday_tools::Registry::with_defaults();
+                let ctx = friday_tools::ToolCtx::new(friday_tools::AuditLog::discover());
+                registry.call(
+                    "assistant_task",
+                    &serde_json::json!({ "name": name, "task": task }),
+                    &ctx,
+                )
+            },
+            |app, result, cx| {
+                app.assistant_busy = false;
+                match result {
+                    Ok(value) => {
+                        let answer = value
+                            .get("answer")
+                            .and_then(|answer| answer.as_str())
+                            .unwrap_or("(sem resposta)")
+                            .to_string();
+                        app.last_answer = format!("◆ {}", answer);
+                    }
+                    Err(error) => {
+                        app.last_answer = format!("⚠ {error}");
+                    }
+                }
+                cx.notify();
+            },
+        );
+    }
+
     fn push_activity(&mut self, label: impl Into<String>, state: StepState) {
         let label = label.into();
         self.activity.push(Activity {
@@ -1248,6 +1286,17 @@ impl FridayApp {
 
     fn submit(&mut self, cx: &mut Context<Self>) {
         let text = self.input.trim().to_string();
+        if let Some(name) = self.assistant_selected.clone() {
+            if text.is_empty() {
+                self.assistant_selected = None;
+                cx.notify();
+                return;
+            }
+            self.input.clear();
+            self.assistant_selected = None;
+            self.send_to_assistant(name, text, cx);
+            return;
+        }
         if self.warming {
             if !text.is_empty() {
                 self.external_pending.push_back(("você".into(), text));
@@ -1638,7 +1687,7 @@ impl Render for FridayApp {
                     .child(corner_wave),
             )
             // Transient command line (only while typing, no permanent field)
-            .when(!self.input.is_empty(), |root| {
+            .when(!self.input.is_empty() || self.assistant_selected.is_some(), |root| {
                 root.child(
                     div()
                         .absolute()
@@ -1648,11 +1697,79 @@ impl Render for FridayApp {
                         .text_size(sx(13.0))
                         .text_color(rgb(0xff3448))
                         .child(SharedString::from(format!(
-                            "› {}{}",
+                            "{}› {}{}",
+                            self.assistant_selected
+                                .as_ref()
+                                .map(|name| format!("→ {name}  "))
+                                .unwrap_or_default(),
                             self.input,
                             if self.blink { "█" } else { " " }
                         ))),
                 )
+            })
+            // Subagents (bottom-right, clickable)
+            .when(!self.assistants.is_empty(), |root| {
+                let mut panel = div()
+                    .absolute()
+                    .right(lx(28.0))
+                    .bottom(ly(28.0))
+                    .w(sx(230.0))
+                    .flex()
+                    .flex_col()
+                    .gap(sx(6.0))
+                    .p(sx(12.0))
+                    .border_1()
+                    .border_color(rgb(0x3b0d0d))
+                    .rounded(sx(10.0))
+                    .bg(rgba(0x080608f0))
+                    .child(
+                        div()
+                            .font_family("SF Mono")
+                            .text_size(sx(9.0))
+                            .text_color(rgb(0x8a1c1c))
+                            .child(SharedString::from(if self.assistant_busy {
+                                "SUBAGENTES · trabalhando…"
+                            } else {
+                                "SUBAGENTES · clique para escrever"
+                            })),
+                    );
+                for (name, role) in self.assistants.iter().take(6) {
+                    let target = name.clone();
+                    panel = panel.child(
+                        div()
+                            .id(SharedString::from(format!("agent-{name}")))
+                            .flex()
+                            .justify_between()
+                            .gap(sx(8.0))
+                            .px(sx(6.0))
+                            .py(sx(4.0))
+                            .rounded(sx(4.0))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgba(0x1a0505ff)))
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(move |this, _, window, cx| {
+                                    this.assistant_selected = Some(target.clone());
+                                    this.input.clear();
+                                    window.focus(&this.focus);
+                                    cx.notify();
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(sx(11.0))
+                                    .text_color(rgb(0xff1738))
+                                    .child(SharedString::from(format!("◇ {name}"))),
+                            )
+                            .child(
+                                div()
+                                    .text_size(sx(9.0))
+                                    .text_color(rgb(0x5e1414))
+                                    .child(SharedString::from(role.clone())),
+                            ),
+                    );
+                }
+                root.child(panel)
             })
             // Orb
             .child(
