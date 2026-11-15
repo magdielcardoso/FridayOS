@@ -222,7 +222,7 @@ fn glitch(text: &str, seed: u64) -> String {
 
 
 impl Render for OverlayView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let glitching = self.tick < 12 || self.closing;
         let title = if glitching {
             glitch(&self.title.to_uppercase(), self.tick)
@@ -289,9 +289,31 @@ impl Render for OverlayView {
                             )
                             .child(
                                 div()
-                                    .text_size(px(9.0))
-                                    .text_color(rgb(0x5e1414))
-                                    .child(SharedString::from("F.R.I.D.A.Y · HUD")),
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(10.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(9.0))
+                                            .text_color(rgb(0x5e1414))
+                                            .child(SharedString::from("F.R.I.D.A.Y · HUD")),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("overlay-close")
+                                            .px(px(6.0))
+                                            .py(px(2.0))
+                                            .rounded(px(4.0))
+                                            .cursor_pointer()
+                                            .hover(|style| style.bg(rgba(0x2a0505ff)))
+                                            .text_size(px(12.0))
+                                            .text_color(rgb(0xff3448))
+                                            .child(SharedString::from("×"))
+                                            .on_mouse_down(
+                                                gpui::MouseButton::Left,
+                                                cx.listener(|_, _, window, _| window.remove_window()),
+                                            ),
+                                    ),
                             ),
                     )
                     // Rule with ticks
@@ -372,6 +394,8 @@ struct FridayApp {
     last_answer: String,
     assistant_selected: Option<String>,
     assistant_busy: bool,
+    tasks_hidden: bool,
+    agents_hidden: bool,
     warming: bool,
     prewarmed: bool,
     last_activity: std::time::Instant,
@@ -425,6 +449,8 @@ impl FridayApp {
             last_answer: String::new(),
             assistant_selected: None,
             assistant_busy: false,
+            tasks_hidden: false,
+            agents_hidden: false,
             warming: false,
             prewarmed: false,
             last_activity: std::time::Instant::now(),
@@ -1707,12 +1733,105 @@ impl Render for FridayApp {
                         ))),
                 )
             })
+            // Pending tasks (bottom-right, clickable → overlay)
+            .when(!self.tasks_hidden, |root| {
+                let tasks: Vec<(usize, String)> = self
+                    .activity
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, activity)| activity.state == StepState::Started)
+                    .map(|(index, activity)| (index, activity.label.clone()))
+                    .collect();
+                if tasks.is_empty() {
+                    root
+                } else {
+                    let mut panel = div()
+                        .absolute()
+                        .right(lx(28.0))
+                        .bottom(ly(28.0))
+                        .w(sx(250.0))
+                        .flex()
+                        .flex_col()
+                        .gap(sx(6.0))
+                        .p(sx(12.0))
+                        .border_1()
+                        .border_color(rgb(0x3b0d0d))
+                        .rounded(sx(10.0))
+                        .bg(rgba(0x080608f0))
+                        .child(
+                            div()
+                                .flex()
+                                .justify_between()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .font_family("SF Mono")
+                                        .text_size(sx(9.0))
+                                        .text_color(rgb(0xff7a1f))
+                                        .child(SharedString::from(format!(
+                                            "TAREFAS · {}",
+                                            tasks.len()
+                                        ))),
+                                )
+                                .child(
+                                    div()
+                                        .id("tasks-close")
+                                        .cursor_pointer()
+                                        .px(sx(4.0))
+                                        .text_size(sx(11.0))
+                                        .text_color(rgb(0x8a1c1c))
+                                        .child(SharedString::from("×"))
+                                        .on_mouse_down(
+                                            gpui::MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.tasks_hidden = true;
+                                                cx.notify();
+                                            }),
+                                        ),
+                                ),
+                        );
+                    for (_, label) in tasks.iter().take(5) {
+                        let body = label.clone();
+                        panel = panel.child(
+                            div()
+                                .id(SharedString::from(format!("task-{}", label.len())))
+                                .px(sx(6.0))
+                                .py(sx(4.0))
+                                .rounded(sx(4.0))
+                                .cursor_pointer()
+                                .hover(|style| style.bg(rgba(0x1a0505ff)))
+                                .text_size(sx(10.0))
+                                .text_color(rgb(0xff8a32))
+                                .child(SharedString::from(format!("▸ {label}")))
+                                .on_mouse_down(
+                                    gpui::MouseButton::Left,
+                                    cx.listener(move |_, _, _, cx| {
+                                        open_overlay(
+                                            cx,
+                                            OverlayRequest {
+                                                title: "Tarefa em andamento".into(),
+                                                body: body.clone(),
+                                                anchor: "center".into(),
+                                                width: 460.0,
+                                                height: 0.0,
+                                                offset_x: 0.0,
+                                                offset_y: 0.0,
+                                                seconds: 0,
+                                            },
+                                        );
+                                    }),
+                                ),
+                        );
+                    }
+                    root.child(panel)
+                }
+            })
             // Subagents (bottom-right, clickable)
-            .when(!self.assistants.is_empty(), |root| {
+            .when(!self.assistants.is_empty() && !self.agents_hidden, |root| {
                 let mut panel = div()
                     .absolute()
                     .right(lx(28.0))
-                    .bottom(ly(28.0))
+                    .bottom(ly(170.0))
                     .w(sx(230.0))
                     .flex()
                     .flex_col()
