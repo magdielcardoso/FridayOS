@@ -75,6 +75,9 @@ with a prompt that wakes you, and `routine_create` schedules prompts by
 interval, daily time, weekly time or a specific date. Use `webhook_test` and
 `routine_run_now` to validate. These run while the app is open and wake you
 without the user typing.
+While a turn is running, anything the user says is transcribed and sent with
+`turn/steer` as guidance for that same turn — treat it as an adjustment, not a
+new task, and fold it into the answer you are already producing.
 You also have: `diagnose` (read logs, list recent errors and environment
 problems), `say` (macOS speech as an explicit fallback), `memory_save` /
 `memory_list` (persistent memories that survive restarts), and the permanent
@@ -483,15 +486,6 @@ impl FridayApp {
             }
             voice::MicEvent::Utterance { path } => {
                 log(format!("mic: utterance {}", path.display()));
-                // Never start a second turn on top of the running one: drop the
-                // capture and keep the current answer going.
-                if self.status == Status::Thinking
-                    || self.voice_phase == voice::VoicePhase::Speaking
-                {
-                    self.voice_phase = voice::VoicePhase::Listening;
-                    cx.notify();
-                    return;
-                }
                 self.level = 0.0;
                 self.voice_phase = voice::VoicePhase::Transcribing;
                 cx.notify();
@@ -503,18 +497,42 @@ impl FridayApp {
                         match result {
                             Ok(text) if !text.trim().is_empty() => {
                                 app.transcript = text.clone();
-                                app.messages.push(Line {
-                                    role: Role::User,
-                                    text: text.clone(),
-                                });
-                                app.input.clear();
-                                app.stream.clear();
-                                app.status = Status::Thinking;
-                                app.voice_phase = voice::VoicePhase::Idle;
-                                if let Some(codex) = app.codex.as_ref() {
-                                    codex.prompt(text);
+                                let steering = app.status == Status::Thinking
+                                    || app.voice_phase == voice::VoicePhase::Speaking;
+                                if steering {
+                                    if app.voice_phase == voice::VoicePhase::Speaking {
+                                        app.stop_speech_now();
+                                    }
+                                    app.messages.push(Line {
+                                        role: Role::User,
+                                        text: format!("[orientação] {text}"),
+                                    });
+                                    app.push_activity(
+                                        "orientação enviada ao turno",
+                                        StepState::Completed,
+                                    );
+                                    if let Some(codex) = app.codex.as_ref() {
+                                        codex.steer(text);
+                                    }
+                                    app.voice_phase = if app.mic.is_some() {
+                                        voice::VoicePhase::Listening
+                                    } else {
+                                        voice::VoicePhase::Idle
+                                    };
+                                } else {
+                                    app.messages.push(Line {
+                                        role: Role::User,
+                                        text: text.clone(),
+                                    });
+                                    app.input.clear();
+                                    app.stream.clear();
+                                    app.status = Status::Thinking;
+                                    app.voice_phase = voice::VoicePhase::Idle;
+                                    if let Some(codex) = app.codex.as_ref() {
+                                        codex.prompt(text);
+                                    }
+                                    app.scroll.scroll_to_bottom();
                                 }
-                                app.scroll.scroll_to_bottom();
                             }
                             Ok(_) => {
                                 app.voice_phase = voice::VoicePhase::Listening;
@@ -532,12 +550,12 @@ impl FridayApp {
                 );
             }
             voice::MicEvent::BargeIn => {
-                if self.voice_phase == voice::VoicePhase::Speaking
-                    || self.status == Status::Thinking
-                {
-                    self.interrupt(cx);
-                    self.voice_phase = voice::VoicePhase::Listening;
-                }
+                // Stop the audio, but keep the turn alive: what the user says
+                // next is guidance for it, not a cancellation.
+                self.stop_speech_now();
+                self.voice_phase = voice::VoicePhase::Listening;
+                self.push_activity("barge-in · capturando orientação", StepState::Started);
+                cx.notify();
             }
             voice::MicEvent::Error(error) => {
                 log(format!("mic: erro {error}"));

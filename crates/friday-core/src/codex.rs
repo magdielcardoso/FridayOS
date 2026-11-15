@@ -171,6 +171,8 @@ pub enum CodexEvent {
 #[derive(Debug)]
 enum Command {
     Prompt(String),
+    /// Guidance for the turn that is already running.
+    Steer(String),
     Cancel,
     Shutdown,
 }
@@ -222,6 +224,11 @@ impl Codex {
         let _ = self.tx.send(Command::Prompt(text.into()));
     }
 
+    /// Sends guidance to the running turn instead of starting a new one.
+    pub fn steer(&self, text: impl Into<String>) {
+        let _ = self.tx.send(Command::Steer(text.into()));
+    }
+
     pub fn cancel(&self) {
         let _ = self.tx.send(Command::Cancel);
     }
@@ -254,7 +261,10 @@ async fn supervise(
             }
         };
 
-        let mut session = match Session::connect(child, stdout, stdin, &config, &events).await {
+        let (tx, rx) = mpsc::unbounded_channel::<Value>();
+        tokio::spawn(writer_task(stdin, rx));
+
+        let mut session = match Session::connect(child, stdout, tx.clone(), &config, &events).await {
             Ok(session) => session,
             Err(error) => {
                 let _ = events.send(CodexEvent::Error(error));
@@ -262,11 +272,15 @@ async fn supervise(
             }
         };
 
+        let steer_tx = tx.clone();
+        let turn_slot = session.turn_id.clone();
+        let thread_id = session.thread_id.clone();
+
         loop {
-            // Wait for a prompt, idle.
+            // Idle: wait for a prompt. A steer with no turn running becomes one.
             let text = loop {
                 match commands.recv().await {
-                    Some(Command::Prompt(text)) => break text,
+                    Some(Command::Prompt(text)) | Some(Command::Steer(text)) => break text,
                     Some(Command::Cancel) => continue,
                     Some(Command::Shutdown) | None => {
                         session.kill().await;
@@ -275,32 +289,93 @@ async fn supervise(
                 }
             };
 
-            // Run the turn, but stay responsive to cancel/shutdown.
-            tokio::select! {
-                result = session.turn(&text) => {
-                    if let Err(error) = result {
+            if let Err(error) = session.start_turn(&text).await {
+                let _ = events.send(CodexEvent::Error(error));
+                break;
+            }
+
+            enum TurnEvent {
+                Line(Result<Option<String>, String>),
+                Cmd(Option<Command>),
+            }
+
+            loop {
+                let event = {
+                    let lines = &mut session.lines;
+                    tokio::select! {
+                        line = lines.next_line() => TurnEvent::Line(line.map_err(|e| e.to_string())),
+                        command = commands.recv() => TurnEvent::Cmd(command),
+                    }
+                };
+
+                match event {
+                    TurnEvent::Line(Ok(Some(line))) => {
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+                        if let Ok(message) = serde_json::from_str::<Value>(&line) {
+                            session.handle(message).await;
+                        }
+                        if session.turn_finished {
+                            session.turn_finished = false;
+                            break;
+                        }
+                    }
+                    TurnEvent::Line(Ok(None)) => {
+                        let _ = events.send(CodexEvent::Error(
+                            "O processo do Codex foi encerrado durante o turno.".into(),
+                        ));
+                        break;
+                    }
+                    TurnEvent::Line(Err(error)) => {
                         let _ = events.send(CodexEvent::Error(error));
                         break;
                     }
-                }
-                command = commands.recv() => {
-                    match command {
-                        Some(Command::Cancel) => {
-                            session.kill().await;
-                            let _ = events.send(CodexEvent::Done { status: "interrupted".into() });
-                            break;
+                    TurnEvent::Cmd(Some(Command::Steer(text)))
+                    | TurnEvent::Cmd(Some(Command::Prompt(text))) => {
+                        // Guidance for the live turn: keeps the context intact.
+                        let turn_id = turn_slot
+                            .lock()
+                            .ok()
+                            .and_then(|slot| slot.clone());
+                        if let Some(turn_id) = turn_id {
+                            let _ = steer_tx.send(json!({
+                                "jsonrpc": "2.0",
+                                "id": 0,
+                                "method": "turn/steer",
+                                "params": {
+                                    "threadId": thread_id,
+                                    "expectedTurnId": turn_id,
+                                    "input": [{ "type": "text", "text": text, "text_elements": [] }]
+                                }
+                            }));
                         }
-                        Some(Command::Shutdown) | None => {
-                            session.kill().await;
-                            return;
-                        }
-                        Some(Command::Prompt(_)) => {
-                            // A new prompt while a turn is running: drop it, the UI
-                            // only allows one turn at a time.
-                        }
+                    }
+                    TurnEvent::Cmd(Some(Command::Cancel)) => {
+                        session.kill().await;
+                        let _ = events.send(CodexEvent::Done {
+                            status: "interrupted".into(),
+                        });
+                        break;
+                    }
+                    TurnEvent::Cmd(Some(Command::Shutdown)) | TurnEvent::Cmd(None) => {
+                        session.kill().await;
+                        return;
                     }
                 }
             }
+        }
+    }
+}
+
+async fn writer_task(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<Value>) {
+    while let Some(message) = rx.recv().await {
+        let Ok(mut line) = serde_json::to_vec(&message) else {
+            continue;
+        };
+        line.push(b'\n');
+        if stdin.write_all(&line).await.is_err() {
+            break;
         }
     }
 }
@@ -340,7 +415,8 @@ async fn launch(config: &CodexConfig) -> Result<Parts, String> {
 struct Session {
     child: Child,
     lines: Lines<BufReader<ChildStdout>>,
-    stdin: ChildStdin,
+    tx: mpsc::UnboundedSender<Value>,
+    turn_id: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     next_id: u64,
     pending: HashMap<u64, oneshot::Sender<Value>>,
     thread_id: String,
@@ -355,14 +431,15 @@ impl Session {
     async fn connect(
         child: Child,
         lines: Lines<BufReader<ChildStdout>>,
-        stdin: ChildStdin,
+        tx: mpsc::UnboundedSender<Value>,
         config: &CodexConfig,
         events: &mpsc::UnboundedSender<CodexEvent>,
     ) -> Result<Self, String> {
         let mut session = Self {
             child,
             lines,
-            stdin,
+            tx,
+            turn_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
             next_id: 0,
             pending: HashMap::new(),
             thread_id: String::new(),
@@ -412,7 +489,7 @@ impl Session {
         Ok(session)
     }
 
-    async fn turn(&mut self, text: &str) -> Result<(), String> {
+    async fn start_turn(&mut self, text: &str) -> Result<(), String> {
         let mut params = json!({
             "threadId": self.thread_id,
             "input": [{ "type": "text", "text": text, "text_elements": [] }],
@@ -429,21 +506,14 @@ impl Session {
         if let Some(effort) = configured_reasoning_effort().or_else(|| self.turn_effort.clone()) {
             params["effort"] = json!(effort);
         }
+        self.turn_finished = false;
+        if let Ok(mut slot) = self.turn_id.lock() {
+            *slot = None;
+        }
         let id = self.send_request("turn/start", params).await?;
         let (tx, _rx) = oneshot::channel();
         self.pending.insert(id, tx);
-
-        // Drain notifications until the turn completes.
-        loop {
-            match self.next_message().await? {
-                Some(message) => self.handle(message).await,
-                None => return Err("O processo do Codex foi encerrado durante o turno.".into()),
-            }
-            if self.turn_finished {
-                self.turn_finished = false;
-                return Ok(());
-            }
-        }
+        Ok(())
     }
 
     async fn handle(&mut self, message: Value) {
@@ -555,7 +625,17 @@ impl Session {
                         }
                     }
                 }
+                "turn/started" => {
+                    if let Some(id) = params.pointer("/turn/id").and_then(Value::as_str) {
+                        if let Ok(mut slot) = self.turn_id.lock() {
+                            *slot = Some(id.to_string());
+                        }
+                    }
+                }
                 "turn/completed" => {
+                    if let Ok(mut slot) = self.turn_id.lock() {
+                        *slot = None;
+                    }
                     let status = params
                         .pointer("/turn/status")
                         .and_then(Value::as_str)
@@ -637,12 +717,9 @@ impl Session {
     }
 
     async fn write(&mut self, message: &Value) -> Result<(), String> {
-        let mut line = serde_json::to_vec(message).map_err(|e| e.to_string())?;
-        line.push(b'\n');
-        self.stdin
-            .write_all(&line)
-            .await
-            .map_err(|e| format!("Falha escrevendo no Codex: {e}"))
+        self.tx
+            .send(message.clone())
+            .map_err(|_| "O processo do Codex foi encerrado.".to_string())
     }
 
     async fn kill(&mut self) {

@@ -303,6 +303,8 @@ struct VadState {
     calibrated: u32,
     /// Frames elapsed since Friday started speaking (echo guard).
     speaking_frames: u32,
+    /// Set once a barge-in opened a capture while Friday was speaking.
+    barge_capturing: bool,
     /// Consecutive voiced frames, so a single click does not open an utterance.
     voiced_run: u32,
     /// Frames kept before speech starts, so the first syllable is not clipped.
@@ -321,6 +323,7 @@ impl VadState {
             noise: 0.02,
             calibrated: 0,
             speaking_frames: 0,
+            barge_capturing: false,
             voiced_run: 0,
             pre_roll: std::collections::VecDeque::with_capacity(3),
         }
@@ -354,7 +357,7 @@ impl VadState {
         // While Friday speaks, the microphone also hears her. Never treat that
         // as an utterance: only a much louder voice after a short grace period
         // counts as barge-in, so she never transcribes her own tail.
-        if speaking {
+        if speaking && !self.barge_capturing {
             self.speaking_frames += 1;
             self.in_speech = false;
             self.silence_frames = 0;
@@ -363,14 +366,27 @@ impl VadState {
             if self.speaking_frames > 6 && rms >= barge_gate {
                 if !self.barge_sent {
                     self.barge_sent = true;
+                    // Start capturing right away: the words that interrupted
+                    // Friday become the guidance for the running turn.
+                    self.barge_capturing = true;
+                    self.in_speech = true;
+                    self.silence_frames = 0;
+                    self.frames_captured = self.pre_roll.len();
+                    self.captured.clear();
+                    for pending in self.pre_roll.drain(..) {
+                        self.captured.extend_from_slice(&pending);
+                    }
                     let _ = tx.send(VoiceEvent::BargeIn);
+                    let _ = tx.send(VoiceEvent::SpeechStart);
                 }
             } else if rms < barge_gate {
                 self.barge_sent = false;
             }
             return;
         }
-        self.speaking_frames = 0;
+        if !speaking {
+            self.speaking_frames = 0;
+        }
 
         let voiced = rms >= gate;
 
@@ -417,6 +433,7 @@ impl VadState {
             self.frames_captured = 0;
             self.voiced_run = 0;
             self.barge_sent = false;
+            self.barge_capturing = false;
             // Utterances shorter than ~0.75 s are clicks, not speech.
             if frames >= 3 {
                 let _ = tx.send(VoiceEvent::SpeechEnd {
