@@ -1580,7 +1580,7 @@ impl Render for FridayApp {
         } else {
             String::new()
         };
-        let speech: String = speech.chars().take(180).collect();
+        let speech: String = speech.chars().take(130).collect();
         let show_speech = !speech.is_empty() && (speaking || busy);
 
         let mut corner_wave = div().flex().items_center().gap(sx(3.0));
@@ -1637,6 +1637,23 @@ impl Render for FridayApp {
                     .items_center()
                     .child(corner_wave),
             )
+            // Transient command line (only while typing, no permanent field)
+            .when(!self.input.is_empty(), |root| {
+                root.child(
+                    div()
+                        .absolute()
+                        .left(lx(28.0))
+                        .top(ly(812.0))
+                        .w(sx(700.0))
+                        .text_size(sx(13.0))
+                        .text_color(rgb(0xff3448))
+                        .child(SharedString::from(format!(
+                            "› {}{}",
+                            self.input,
+                            if self.blink { "█" } else { " " }
+                        ))),
+                )
+            })
             // Orb
             .child(
                 div()
@@ -1708,6 +1725,7 @@ impl Render for FridayApp {
                     .items_center()
                     .gap(sx(18.0))
                     .px(sx(28.0))
+                    .overflow_hidden()
                     .when(!show_speech, |capsule| capsule.opacity(0.35))
                     .child(
                         div()
@@ -1719,7 +1737,10 @@ impl Render for FridayApp {
                     .child(
                         div()
                             .flex_1()
+                            .w(sx(500.0))
+                            .overflow_hidden()
                             .text_size(sx(16.0))
+                            .line_height(sx(22.0))
                             .text_color(rgb(0xf4f4f6))
                             .child(SharedString::from(if speech.is_empty() {
                                 "Aguardando o senhor…".to_string()
