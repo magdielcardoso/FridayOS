@@ -41,6 +41,8 @@ the next step.
 Your answers are spoken out loud by the app: 1 to 3 short sentences, no lists,
 no markdown, no tables, no emoji. Expand only when asked.
 
+Do not emit commentary or thinking out loud. Answer directly: the first token
+you produce is spoken immediately.
 TOOLS
 A tool server named `friday` is connected and exposes the tools below. Call
 them through the MCP server; the tool names are exactly as listed.
@@ -292,14 +294,7 @@ impl FridayApp {
 
         let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
         std::thread::spawn(move || {
-            for sentence in rx {
-                if cancel.load(Ordering::Relaxed) {
-                    break;
-                }
-                if voice::speak(&sentence, &cancel).is_err() {
-                    break;
-                }
-            }
+            let _ = voice::speak_stream(rx, &cancel);
             let _ = done_tx.send(());
         });
 
@@ -461,14 +456,15 @@ impl FridayApp {
             .and_then(|exe| exe.parent().map(|dir| dir.join("friday-mcp")))
             .filter(|path| path.is_file());
 
-        let mut extra_args = Vec::new();
-        if let Some(mcp) = mcp {
-            extra_args.push("-c".to_string());
-            extra_args.push(format!(
-                "mcp_servers.friday.command=\"{}\"",
-                mcp.display()
-            ));
-        }
+        // Isolated CODEX_HOME: Friday must not inherit the user's plugins,
+        // 30 s stop-hooks or unrelated MCP servers.
+        let env = match friday_core::codex::prepare_isolated_home(mcp.as_deref()) {
+            Ok(home) => vec![(
+                "CODEX_HOME".to_string(),
+                home.display().to_string(),
+            )],
+            Err(_) => Vec::new(),
+        };
 
         // Bundled apps launch with cwd "/", which is a terrible Codex workspace.
         let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".into());
@@ -477,7 +473,8 @@ impl FridayApp {
             model: None,
             effort: Some("low".into()),
             developer_instructions: Some(persona()),
-            extra_args,
+            extra_args: Vec::new(),
+            env,
         };
 
         let mut codex = Codex::spawn(config);
@@ -890,11 +887,31 @@ fn take_sentences(buffer: &mut String) -> Vec<String> {
                 }
             }
         }
-        if cut.is_none() && buffer.chars().count() > 220 {
-            // Break long clauses at the last comma/space before the limit.
-            let take: String = buffer.chars().take(220).collect();
-            if let Some(pos) = take.rfind([',', ';', ':', ' ']) {
-                cut = Some(pos + 1);
+        if cut.is_none() {
+            // Low-latency clause flush: speak the first chunk as soon as there
+            // is a natural pause, instead of waiting for the full sentence.
+            let mut boundary = None;
+            let mut chars = 0usize;
+            for (index, ch) in buffer.char_indices() {
+                if chars >= 64 {
+                    break;
+                }
+                if matches!(ch, ',' | ';' | ':' | ' ') {
+                    boundary = Some(index + ch.len_utf8());
+                }
+                chars += 1;
+            }
+            if chars >= 24 {
+                if let Some(at) = boundary {
+                    cut = Some(at);
+                }
+            }
+            if cut.is_none() && buffer.chars().count() > 220 {
+                // Hard break for very long unpunctuated output.
+                let take: String = buffer.chars().take(220).collect();
+                if let Some(pos) = take.rfind([',', ';', ':', ' ']) {
+                    cut = Some(pos + 1);
+                }
             }
         }
         match cut {

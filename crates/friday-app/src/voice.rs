@@ -771,3 +771,126 @@ mod tests {
         assert!((out.len() as i64 - 16_000).abs() <= 1);
     }
 }
+
+/// Streaming variant used by the live call loop: sentences arrive while the
+/// model is still writing, and each one is synthesized *while the previous one
+/// plays*. That removes the dead air between sentences that a naive
+/// synthesize-then-play loop leaves behind.
+pub fn speak_stream(
+    sentences: std::sync::mpsc::Receiver<String>,
+    cancel: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    let cancel = Arc::clone(cancel);
+    if tokio::runtime::Handle::try_current().is_ok() {
+        let worker = thread::Builder::new()
+            .name("friday-tts-stream".to_string())
+            .spawn(move || stream_sentences(sentences, &cancel))
+            .map_err(|e| format!("não foi possível iniciar a voz: {e}"))?;
+        return worker
+            .join()
+            .map_err(|_| "a thread de voz falhou".to_string())?;
+    }
+    stream_sentences(sentences, &cancel)
+}
+
+fn stream_sentences(
+    sentences: std::sync::mpsc::Receiver<String>,
+    cancel: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    std::fs::create_dir_all(temp_dir())
+        .map_err(|e| format!("não foi possível criar {}: {e}", temp_dir().display()))?;
+
+    // Bounded queue: the synthesizer stays up to three sentences ahead of the
+    // speaker, so network jitter does not become audible silence.
+    let (path_tx, path_rx) = std::sync::mpsc::sync_channel::<PathBuf>(3);
+    let synth_cancel = Arc::clone(cancel);
+    let synthesizer = thread::Builder::new()
+        .name("friday-tts-synth".to_string())
+        .spawn(move || {
+            let Ok(rt) = runtime() else { return };
+            let auth = CodexAuth::discover();
+            for sentence in sentences {
+                if synth_cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                let text = sentence.trim();
+                if text.is_empty() {
+                    continue;
+                }
+                let path = match synthesize_file(&rt, &auth, text) {
+                    Ok(path) => path,
+                    Err(_) => match say_to_file(text) {
+                        Ok(path) => path,
+                        Err(_) => continue,
+                    },
+                };
+                if path_tx.send(path).is_err() {
+                    break;
+                }
+            }
+        })
+        .map_err(|e| format!("não foi possível iniciar a síntese: {e}"))?;
+
+    for path in path_rx {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = std::fs::remove_file(&path);
+            break;
+        }
+        let result = play_file(&path, cancel);
+        let _ = std::fs::remove_file(&path);
+        if result.is_err() {
+            break;
+        }
+    }
+
+    let _ = synthesizer.join();
+    Ok(())
+}
+
+fn synthesize_file(
+    rt: &tokio::runtime::Runtime,
+    auth: &CodexAuth,
+    text: &str,
+) -> Result<PathBuf, String> {
+    let pcm = rt
+        .block_on(tts::synthesize(auth, text))
+        .map_err(|e| e.to_string())?;
+    let samples: Vec<i16> = pcm
+        .mono_f32()
+        .iter()
+        .map(|s| (s.clamp(-1.0, 1.0) * 32_767.0).round() as i16)
+        .collect();
+    if samples.is_empty() {
+        return Err("áudio vazio".into());
+    }
+    let bytes = encode_pcm16_wav(&samples, pcm.sample_rate.max(8_000));
+    let path = temp_audio_path();
+    std::fs::write(&path, &bytes).map_err(|e| format!("não foi possível gravar o áudio: {e}"))?;
+    Ok(path)
+}
+
+/// Offline fallback: `say` writes an AIFF, `afconvert` normalizes it to WAV.
+fn say_to_file(text: &str) -> Result<PathBuf, String> {
+    let aiff = temp_audio_path().with_extension("aiff");
+    let status = Command::new("/usr/bin/say")
+        .arg("-o")
+        .arg(&aiff)
+        .arg(text)
+        .status()
+        .map_err(|e| format!("fallback say: {e}"))?;
+    if !status.success() {
+        return Err("fallback say falhou".into());
+    }
+    let wav = temp_audio_path();
+    let status = Command::new("/usr/bin/afconvert")
+        .args(["-f", "WAVE", "-d", "LEI16", "-c", "1"])
+        .arg(&aiff)
+        .arg(&wav)
+        .status()
+        .map_err(|e| format!("afconvert: {e}"))?;
+    let _ = std::fs::remove_file(&aiff);
+    if !status.success() {
+        return Err("afconvert falhou".into());
+    }
+    Ok(wav)
+}

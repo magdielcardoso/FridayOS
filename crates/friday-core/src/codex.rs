@@ -29,8 +29,10 @@ pub struct CodexConfig {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub developer_instructions: Option<String>,
-    /// Extra CLI args, e.g. `-c` overrides to register the Friday MCP server.
+    /// Extra CLI args, e.g. `-c` overrides.
     pub extra_args: Vec<String>,
+    /// Environment for the Codex child (mainly `CODEX_HOME`).
+    pub env: Vec<(String, String)>,
 }
 
 impl Default for CodexConfig {
@@ -43,6 +45,7 @@ impl Default for CodexConfig {
             effort: None,
             developer_instructions: None,
             extra_args: Vec::new(),
+            env: Vec::new(),
         }
     }
 }
@@ -202,6 +205,7 @@ type Parts = (Child, Lines<BufReader<ChildStdout>>, ChildStdin);
 async fn launch(config: &CodexConfig) -> Result<Parts, String> {
     let mut child = tokio::process::Command::new(CODEX_BIN)
         .args(&config.extra_args)
+        .envs(config.env.iter().map(|(key, value)| (key, value)))
         .arg("app-server")
         .arg("--stdio")
         .current_dir(&config.cwd)
@@ -523,4 +527,43 @@ fn which(bin: &str) -> Option<std::path::PathBuf> {
     std::env::split_paths(&path)
         .map(|dir| dir.join(bin))
         .find(|candidate| candidate.is_file())
+}
+
+/// Creates a clean `CODEX_HOME` for Friday: no user plugins, hooks or unrelated
+/// MCP servers, just the model settings and the Friday tool server. This is the
+/// difference between a ~5 s and a ~3 s first token on a stock Codex install.
+pub fn prepare_isolated_home(mcp_command: Option<&std::path::Path>) -> std::io::Result<std::path::PathBuf> {
+    let home = std::env::var_os("HOME").unwrap_or_default();
+    let dir = std::path::PathBuf::from(home)
+        .join("Library/Application Support/FridayOS/codex");
+    std::fs::create_dir_all(&dir)?;
+
+    let auth = crate::auth::CodexAuth::discover().path().to_path_buf();
+    let link = dir.join("auth.json");
+    if !link.exists() {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&auth, &link)?;
+        #[cfg(not(unix))]
+        std::fs::copy(&auth, &link)?;
+    }
+
+    let model = std::env::var("FRIDAY_MODEL").unwrap_or_else(|_| "gpt-6-luna".into());
+    let mut config = format!(
+        "model = \"{model}\"\n\
+         model_reasoning_effort = \"low\"\n\
+         model_reasoning_summary = \"none\"\n\
+         model_verbosity = \"low\"\n\
+         hide_agent_reasoning = true\n\
+         approval_policy = \"on-request\"\n\
+         sandbox_mode = \"workspace-write\"\n\
+         \n"
+    );
+    if let Some(command) = mcp_command {
+        config.push_str(&format!(
+            "[mcp_servers.friday]\ncommand = \"{}\"\nstartup_timeout_sec = 20\n",
+            command.display()
+        ));
+    }
+    std::fs::write(dir.join("config.toml"), config)?;
+    Ok(dir)
 }
