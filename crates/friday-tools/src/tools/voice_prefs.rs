@@ -50,7 +50,7 @@ impl Tool for VoiceTool {
                 let voice = std::env::var("FRIDAY_VOICE")
                     .ok()
                     .or_else(|| config.get("voice").and_then(Value::as_str).map(str::to_string))
-                    .unwrap_or_else(|| "viola".into());
+                    .unwrap_or_else(|| "cove".into());
                 Ok(json!({
                     "ok": true,
                     "voice": voice,
@@ -164,7 +164,7 @@ fn tool(name: &'static str, summary: &'static str, risk: crate::policy::Risk, ar
 pub fn register(registry: &mut Registry) {
     registry.add(tool(
         "voice_config",
-        "Diz qual voz do ChatGPT a Friday está usando (padrão: viola) e em que idioma.",
+        "Diz qual voz do ChatGPT a Friday está usando (padrão: cove) e em que idioma.",
         crate::policy::Risk::ReadOnly,
         json!({ "type": "object", "properties": {}, "additionalProperties": false }),
     ));
@@ -176,7 +176,7 @@ pub fn register(registry: &mut Registry) {
     ));
     registry.add(tool(
         "voice_set",
-        "Define a voz do ChatGPT usada pela Friday (ex.: viola, rio, marin).",
+        "Define a voz do ChatGPT usada pela Friday (orbit, ember, maple, juniper, breeze, cove, glimmer, vale, fathom).",
         crate::policy::Risk::Reversible,
         json!({
             "type": "object",
