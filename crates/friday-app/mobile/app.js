@@ -57,9 +57,16 @@ async function api(path, options = {}) {
 }
 
 async function checkSession() {
-  const response = await fetch('/api/session', { credentials: 'same-origin' });
+  let response = await fetch('/api/session', { credentials: 'same-origin' });
+  if (response.status === 401) {
+    // Cookie lost or expired: reuse the pairing saved in localStorage.
+    if (await autoPair()) {
+      response = await fetch('/api/session', { credentials: 'same-origin' });
+    }
+  }
   if (response.status === 401) {
     pair.classList.remove('hidden');
+    document.getElementById('code').value = storedPairCode();
     return false;
   }
   const data = await response.json();
@@ -68,18 +75,38 @@ async function checkSession() {
   return true;
 }
 
-async function pairDevice() {
-  const code = document.getElementById('code').value.trim();
+async function pairWith(code, silent = false) {
   const response = await fetch('/api/pair', {
     method: 'POST',
     credentials: 'same-origin',
     headers: { 'Content-Type': 'application/json', 'X-Friday-Request': '1' },
     body: JSON.stringify({ code }),
   });
-  if (!response.ok) { toast('código inválido'); return; }
+  if (!response.ok) {
+    localStorage.removeItem('friday_pair_code');
+    if (!silent) toast('código inválido');
+    return false;
+  }
+  localStorage.setItem('friday_pair_code', code);
   pair.classList.add('hidden');
-  toast('pareado');
+  if (!silent) toast('pareado');
   connect();
+  return true;
+}
+
+function pairDevice() {
+  const code = document.getElementById('code').value.trim();
+  return pairWith(code);
+}
+
+function storedPairCode() {
+  try { return localStorage.getItem('friday_pair_code') || ''; } catch (e) { return ''; }
+}
+
+async function autoPair() {
+  const code = storedPairCode();
+  if (!code) return false;
+  return pairWith(code, true);
 }
 
 function connect() {
@@ -221,7 +248,12 @@ async function boot() {
     try { await navigator.serviceWorker.register('/sw.js'); } catch (e) {}
   }
   const ok = await checkSession().catch(() => false);
-  if (ok) connect();
+  if (ok) {
+    pair.classList.add('hidden');
+    connect();
+  } else {
+    document.getElementById('code').value = storedPairCode();
+  }
   document.getElementById('pushBtn').onclick = enablePush;
   // Long press the brand also enables push.
   let timer = null;
