@@ -1700,6 +1700,13 @@ impl Render for FridayApp {
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
                 this.on_key(event, cx)
             }))
+            // Matrix background
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .child(matrix_background(clock)),
+            )
             // Corner voice waveform (top-left)
             .child(
                 div()
