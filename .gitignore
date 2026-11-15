@@ -5,3 +5,6 @@
 /.env
 /.dev
 /dist
+
+# Notas pessoais locais (não publicar)
+CONVERSA_MEMORIA.md
