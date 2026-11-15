@@ -624,14 +624,16 @@ pub fn prepare_isolated_home(mcp_command: Option<&std::path::Path>) -> std::io::
         .join("Library/Application Support/FridayOS/codex");
     std::fs::create_dir_all(&dir)?;
 
-    let auth = crate::auth::CodexAuth::discover().path().to_path_buf();
+    let auth = crate::auth::active_auth_path();
     let link = dir.join("auth.json");
-    if !link.exists() {
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&auth, &link)?;
-        #[cfg(not(unix))]
-        std::fs::copy(&auth, &link)?;
+    // Always refresh the link: the active account may have changed.
+    if link.symlink_metadata().is_ok() {
+        let _ = std::fs::remove_file(&link);
     }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&auth, &link)?;
+    #[cfg(not(unix))]
+    std::fs::copy(&auth, &link)?;
 
     let model = std::env::var("FRIDAY_MODEL").unwrap_or_else(|_| "gpt-6-luna".into());
     let mut config = format!(

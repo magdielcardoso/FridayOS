@@ -52,6 +52,10 @@ Risk policy, non-negotiable:
 - sensitive: ask the user out loud for permission, wait for the next turn, and
   only then retry the same call with \"__confirm\": true.
 - critical: same as sensitive, and say clearly what will be touched.
+If voice fails because of the ChatGPT hourly limit, offer to authenticate
+another Codex account: ask for permission, then call `friday__codex_login`
+(the user confirms in the browser). It activates the new account by default and
+the app reconnects by itself. `friday__codex_accounts` lists what exists.
 Never claim a result before seeing the tool output. Never invent paths, files
 or command output. If the user asks for something possible, do it instead of
 explaining how they could do it.";
@@ -98,6 +102,8 @@ struct FridayApp {
     speaking_since: Option<std::time::Instant>,
     wake: bool,
     wake_flag: Option<Arc<AtomicBool>>,
+    account: Option<String>,
+    tasks_started: bool,
     blink: bool,
     focus: FocusHandle,
     scroll: ScrollHandle,
@@ -133,6 +139,8 @@ impl FridayApp {
             speaking_since: None,
             wake: false,
             wake_flag: None,
+            account: friday_core::auth::active_account(),
+            tasks_started: false,
             blink: true,
             focus,
             scroll: ScrollHandle::new(),
@@ -558,6 +566,8 @@ impl FridayApp {
         }
         self.codex = Some(codex);
 
+        if !self.tasks_started {
+        self.tasks_started = true;
         // Caret / presence blink.
         cx.spawn(async move |this, cx| loop {
             cx.background_executor()
@@ -628,6 +638,38 @@ impl FridayApp {
             });
         })
         .detach();
+
+        // Watch for account switches made by the agent's account tools.
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_secs(2))
+                .await;
+            let current = friday_core::auth::active_account();
+            let changed = this
+                .update(cx, |app, _| {
+                    if app.account != current {
+                        app.account = current.clone();
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .unwrap_or(false);
+            if changed {
+                let _ = this.update(cx, |app, cx| {
+                    app.messages.push(Line {
+                        role: Role::System,
+                        text: format!(
+                            "conta Codex ativa: {} — reconectando",
+                            app.account.clone().unwrap_or_else(|| "padrão".into())
+                        ),
+                    });
+                    app.connect(cx);
+                });
+            }
+        })
+        .detach();
+        }
 
         self.status = Status::Connecting;
     }

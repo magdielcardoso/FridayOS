@@ -13,6 +13,62 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
+/// Friday's own data directory.
+pub fn friday_data_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default()
+        .join("Library/Application Support/FridayOS")
+}
+
+/// Where extra Codex logins live: `<data>/codex-accounts/<name>/auth.json`.
+pub fn accounts_dir() -> PathBuf {
+    friday_data_dir().join("codex-accounts")
+}
+
+pub fn active_account() -> Option<String> {
+    let raw = std::fs::read_to_string(accounts_dir().join("active")).ok()?;
+    let name = raw.trim().to_string();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+pub fn set_active_account(name: &str) -> std::io::Result<()> {
+    let dir = accounts_dir();
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("active"), name.trim())?;
+    // Keep the isolated CODEX_HOME pointing at the newly selected account.
+    let isolated = friday_data_dir().join("codex/auth.json");
+    if let Some(parent) = isolated.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let target = dir.join(name.trim()).join("auth.json");
+    if isolated.symlink_metadata().is_ok() {
+        let _ = std::fs::remove_file(&isolated);
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&target, &isolated)?;
+    Ok(())
+}
+
+/// Resolves which auth.json Friday should use right now.
+pub fn active_auth_path() -> PathBuf {
+    if let Some(name) = active_account() {
+        let candidate = accounts_dir().join(name).join("auth.json");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    let home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".codex")))
+        .unwrap_or_else(|| PathBuf::from(".codex"));
+    home.join("auth.json")
+}
+
 /// Public OAuth client id used by the Codex CLI.
 pub const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
@@ -99,13 +155,10 @@ pub struct CodexAuth {
 }
 
 impl CodexAuth {
-    /// Uses `$CODEX_HOME/auth.json`, falling back to `~/.codex/auth.json`.
+    /// Uses the active Friday account if one is selected, otherwise
+    /// `$CODEX_HOME/auth.json`, falling back to `~/.codex/auth.json`.
     pub fn discover() -> Self {
-        let home = std::env::var_os("CODEX_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".codex")))
-            .unwrap_or_else(|| PathBuf::from(".codex"));
-        Self::at(home.join("auth.json"))
+        Self::at(active_auth_path())
     }
 
     pub fn at(path: impl Into<PathBuf>) -> Self {
