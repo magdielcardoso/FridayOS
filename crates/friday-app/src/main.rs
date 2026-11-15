@@ -9,8 +9,9 @@ use std::time::Duration;
 use friday_core::codex::{Codex, CodexConfig, CodexEvent, StepState};
 use gpui::prelude::*;
 use gpui::{
-    div, px, rgb, App, Application, Bounds, Context, FocusHandle, KeyDownEvent, Render,
-    ScrollHandle, SharedString, Window, WindowBounds, WindowOptions, size,
+    canvas, div, point, px, rgb, size, App, Application, Bounds, Context, FocusHandle,
+    KeyDownEvent, PathBuilder, Render, ScrollHandle, SharedString, Window, WindowBounds,
+    WindowOptions,
 };
 
 mod voice;
@@ -21,8 +22,6 @@ const RED_SOFT: u32 = 0xff6b6b;
 const RED_DIM: u32 = 0x991f1f;
 const RED_FAINT: u32 = 0x3b0d0d;
 const BONE: u32 = 0xd9caca;
-
-const PORTRAIT: &str = include_str!("../assets/friday.txt");
 
 const BANNER: [&str; 5] = [
     " ██████  ██████  ██  ██████   █████  ██   ██",
@@ -920,30 +919,68 @@ impl Render for FridayApp {
         let clock = self.booted_at.elapsed().as_secs_f32();
         let speaking = self.voice_phase == voice::VoicePhase::Speaking;
         let busy = matches!(self.status, Status::Thinking);
+        let angle = clock * if speaking { 2.4 } else { 0.22 };
+        let pulse = if speaking {
+            1.0 + 0.055 * (clock * 7.5).sin()
+        } else {
+            1.0 + 0.012 * (clock * 0.8).sin()
+        };
 
-        // Subtle breathing: a couple of pixels of drift and a slow colour pulse.
-        // The ASCII illustration itself never changes, so it cannot "break".
-        let breathe = (clock * 0.7).sin();
-        let float_y = breathe * 3.0;
-        let float_x = (clock * 0.45).sin() * 1.5;
-        let pulse = 0.72 + 0.28 * ((clock * (if speaking { 6.5 } else { 1.1 })).sin() * 0.5 + 0.5);
-        let art_color = rgb(scale_red(pulse));
+        let orb = canvas(move |_bounds, _window, _cx| {}, move |bounds, _, window, _cx| {
+            let w = f32::from(bounds.size.width);
+            let h = f32::from(bounds.size.height);
+            let cx = f32::from(bounds.origin.x) + w / 2.0;
+            let cy = f32::from(bounds.origin.y) + h / 2.0;
+            let base = w.min(h) * 0.44 * pulse;
+            let glow = if speaking { 0x3a0d0d } else { 0x260808 };
+            let dim = if speaking { 0x8f1c1c } else { 0x5e1414 };
+            let bright = if speaking { 0xff4632 } else { 0xd92b23 };
 
-        let mut portrait = div()
-            .flex()
-            .flex_col()
-            .items_center()
-            .mt(px(float_y))
-            .ml(px(float_x));
-        for line in PORTRAIT.lines() {
-            portrait = portrait.child(
-                div()
-                    .text_size(px(8.0))
-                    .line_height(px(8.2))
-                    .text_color(art_color)
-                    .child(SharedString::from(line.to_string())),
+            // Halo.
+            paint_arc(window, cx, cy, base * 1.02, 0.0, TAU, 10.0, 0x1c0606);
+            // Outer hairline ring.
+            paint_arc(window, cx, cy, base, 0.0, TAU, 1.4, dim);
+            // Rotating segmented outer ring.
+            for i in 0..4 {
+                let start = angle + i as f32 * TAU / 4.0 + 0.16;
+                paint_arc(window, cx, cy, base * 0.965, start, start + 1.02, 6.0, bright);
+            }
+            // Dashed tick ring.
+            paint_dashed_ring(window, cx, cy, base * 0.90, 2.0, 0x6d1717);
+            // Counter-rotating middle ring with thicker slabs.
+            for i in 0..3 {
+                let start = -angle * 0.7 + i as f32 * TAU / 3.0 + 0.32;
+                paint_arc(window, cx, cy, base * 0.78, start, start + 0.95, 11.0, dim);
+            }
+            // Inner thin arcs.
+            for i in 0..3 {
+                let start = angle * 1.6 + i as f32 * TAU / 3.0;
+                paint_arc(window, cx, cy, base * 0.61, start, start + 0.55, 3.0, bright);
+            }
+            // Radial ticks around the core.
+            for i in 0..48 {
+                let t = i as f32 * TAU / 48.0 + angle * 0.35;
+                let r1 = base * 0.50;
+                let r2 = base * if i % 4 == 0 { 0.545 } else { 0.525 };
+                paint_line(window, cx, cy, r1, r2, t, 1.2, if i % 4 == 0 { dim } else { glow });
+            }
+            // Core rings.
+            paint_arc(window, cx, cy, base * 0.46, 0.0, TAU, 2.0, glow);
+            paint_arc(window, cx, cy, base * 0.34, 0.0, TAU, 1.2, glow);
+            paint_arc(window, cx, cy, base * 0.22, 0.0, TAU, 1.0, glow);
+            // LED arc on the upper left, like the reference.
+            paint_arc(
+                window,
+                cx,
+                cy,
+                base * 0.99,
+                -2.55 + angle * 0.2,
+                -2.05 + angle * 0.2,
+                4.0,
+                0x7c1a1a,
             );
-        }
+        })
+        .size(px(560.0));
 
         let answer = if !self.stream.is_empty() {
             self.stream.clone()
@@ -956,11 +993,7 @@ impl Render for FridayApp {
                 .unwrap_or_default()
         };
 
-        let mut answer_block = div()
-            .flex()
-            .flex_col()
-            .gap(px(6.0))
-            .w(px(270.0));
+        let mut answer_block = div().flex().flex_col().gap(px(6.0)).w(px(270.0));
         if !answer.is_empty() {
             answer_block = answer_block.child(
                 div()
@@ -1030,7 +1063,6 @@ impl Render for FridayApp {
                             .child(SharedString::from(status)),
                     ),
             )
-            // Overlay: Friday's words, top-left, right under her name.
             .child(
                 div()
                     .absolute()
@@ -1038,14 +1070,33 @@ impl Render for FridayApp {
                     .left(px(26.0))
                     .child(answer_block),
             )
-            // The portrait owns the centre.
             .child(
                 div()
                     .flex()
                     .flex_1()
                     .items_center()
                     .justify_center()
-                    .child(portrait),
+                    .child(
+                        div()
+                            .relative()
+                            .child(orb)
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .left_0()
+                                    .size_full()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        div()
+                                            .text_size(px(30.0))
+                                            .text_color(rgb(RED))
+                                            .child(SharedString::from("F.R.I.D.A.Y.")),
+                                    ),
+                            ),
+                    ),
             )
             .child(
                 div()
@@ -1079,11 +1130,70 @@ impl Render for FridayApp {
     }
 }
 
-fn scale_red(factor: f32) -> u32 {
-    let red = (0xff as f32 * factor.clamp(0.0, 1.0)) as u32;
-    let green = (0x2f as f32 * factor.clamp(0.0, 1.0)) as u32;
-    let blue = (0x2f as f32 * factor.clamp(0.0, 1.0)) as u32;
-    (red << 16) | (green << 8) | blue
+const TAU: f32 = std::f32::consts::TAU;
+
+fn paint_arc(
+    window: &mut Window,
+    cx: f32,
+    cy: f32,
+    radius: f32,
+    start: f32,
+    end: f32,
+    width: f32,
+    color: u32,
+) {
+    if radius <= 1.0 {
+        return;
+    }
+    let steps = ((end - start).abs() * radius / 3.0).max(10.0) as usize;
+    let mut builder = PathBuilder::stroke(px(width));
+    for index in 0..=steps {
+        let t = start + (end - start) * index as f32 / steps as f32;
+        let point = point(px(cx + radius * t.cos()), px(cy + radius * t.sin()));
+        if index == 0 {
+            builder.move_to(point);
+        } else {
+            builder.line_to(point);
+        }
+    }
+    if let Ok(path) = builder.build() {
+        window.paint_path(path, rgb(color));
+    }
+}
+
+fn paint_dashed_ring(window: &mut Window, cx: f32, cy: f32, radius: f32, width: f32, color: u32) {
+    let mut builder = PathBuilder::stroke(px(width)).dash_array(&[px(2.0), px(7.0)]);
+    let steps = 360usize;
+    for index in 0..=steps {
+        let t = index as f32 / steps as f32 * TAU;
+        let point = point(px(cx + radius * t.cos()), px(cy + radius * t.sin()));
+        if index == 0 {
+            builder.move_to(point);
+        } else {
+            builder.line_to(point);
+        }
+    }
+    if let Ok(path) = builder.build() {
+        window.paint_path(path, rgb(color));
+    }
+}
+
+fn paint_line(
+    window: &mut Window,
+    cx: f32,
+    cy: f32,
+    r1: f32,
+    r2: f32,
+    angle: f32,
+    width: f32,
+    color: u32,
+) {
+    let mut builder = PathBuilder::stroke(px(width));
+    builder.move_to(point(px(cx + r1 * angle.cos()), px(cy + r1 * angle.sin())));
+    builder.line_to(point(px(cx + r2 * angle.cos()), px(cy + r2 * angle.sin())));
+    if let Ok(path) = builder.build() {
+        window.paint_path(path, rgb(color));
+    }
 }
 
 /// Builds the capability manifesto from the live tool registry, so Friday knows
