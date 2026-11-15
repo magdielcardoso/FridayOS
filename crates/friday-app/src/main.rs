@@ -34,6 +34,12 @@ theatrical. Address the user as 'senhor' only when it fits; do not overdo it.
 You are running as a native app and do not have tools enabled yet: never claim
 to have executed commands, read files, or accessed the network. If asked for
 something that would need tools, say it is not wired yet.
+You have hands: a tool server called `friday` exposes native macOS tools.
+Before using one, consider the risk: read-only tools are free; actions that
+change things can be done directly; sensitive actions (shell commands, deleting
+files, sending messages, running AppleScript) require you to ask the user out
+loud and only then retry with `\"__confirm\": true` in the arguments.
+Never say something worked before seeing the tool result. Never invent results.
 Never use markdown tables. Keep answers short unless asked to expand.";
 
 #[derive(Clone, Copy, PartialEq)]
@@ -95,6 +101,20 @@ impl FridayApp {
     }
 
     fn connect(&mut self, cx: &mut Context<Self>) {
+        let mcp = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join("friday-mcp")))
+            .filter(|path| path.is_file());
+
+        let mut extra_args = Vec::new();
+        if let Some(mcp) = mcp {
+            extra_args.push("-c".to_string());
+            extra_args.push(format!(
+                "mcp_servers.friday.command=\"{}\"",
+                mcp.display()
+            ));
+        }
+
         let config = CodexConfig {
             cwd: std::env::current_dir()
                 .map(|p| p.display().to_string())
@@ -102,6 +122,7 @@ impl FridayApp {
             model: None,
             effort: Some("low".into()),
             developer_instructions: Some(PERSONA.into()),
+            extra_args,
         };
 
         let mut codex = Codex::spawn(config);

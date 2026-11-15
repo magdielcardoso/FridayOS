@@ -29,6 +29,8 @@ pub struct CodexConfig {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub developer_instructions: Option<String>,
+    /// Extra CLI args, e.g. `-c` overrides to register the Friday MCP server.
+    pub extra_args: Vec<String>,
 }
 
 impl Default for CodexConfig {
@@ -40,6 +42,7 @@ impl Default for CodexConfig {
             model: None,
             effort: None,
             developer_instructions: None,
+            extra_args: Vec::new(),
         }
     }
 }
@@ -198,6 +201,7 @@ type Parts = (Child, Lines<BufReader<ChildStdout>>, ChildStdin);
 
 async fn launch(config: &CodexConfig) -> Result<Parts, String> {
     let mut child = tokio::process::Command::new(CODEX_BIN)
+        .args(&config.extra_args)
         .arg("app-server")
         .arg("--stdio")
         .current_dir(&config.cwd)
