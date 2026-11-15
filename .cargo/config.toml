@@ -1,0 +1,4 @@
+[build]
+# Esta máquina é um i3 quad-core; sem limite o cargo dispara um rustc por core
+# e satura a máquina. 4 mantém o build rápido e o sistema utilizável.
+jobs = 4
