@@ -448,6 +448,8 @@ impl FridayApp {
                     self.spawn_mic_poll(cx);
                 }
                 Err(error) => {
+                    log(format!("mic: {error}"));
+                    self.status = Status::Offline;
                     self.messages.push(Line {
                         role: Role::System,
                         text: format!("microfone indisponível: {error}"),
@@ -482,7 +484,7 @@ impl FridayApp {
     fn spawn_mic_poll(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| loop {
             cx.background_executor()
-                .timer(Duration::from_millis(40))
+                .timer(Duration::from_millis(90))
                 .await;
             let events = this.update(cx, |app, _| {
                 app.mic
@@ -876,7 +878,7 @@ impl FridayApp {
         // Caret / presence blink.
         cx.spawn(async move |this, cx| loop {
             cx.background_executor()
-                .timer(Duration::from_millis(40))
+                .timer(Duration::from_millis(90))
                 .await;
             let _ = this.update(cx, |app, cx| {
                 app.tick = app.tick.wrapping_add(1);
@@ -999,7 +1001,7 @@ impl FridayApp {
             .name("friday-context".into())
             .spawn(move || loop {
                 let _ = ctx_tx.send(current_context());
-                std::thread::sleep(Duration::from_secs(3));
+                std::thread::sleep(Duration::from_secs(5));
             })
             .ok();
         cx.spawn(async move |this, cx| {
@@ -1251,6 +1253,7 @@ impl FridayApp {
                 self.interrupt(cx);
             }
             "f2" => {
+                log("tecla f2");
                 if self.mic.is_some() && self.voice_phase != voice::VoicePhase::Idle {
                     self.stop_listening(cx);
                 } else {
@@ -1512,7 +1515,7 @@ impl Render for FridayApp {
         let show_speech = !speech.is_empty() && (speaking || busy);
 
         let mut waveform = div().flex().items_center().gap(sx(3.0));
-        let bars = 64usize;
+        let bars = 32usize;
         for index in 0..bars {
             let center_distance = ((index as f32 - bars as f32 / 2.0) / (bars as f32 / 2.0)).abs();
             let envelope = (1.0 - center_distance).powf(1.4);
@@ -1550,6 +1553,10 @@ impl Render for FridayApp {
             .text_color(rgb(0xff1738))
             .font_family("SF Pro Display")
             .track_focus(&self.focus)
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, window, _| window.focus(&this.focus)),
+            )
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
                 this.on_key(event, cx)
             }))
@@ -2180,13 +2187,13 @@ fn matrix_background(clock: f32) -> impl IntoElement {
             let origin_y = f32::from(bounds.origin.y);
             let column_width = 26.0;
             let columns = (width / column_width) as usize;
-            for column in 0..columns.min(90) {
+            for column in 0..columns.min(26) {
                 let seed = ((column * 73) % 97) as f32;
                 let speed = 14.0 + seed % 26.0;
                 let span = height + 240.0;
                 let offset = (clock * speed + seed * 19.0) % span;
                 let x = origin_x + column as f32 * column_width + 6.0;
-                for row in 0..12 {
+                for row in 0..7 {
                     let y = origin_y + offset - row as f32 * 18.0;
                     if y < origin_y - 12.0 || y > origin_y + height {
                         continue;
@@ -2689,6 +2696,12 @@ fn main() {
     });
 }
 
+static CATEGORY_CACHE: OnceLock<Mutex<std::collections::HashMap<String, String>>> = OnceLock::new();
+
+fn category_cache() -> &'static Mutex<std::collections::HashMap<String, String>> {
+    CATEGORY_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
 fn current_context() -> (String, String, u8, u8) {
     let front = std::process::Command::new("/usr/bin/lsappinfo")
         .arg("front")
@@ -2735,6 +2748,11 @@ fn current_context() -> (String, String, u8, u8) {
     };
     let mut category = String::new();
     if !bundle.is_empty() {
+        if let Ok(cache) = category_cache().lock() {
+            if let Some(cached) = cache.get(&bundle) {
+                return (name, cached.clone(), cpu_usage(), ram_usage());
+            }
+        }
         let path = std::process::Command::new("/usr/bin/mdfind")
             .arg(format!("kMDItemCFBundleIdentifier == '{bundle}'"))
             .output()
@@ -2762,6 +2780,9 @@ fn current_context() -> (String, String, u8, u8) {
                 }
             }
         }
+    }
+    if let Ok(mut cache) = category_cache().lock() {
+        cache.insert(bundle, category.clone());
     }
     (name, category, cpu_usage(), ram_usage())
 }
