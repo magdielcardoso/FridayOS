@@ -29,9 +29,9 @@ use crate::policy::Risk;
 use crate::registry::{Registry, Tool, ToolCtx, ToolError, ToolResult, ToolSpec};
 
 /// RMS above this starts an utterance.
-pub const SPEECH_THRESHOLD: f32 = 0.014;
+pub const SPEECH_THRESHOLD: f32 = 0.03;
 /// RMS above this while Friday is speaking triggers barge-in.
-pub const BARGE_THRESHOLD: f32 = 0.035;
+pub const BARGE_THRESHOLD: f32 = 0.18;
 /// How many consecutive silent frames end an utterance.
 pub const SILENCE_FRAMES_TO_END: u32 = 2;
 /// Hard cap on an utterance (~30 s at 16 kHz / 4096-sample frames).
@@ -343,7 +343,7 @@ impl VadState {
 
         // Learn the room for ~1.5 s before trusting the gate: mics differ a lot
         // and a noisy fan would otherwise look like non-stop speech.
-        if self.calibrated < 6 {
+        if self.calibrated < 10 {
             self.noise = self.noise.max(rms).min(0.2);
             self.calibrated += 1;
             return;
@@ -352,7 +352,7 @@ impl VadState {
             let target = rms.clamp(0.002, 0.08);
             self.noise += (target - self.noise) * 0.04;
         }
-        let gate = (self.noise * 2.5).max(SPEECH_THRESHOLD).min(0.16);
+        let gate = (self.noise * 3.0).max(SPEECH_THRESHOLD).min(0.18);
 
         // While Friday speaks, the microphone also hears her. Never treat that
         // as an utterance: only a much louder voice after a short grace period
@@ -362,8 +362,8 @@ impl VadState {
             self.in_speech = false;
             self.silence_frames = 0;
             self.frames_captured = 0;
-            let barge_gate = (self.noise * 6.0).max(0.12);
-            if self.speaking_frames > 6 && rms >= barge_gate {
+            let barge_gate = (self.noise * 6.0).max(BARGE_THRESHOLD);
+            if self.speaking_frames > 9 && rms >= barge_gate {
                 if !self.barge_sent {
                     self.barge_sent = true;
                     // Start capturing right away: the words that interrupted
@@ -402,7 +402,7 @@ impl VadState {
             } else {
                 self.voiced_run = 0;
             }
-            if self.voiced_run >= 2 {
+            if self.voiced_run >= 3 {
                 self.in_speech = true;
                 self.silence_frames = 0;
                 self.frames_captured = self.pre_roll.len();
@@ -435,7 +435,7 @@ impl VadState {
             self.barge_sent = false;
             self.barge_capturing = false;
             // Utterances shorter than ~0.75 s are clicks, not speech.
-            if frames >= 3 {
+            if frames >= 4 {
                 let _ = tx.send(VoiceEvent::SpeechEnd {
                     captured,
                     sample_rate: TARGET_SAMPLE_RATE,
