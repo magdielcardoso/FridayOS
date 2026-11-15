@@ -27,7 +27,7 @@ use web_push::{
 const COOKIE: &str = "friday_session";
 const MAX_BODY: usize = 2_000_000;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatLine {
     pub role: String,
     pub text: String,
