@@ -22,6 +22,18 @@ fn read_config() -> Value {
 
 /// The app binary that can audition a voice; the MCP server lives in the same
 /// bundle, so look next to ourselves first.
+/// Asks the running app for the real catalog (the MCP server has no HTTP client).
+fn live_catalog() -> Option<Value> {
+    let binary = app_binary()?;
+    let output = Command::new(binary)
+        .arg("--voices")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    serde_json::from_slice(&output.stdout).ok()
+}
+
 fn app_binary() -> Option<PathBuf> {
     let mut candidates = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
