@@ -116,6 +116,7 @@ struct FridayApp {
     speech_pending: String,
     speech_batch: String,
     speech_sent_first: bool,
+    transcript: String,
     tts_stream: bool,
     speaking_since: Option<std::time::Instant>,
     wake: bool,
@@ -153,6 +154,7 @@ impl FridayApp {
             speech_pending: String::new(),
             speech_batch: String::new(),
             speech_sent_first: false,
+            transcript: String::new(),
             tts_stream: std::env::var("FRIDAY_TTS_MODE")
                 .map(|mode| mode == "stream")
                 .unwrap_or(false),
@@ -275,6 +277,7 @@ impl FridayApp {
                         log(format!("stt: {:?}", result.as_ref().map(|t| t.chars().take(80).collect::<String>())));
                         match result {
                             Ok(text) if !text.trim().is_empty() => {
+                                app.transcript = text.clone();
                                 app.messages.push(Line {
                                     role: Role::User,
                                     text: text.clone(),
@@ -1138,6 +1141,33 @@ impl Render for FridayApp {
                                     ),
                             ),
                     ),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .bottom(px(78.0))
+                    .right(px(26.0))
+                    .w(px(330.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .items_end()
+                    .when(!self.transcript.is_empty(), |block| {
+                        block
+                            .child(
+                                div()
+                                    .text_size(px(9.0))
+                                    .text_color(rgb(RED_DIM))
+                                    .child(SharedString::from("▌ VOCÊ")),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .line_height(px(14.0))
+                                    .text_color(rgb(BONE))
+                                    .child(SharedString::from(self.transcript.clone())),
+                            )
+                    }),
             )
             .child(
                 div()
