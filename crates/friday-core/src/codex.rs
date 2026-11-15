@@ -131,6 +131,13 @@ impl Default for CodexConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepState {
+    Started,
+    Completed,
+    Failed,
+}
+
 #[derive(Debug, Clone)]
 pub enum CodexEvent {
     /// Handshake + thread created, ready for turns.
@@ -139,6 +146,12 @@ pub enum CodexEvent {
     Delta(String),
     /// Streamed reasoning summary (rendered dimmer in the UI).
     Reasoning(String),
+    /// A tool/command step the UI can show.
+    Step {
+        id: String,
+        label: String,
+        state: StepState,
+    },
     /// Turn finished (completed, failed, interrupted).
     Done { status: String },
     Error(String),
@@ -464,6 +477,13 @@ impl Session {
                             self.commentary_items.insert(id.to_string());
                         }
                     }
+                    if let Some((id, label)) = step_label(&item) {
+                        let _ = self.events.send(CodexEvent::Step {
+                            id,
+                            label,
+                            state: StepState::Started,
+                        });
+                    }
                 }
                 "item/agentMessage/delta" => {
                     if let Some(delta) = params.get("delta").and_then(Value::as_str) {
@@ -491,6 +511,23 @@ impl Session {
                 }
                 "item/completed" => {
                     let item = params.get("item").cloned().unwrap_or(Value::Null);
+                    if let Some((id, label)) = step_label(&item) {
+                        let failed = item
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .map(|status| matches!(status, "failed" | "declined" | "cancelled"))
+                            .unwrap_or(false)
+                            || item.get("error").map(|e| !e.is_null()).unwrap_or(false);
+                        let _ = self.events.send(CodexEvent::Step {
+                            id,
+                            label,
+                            state: if failed {
+                                StepState::Failed
+                            } else {
+                                StepState::Completed
+                            },
+                        });
+                    }
                     if item.get("type").and_then(Value::as_str) == Some("agentMessage") {
                         // Fallback only when this item never streamed deltas.
                         let item_id = item
@@ -654,4 +691,58 @@ pub fn prepare_isolated_home(mcp_command: Option<&std::path::Path>) -> std::io::
     }
     std::fs::write(dir.join("config.toml"), config)?;
     Ok(dir)
+}
+
+/// Turns a Codex item into a short human step for the UI.
+fn step_label(item: &Value) -> Option<(String, String)> {
+    let id = item.get("id").and_then(Value::as_str)?.to_string();
+    let kind = item.get("type").and_then(Value::as_str)?;
+    let detail = |key: &str| {
+        item.get(key)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_default()
+    };
+    let label = match kind {
+        "commandExecution" => {
+            let command = detail("command");
+            let first = command.lines().next().unwrap_or("").trim().to_string();
+            if first.is_empty() {
+                "executando comando".to_string()
+            } else {
+                format!("executando · {}", truncate(&first, 60))
+            }
+        }
+        "mcpToolCall" | "dynamicToolCall" => {
+            let tool = item
+                .get("tool")
+                .or_else(|| item.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("ferramenta");
+            let server = item.get("server").and_then(Value::as_str).unwrap_or("");
+            if server.is_empty() {
+                format!("ferramenta · {tool}")
+            } else {
+                format!("{server} · {tool}")
+            }
+        }
+        "fileChange" | "patchApply" => "alterando arquivos".to_string(),
+        "webSearch" => format!("pesquisando · {}", truncate(&detail("query"), 50)),
+        "webFetch" => format!("lendo · {}", truncate(&detail("url"), 50)),
+        "imageGeneration" => "gerando imagem".to_string(),
+        "reasoning" => "raciocinando".to_string(),
+        "plan" => "planejando".to_string(),
+        _ => return None,
+    };
+    Some((id, label))
+}
+
+fn truncate(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        value.to_string()
+    } else {
+        let mut out: String = value.chars().take(max).collect();
+        out.push('…');
+        out
+    }
 }

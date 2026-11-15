@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use friday_core::codex::{Codex, CodexConfig, CodexEvent};
+use friday_core::codex::{Codex, CodexConfig, CodexEvent, StepState};
 use gpui::prelude::*;
 use gpui::{
     div, px, rgb, App, Application, Bounds, Context, FocusHandle, KeyDownEvent, Render,
@@ -76,6 +76,12 @@ enum Role {
     System,
 }
 
+struct Activity {
+    id: String,
+    label: String,
+    state: StepState,
+}
+
 struct Line {
     role: Role,
     text: String,
@@ -105,6 +111,8 @@ struct FridayApp {
     account: Option<String>,
     tasks_started: bool,
     blink: bool,
+    tick: u64,
+    activity: Vec<Activity>,
     focus: FocusHandle,
     scroll: ScrollHandle,
     booted_at: std::time::Instant,
@@ -142,6 +150,8 @@ impl FridayApp {
             account: friday_core::auth::active_account(),
             tasks_started: false,
             blink: true,
+            tick: 0,
+            activity: Vec::new(),
             focus,
             scroll: ScrollHandle::new(),
             booted_at: std::time::Instant::now(),
@@ -571,10 +581,11 @@ impl FridayApp {
         // Caret / presence blink.
         cx.spawn(async move |this, cx| loop {
             cx.background_executor()
-                .timer(Duration::from_millis(560))
+                .timer(Duration::from_millis(80))
                 .await;
             let _ = this.update(cx, |app, cx| {
-                app.blink = !app.blink;
+                app.tick = app.tick.wrapping_add(1);
+                app.blink = (app.tick / 7) % 2 == 0;
                 cx.notify();
             });
         })
@@ -690,6 +701,20 @@ impl FridayApp {
             }
             CodexEvent::Reasoning(delta) => {
                 self.reasoning.push_str(&delta);
+                if self.activity.last().map(|a| a.label.as_str()) != Some("raciocinando") {
+                    self.push_activity("raciocinando", StepState::Started);
+                }
+            }
+            CodexEvent::Step { id, label, state } => {
+                if let Some(existing) = self.activity.iter_mut().find(|item| item.id == id) {
+                    existing.label = label;
+                    existing.state = state;
+                } else {
+                    self.activity.push(Activity { id, label, state });
+                }
+                if self.activity.len() > 40 {
+                    self.activity.remove(0);
+                }
             }
             CodexEvent::Done { status } => {
                 let mut spoken = None;
@@ -732,6 +757,18 @@ impl FridayApp {
         cx.notify();
     }
 
+    fn push_activity(&mut self, label: impl Into<String>, state: StepState) {
+        let label = label.into();
+        self.activity.push(Activity {
+            id: format!("ui-{}", self.tick),
+            label,
+            state,
+        });
+        if self.activity.len() > 40 {
+            self.activity.remove(0);
+        }
+    }
+
     fn submit(&mut self, cx: &mut Context<Self>) {
         let text = self.input.trim().to_string();
         if text.is_empty() || self.status == Status::Thinking {
@@ -745,6 +782,8 @@ impl FridayApp {
         self.stream.clear();
         self.reasoning.clear();
         self.status = Status::Thinking;
+        self.activity.clear();
+        self.push_activity("enviado ao código", StepState::Completed);
 
         match self.codex.as_ref() {
             Some(codex) => codex.prompt(text),
@@ -876,133 +915,77 @@ impl FridayApp {
 impl Render for FridayApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let (status, status_color) = self.status_line();
-        let thread = self
-            .thread
-            .as_deref()
-            .map(|id| shorten(id, 18))
-            .unwrap_or_else(|| "—".into());
+        let clock = self.booted_at.elapsed().as_secs_f32();
 
-        let mut transcript = div()
-            .id("transcript")
+        let speaking = self.voice_phase == voice::VoicePhase::Speaking;
+        let busy = matches!(self.status, Status::Thinking);
+        let energy = if speaking {
+            0.55 + 0.45 * (clock * 11.0).sin().abs()
+        } else if busy {
+            0.35 + 0.15 * (clock * 3.0).sin()
+        } else {
+            0.15 + 0.05 * (clock * 0.7).sin()
+        };
+        let frame = eye_art(clock, energy, busy, speaking);
+
+        // The eye floats: slow vertical drift plus a tiny horizontal sway.
+        let float_y = (clock * 0.9).sin() * 10.0;
+        let float_x = (clock * 0.55).sin() * 7.0;
+
+        let mut eye = div()
             .flex()
             .flex_col()
-            .gap(px(16.0))
-            .flex_1()
-            .p(px(20.0))
-            .overflow_y_scroll()
-            .track_scroll(&self.scroll);
-
-        for line in &self.messages {
-            transcript = transcript.child(self.message_block(line));
-        }
-
-        if !self.stream.is_empty() {
-            transcript = transcript.child(
+            .items_center()
+            .gap(px(0.0))
+            .mt(px(26.0 + float_y))
+            .ml(px(float_x));
+        for line in frame {
+            eye = eye.child(
                 div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.0))
-                    .child(
-                        div()
-                            .text_size(px(10.0))
-                            .text_color(rgb(RED))
-                            .child(SharedString::from("▌ FRIDAY")),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(13.5))
-                            .line_height(px(21.0))
-                            .text_color(rgb(RED_SOFT))
-                            .child(SharedString::from(self.stream.clone())),
-                    ),
-            );
-        }
-
-        let mut banner = div().flex().flex_col();
-        for line in BANNER {
-            banner = banner.child(
-                div()
-                    .text_size(px(7.5))
-                    .line_height(px(9.0))
-                    .text_color(rgb(RED_DIM))
+                    .text_size(px(11.5))
+                    .line_height(px(12.0))
+                    .text_color(rgb(RED))
                     .child(SharedString::from(line)),
             );
         }
 
-        let header = div()
-            .flex()
-            .justify_between()
-            .items_start()
-            .px(px(20.0))
-            .pt(px(18.0))
-            .child(
+        let mut steps = div().flex().flex_col().gap(px(4.0)).items_center();
+        for activity in self.activity.iter().rev().take(5).rev() {
+            let (mark, color) = match activity.state {
+                StepState::Started => ("▸", RED_SOFT),
+                StepState::Completed => ("✓", RED_DIM),
+                StepState::Failed => ("✗", RED),
+            };
+            steps = steps.child(
                 div()
                     .flex()
-                    .flex_col()
                     .gap(px(8.0))
-                    .child(banner)
-                    .child(
-                        div()
-                            .text_size(px(10.0))
-                            .text_color(rgb(BONE))
-                            .child(SharedString::from("personal assistant · build 0.1.0")),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_end()
-                    .gap(px(6.0))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .text_size(px(11.0))
-                            .text_color(rgb(status_color))
-                            .child(SharedString::from(if self.status == Status::Thinking {
-                                "◉"
-                            } else {
-                                "○"
-                            }))
-                            .child(SharedString::from(status)),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(10.0))
-                            .text_color(rgb(RED_FAINT))
-                            .child(SharedString::from(format!("thread {thread}"))),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(10.0))
-                            .text_color(rgb(if self.voice_phase == voice::VoicePhase::Idle {
-                                RED_FAINT
-                            } else {
-                                RED_SOFT
-                            }))
-                            .child(SharedString::from(voice_label(self.voice_phase, self.level))),
-                    ),
+                    .text_size(px(10.0))
+                    .text_color(rgb(color))
+                    .child(SharedString::from(format!("{mark} {}", activity.label))),
             );
+        }
 
-        let divider = div().h(px(1.0)).bg(rgb(RED_FAINT)).mx(px(20.0)).mt(px(14.0));
+        let phase_line = match self.voice_phase {
+            voice::VoicePhase::Idle => "em repouso",
+            voice::VoicePhase::Listening => "ouvindo",
+            voice::VoicePhase::Transcribing => "transcrevendo",
+            voice::VoicePhase::Speaking => "falando",
+        };
+        let meter: String = (0..22)
+            .map(|i| {
+                let wave = ((i as f32 * 0.7) - clock * 9.0).sin() * 0.5 + 0.5;
+                if speaking && wave > 0.45 {
+                    '▮'
+                } else if busy && (i + (clock * 6.0) as usize) % 4 == 0 {
+                    '·'
+                } else {
+                    ' '
+                }
+            })
+            .collect();
 
-        let footer = div()
-            .flex()
-            .justify_between()
-            .px(px(20.0))
-            .py(px(8.0))
-            .border_t_1()
-            .border_color(rgb(RED_FAINT))
-            .text_size(px(9.5))
-            .text_color(rgb(RED_DIM))
-            .child(SharedString::from(format!(
-                "{} ferramentas · uptime {:>3}s",
-                self.tools,
-                self.booted_at.elapsed().as_secs()
-            )))
-            .child(SharedString::from("friday·os // black terminal // no light mode"));
+        let input_line = format!("› {}{}", self.input, if self.blink { "█" } else { " " });
 
         div()
             .flex()
@@ -1015,13 +998,88 @@ impl Render for FridayApp {
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
                 this.on_key(event, cx)
             }))
-            .child(header)
-            .child(divider)
-            .child(transcript)
-            .child(self.input_block())
-            .child(footer)
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .items_center()
+                    .px(px(24.0))
+                    .pt(px(18.0))
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(rgb(RED_DIM))
+                            .child(SharedString::from("F R I D A Y · O S")),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .text_size(px(11.0))
+                            .text_color(rgb(status_color))
+                            .child(SharedString::from(if busy { "◉" } else { "○" }))
+                            .child(SharedString::from(status)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .items_center()
+                    .justify_center()
+                    .child(eye),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(6.0))
+                    .px(px(24.0))
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(rgb(if speaking { RED } else { RED_DIM }))
+                            .child(SharedString::from(meter)),
+                    )
+                    .child(steps),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .px(px(24.0))
+                    .py(px(14.0))
+                    .border_t_1()
+                    .border_color(rgb(RED_FAINT))
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .text_color(rgb(RED))
+                            .child(SharedString::from(input_line)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_between()
+                            .text_size(px(9.5))
+                            .text_color(rgb(RED_FAINT))
+                            .child(SharedString::from(
+                                "⏎ enviar · f2 ouvir · f3 wake word · esc interromper",
+                            ))
+                            .child(SharedString::from(format!(
+                                "{} ferramentas · voz: {phase_line}",
+                                self.tools
+                            ))),
+                    ),
+            )
     }
 }
+
+
 
 /// Builds the capability manifesto from the live tool registry, so Friday knows
 /// exactly what she can do — no guesswork, no "MCP not connected".
@@ -1045,7 +1103,8 @@ fn persona() -> String {
     )
 }
 
-/// Pulls complete sentences out of a growing stream buffer.
+/// Pulls complete sentences out of a growing stream buffer, with an early
+/// clause flush so the voice can start before the answer is finished.
 fn take_sentences(buffer: &mut String) -> Vec<String> {
     let mut out = Vec::new();
     loop {
@@ -1061,8 +1120,6 @@ fn take_sentences(buffer: &mut String) -> Vec<String> {
             }
         }
         if cut.is_none() {
-            // Low-latency clause flush: speak the first chunk as soon as there
-            // is a natural pause, instead of waiting for the full sentence.
             let mut boundary = None;
             let mut chars = 0usize;
             for (index, ch) in buffer.char_indices() {
@@ -1080,7 +1137,6 @@ fn take_sentences(buffer: &mut String) -> Vec<String> {
                 }
             }
             if cut.is_none() && buffer.chars().count() > 220 {
-                // Hard break for very long unpunctuated output.
                 let take: String = buffer.chars().take(220).collect();
                 if let Some(pos) = take.rfind([',', ';', ':', ' ']) {
                     cut = Some(pos + 1);
@@ -1126,6 +1182,75 @@ fn log(message: impl AsRef<str>) {
             .unwrap_or(0);
         let _ = writeln!(file, "[{secs}] {}", message.as_ref());
     }
+}
+
+/// A big phosphor eye drawn with characters. It blinks, tracks, dilates with
+/// whatever Friday is doing and never needs an image asset.
+fn eye_art(clock: f32, energy: f32, busy: bool, speaking: bool) -> Vec<String> {
+    let width = 58usize;
+    let height = 21usize;
+    let center_x = (width as f32 - 1.0) / 2.0;
+    let center_y = (height as f32 - 1.0) / 2.0;
+
+    // Blink every ~5.5 s, quickly.
+    let blink_phase = (clock / 5.5).fract();
+    let blink = if blink_phase > 0.96 {
+        ((blink_phase - 0.96) / 0.04 * std::f32::consts::PI).sin()
+    } else {
+        0.0
+    };
+
+    let opening = (6.6 - blink * 6.0).max(0.25) * (0.85 + energy * 0.35);
+    let gaze_x = (clock * 0.35).sin() * 0.22 + (clock * 1.7).sin() * 0.03 * busy as i32 as f32;
+    let gaze_y = (clock * 0.5).cos() * 0.12 + if speaking { (clock * 9.0).sin() * 0.05 } else { 0.0 };
+    let iris_radius = (5.2 + energy * 1.6).min(opening * 0.92);
+    let pupil_radius = (2.2 + energy * 0.8).min(iris_radius * 0.62);
+
+    let mut rows = Vec::with_capacity(height);
+    for y in 0..height {
+        let mut row = String::with_capacity(width);
+        for x in 0..width {
+            let nx = (x as f32 - center_x) / (center_x - 1.0);
+            let ny = (y as f32 - center_y) / opening;
+            let span = (1.0 - nx.abs().powf(1.6)).max(0.0);
+            let inside = ny.abs() <= span;
+            let edge = (ny.abs() - span).abs() < 0.16 && nx.abs() < 0.995;
+
+            if !inside {
+                if edge && nx.abs() < 0.99 {
+                    row.push(if ny.abs() < 0.35 { '~' } else { '.' });
+                } else {
+                    row.push(' ');
+                }
+                continue;
+            }
+
+            let dx = (nx - gaze_x) * (center_x - 1.0) / 5.0;
+            let dy = (ny - gaze_y) * opening / 5.0;
+            let r = (dx * dx + dy * dy).sqrt();
+
+            let ch = if r <= pupil_radius * 0.55 {
+                '█'
+            } else if r <= pupil_radius {
+                '▓'
+            } else if r <= iris_radius {
+                if (r * 2.2 + clock * 3.0).sin() > 0.55 {
+                    '▓'
+                } else {
+                    '▒'
+                }
+            } else if r <= iris_radius + 0.9 {
+                '░'
+            } else if edge {
+                '#'
+            } else {
+                ' '
+            };
+            row.push(ch);
+        }
+        rows.push(row.trim_end().to_string());
+    }
+    rows
 }
 
 fn voice_label(phase: voice::VoicePhase, level: f32) -> String {
