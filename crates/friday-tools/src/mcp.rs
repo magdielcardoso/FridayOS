@@ -158,6 +158,7 @@ fn dispatch(registry: &Registry, line: &str) -> Outcome {
         }
         "notifications/initialized" | "initialized" => Outcome::Silent,
         "ping" => reply(id, json!({})),
+        "tools/search" => reply(id, tools_search(registry, &params)),
         "tools/list" => reply(id, tools_list(registry)),
         "tools/call" => tools_call(registry, id, &params),
         "shutdown" => match id {
@@ -186,6 +187,37 @@ fn initialize_result() -> Value {
                          sensitive/critical exigem o argumento booleano __confirm=true, e \
                          __dry_run=true pede apenas a descrição do que seria feito."
     })
+}
+
+fn tools_search(registry: &Registry, params: &Value) -> Value {
+    let query = params
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_lowercase();
+    let limit = params
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(20)
+        .min(100) as usize;
+    let tools: Vec<Value> = registry
+        .specs()
+        .into_iter()
+        .filter(|spec| {
+            query.is_empty()
+                || spec.name.to_lowercase().contains(&query)
+                || spec.summary.to_lowercase().contains(&query)
+        })
+        .take(limit)
+        .map(|spec| {
+            json!({
+                "name": spec.name,
+                "description": spec.summary,
+                "risk": spec.risk.label()
+            })
+        })
+        .collect();
+    json!({ "tools": tools })
 }
 
 fn tools_list(registry: &Registry) -> Value {

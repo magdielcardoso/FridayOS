@@ -9,7 +9,9 @@ pub mod audio;
 pub mod assistants;
 pub mod ax;
 pub mod files;
+pub mod forensics;
 pub mod input;
+pub mod knowledge;
 pub mod net;
 pub mod overlay;
 pub mod screen;
@@ -27,6 +29,7 @@ use crate::registry::Registry;
 pub fn register_all(registry: &mut Registry) {
     ax::register(registry);
     input::register(registry);
+    knowledge::register(registry);
     apps::register(registry);
     autonomy::register(registry);
     codex_accounts::register(registry);
@@ -38,6 +41,7 @@ pub fn register_all(registry: &mut Registry) {
     speech::register(registry);
     screen::register(registry);
     files::register(registry);
+    forensics::register(registry);
     net::register(registry);
     overlay::register(registry);
     voice::register(registry);

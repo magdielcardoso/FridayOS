@@ -9,6 +9,7 @@ description = "FridayOS tool layer: macOS perception/action tools, policy and au
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+friday-brain = { path = "../friday-brain" }
 thiserror.workspace = true
 cpal = "0.16"
 base64 = "0.22"

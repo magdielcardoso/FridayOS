@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/friday-core", "crates/friday-tools", "crates/friday-app"]
+members = ["crates/friday-core", "crates/friday-brain", "crates/friday-tools", "crates/friday-app"]
 
 [workspace.package]
 version = "0.1.0"
