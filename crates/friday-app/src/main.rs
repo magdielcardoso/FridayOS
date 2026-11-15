@@ -1349,22 +1349,30 @@ impl Render for FridayApp {
         })
         .size(px(560.0));
 
+        // Streamed deltas occasionally carry carriage returns; rendering them
+        // makes lines overprint each other in the HUD.
         let answer = if !self.stream.is_empty() {
-            self.stream.clone()
+            self.stream.replace('\r', "")
         } else {
             self.messages
                 .iter()
                 .rev()
                 .find(|line| line.role == Role::Friday)
-                .map(|line| line.text.clone())
+                .map(|line| line.text.replace('\r', ""))
                 .unwrap_or_default()
         };
 
         let waiting = busy || self.activity.iter().any(|a| a.state == StepState::Started);
-        let mut answer_block = div().flex().flex_col().gap(px(6.0)).w(px(270.0));
+        let mut answer_block = div()
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .w(px(320.0))
+            .overflow_hidden();
         if !answer.is_empty() {
             answer_block = answer_block.child(
                 div()
+                    .w_full()
                     .text_size(px(11.5))
                     .line_height(px(16.0))
                     .text_color(rgb(RED_SOFT))
@@ -1560,8 +1568,9 @@ impl Render for FridayApp {
             .child(
                 div()
                     .absolute()
-                    .top(px(46.0))
+                    .top(px(48.0))
                     .left(px(26.0))
+                    .w(px(320.0))
                     .child(answer_block),
             )
             .child(
