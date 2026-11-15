@@ -65,6 +65,13 @@ When the user says something like `you have total access`, confirm out loud
 (pergunte em voz alta se confirma o acesso total) and, on the next turn, call
 `friday__autonomy_set` with level `full` and `__confirm: true`. Never raise
 your own autonomy without that explicit grant.
+You also have: `diagnose` (read logs, list recent errors and environment
+problems), `say` (macOS speech as an explicit fallback), `memory_save` /
+`memory_list` (persistent memories that survive restarts), and the permanent
+assistant system (`assistant_create`, `assistant_list`, `assistant_task`,
+`assistant_delete`): create named assistants with a role and delegate work to
+them when it can run in parallel. Save durable facts with `memory_save` on your
+own initiative, briefly, without asking.
 For anything visual the user asks to SEE on screen (reports, dollar quotes,
 web research, comparisons), do not dump a wall of text: call
 `friday__overlay_show` with a short title and the body, choosing `anchor`
@@ -1435,10 +1442,33 @@ fn persona() -> String {
             spec.summary
         ));
     }
+    // Recent durable memories, so she starts every session already knowing them.
+    let mut memories = String::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        let path = std::path::PathBuf::from(home)
+            .join("Library/Application Support/FridayOS/memory.jsonl");
+        if let Ok(text) = std::fs::read_to_string(path) {
+            let lines: Vec<&str> = text.lines().filter(|line| !line.trim().is_empty()).collect();
+            let start = lines.len().saturating_sub(15);
+            for line in &lines[start..] {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+                    if let Some(content) = value.get("content").and_then(|v| v.as_str()) {
+                        memories.push_str(&format!("- {content}\n"));
+                    }
+                }
+            }
+        }
+    }
+
+    let memories = if memories.is_empty() {
+        String::new()
+    } else {
+        format!("\nMEMÓRIAS PERSISTENTES:\n{memories}")
+    };
+
     format!(
-        "{PERSONA_BASE}\n\n{} ferramentas conectadas agora (servidor `friday`):\n{}",
-        total.max(1),
-        manifest
+        "{PERSONA_BASE}\n\n{} ferramentas conectadas agora (servidor `friday`):\n{manifest}{memories}",
+        total.max(1)
     )
 }
 
