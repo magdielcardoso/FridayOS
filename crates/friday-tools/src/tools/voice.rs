@@ -303,6 +303,10 @@ struct VadState {
     calibrated: u32,
     /// Frames elapsed since Friday started speaking (echo guard).
     speaking_frames: u32,
+    /// Consecutive voiced frames, so a single click does not open an utterance.
+    voiced_run: u32,
+    /// Frames kept before speech starts, so the first syllable is not clipped.
+    pre_roll: std::collections::VecDeque<Vec<f32>>,
 }
 
 impl VadState {
@@ -317,6 +321,8 @@ impl VadState {
             noise: 0.02,
             calibrated: 0,
             speaking_frames: 0,
+            voiced_run: 0,
+            pre_roll: std::collections::VecDeque::with_capacity(3),
         }
     }
 
@@ -368,13 +374,26 @@ impl VadState {
 
         let voiced = rms >= gate;
 
+        self.pre_roll.push_back(frame.to_vec());
+        while self.pre_roll.len() > 3 {
+            self.pre_roll.pop_front();
+        }
+
         if !self.in_speech {
+            // Two voiced frames in a row (~0.5 s) before we believe it is speech.
             if voiced {
+                self.voiced_run += 1;
+            } else {
+                self.voiced_run = 0;
+            }
+            if self.voiced_run >= 2 {
                 self.in_speech = true;
                 self.silence_frames = 0;
-                self.frames_captured = 1;
+                self.frames_captured = self.pre_roll.len();
                 self.captured.clear();
-                self.captured.extend_from_slice(frame);
+                for pending in self.pre_roll.drain(..) {
+                    self.captured.extend_from_slice(&pending);
+                }
                 let _ = tx.send(VoiceEvent::SpeechStart);
             }
             return;
@@ -388,16 +407,23 @@ impl VadState {
             self.silence_frames += 1;
         }
 
-        if self.silence_frames >= SILENCE_FRAMES_TO_END || self.frames_captured >= MAX_FRAMES {
+        // 1 s of silence (4 frames) so natural pauses do not chop a sentence
+        // into meaningless fragments that transcribe as gibberish.
+        if self.silence_frames >= 4 || self.frames_captured >= MAX_FRAMES {
             let captured = std::mem::take(&mut self.captured);
+            let frames = self.frames_captured;
             self.in_speech = false;
             self.silence_frames = 0;
             self.frames_captured = 0;
+            self.voiced_run = 0;
             self.barge_sent = false;
-            let _ = tx.send(VoiceEvent::SpeechEnd {
-                captured,
-                sample_rate: TARGET_SAMPLE_RATE,
-            });
+            // Utterances shorter than ~0.75 s are clicks, not speech.
+            if frames >= 3 {
+                let _ = tx.send(VoiceEvent::SpeechEnd {
+                    captured,
+                    sample_rate: TARGET_SAMPLE_RATE,
+                });
+            }
         }
     }
 }
