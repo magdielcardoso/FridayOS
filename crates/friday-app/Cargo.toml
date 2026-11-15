@@ -9,4 +9,5 @@ description = "FridayOS desktop shell (GPUI, macOS)"
 [dependencies]
 gpui = { version = "0.2.2", features = ["runtime_shaders"] }
 friday-core = { path = "../friday-core" }
+friday-tools = { path = "../friday-tools" }
 tokio = { workspace = true }

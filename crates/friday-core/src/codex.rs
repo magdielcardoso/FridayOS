@@ -334,10 +334,24 @@ impl Session {
         let method = message.get("method").and_then(Value::as_str);
 
         if let Some(method) = method {
+            if std::env::var_os("FRIDAY_CODEX_DEBUG").is_some() {
+                eprintln!("[codex] {method} {}", message);
+            }
             let params = message.get("params").cloned().unwrap_or(Value::Null);
             // Server-initiated requests have an id: decline politely for now.
             if let Some(id) = message.get("id") {
-                let reply = if method.contains("requestApproval") {
+                let reply = if method == "mcpServer/elicitation/request" {
+                    // Codex asks the host to approve MCP tool calls. Friday's own
+                    // tool server already enforces risk + confirmation, so only
+                    // its calls are auto-accepted here.
+                    let is_friday = params
+                        .get("serverName")
+                        .and_then(Value::as_str)
+                        .map(|name| name == "friday")
+                        .unwrap_or(false);
+                    let action = if is_friday { "accept" } else { "decline" };
+                    json!({ "id": id, "result": { "action": action, "content": {} } })
+                } else if method.contains("requestApproval") {
                     json!({ "id": id, "result": { "decision": "decline" } })
                 } else if method.contains("requestPermissions") {
                     json!({ "id": id, "result": { "permissions": {}, "scope": "turn" } })

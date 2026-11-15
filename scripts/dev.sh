@@ -24,7 +24,7 @@ cleanup() {
 trap cleanup INT TERM
 
 echo "[friday] initial build…"
-if ! cargo build -p friday-app; then
+if ! cargo build -p friday-app -p friday-tools; then
   echo "[friday] initial build failed — waiting for changes"
 else
   "$ROOT/target/debug/friday-app" &
@@ -48,7 +48,7 @@ while true; do
   LAST="$NOW"
   sleep 0.15
   echo "[friday] change detected — rebuilding"
-  if cargo build -p friday-app; then
+  if cargo build -p friday-app -p friday-tools; then
     kill_app
     "$ROOT/target/debug/friday-app" &
     APP_PID=$!

@@ -8,9 +8,23 @@ use friday_core::codex::{Codex, CodexConfig, CodexEvent};
 #[tokio::main]
 async fn main() {
     let prompt = std::env::args().nth(1).unwrap_or_else(|| "Responda apenas: online.".into());
+    let mut extra_args = Vec::new();
+    let mcp = std::env::current_exe().ok().and_then(|exe| {
+        let dir = exe.parent()?;
+        [dir.join("friday-mcp"), dir.join("../friday-mcp")]
+            .into_iter()
+            .find(|path| path.is_file())
+    });
+    if let Some(mcp) = mcp
+    {
+        extra_args.push("-c".to_string());
+        extra_args.push(format!("mcp_servers.friday.command=\"{}\"", mcp.display()));
+    }
+
     let config = CodexConfig {
         developer_instructions: Some("Responda em português, em no máximo duas frases.".into()),
         effort: Some("low".into()),
+        extra_args,
         ..CodexConfig::default()
     };
     let mut codex = Codex::spawn(config);
