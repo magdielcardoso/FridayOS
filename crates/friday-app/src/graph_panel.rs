@@ -246,7 +246,7 @@ impl Render for GraphPanel {
                                 .rounded(px(4.0))
                                 .hover(|style| style.bg(rgba(0x2a0505ff)))
                                 .text_size(px(12.0))
-                                .text_color(rgb(RED_BRIGHT))
+                                .text_color(rgb(0xff3448))
                                 .child(SharedString::from("×"))
                                 .on_mouse_down(
                                     gpui::MouseButton::Left,
