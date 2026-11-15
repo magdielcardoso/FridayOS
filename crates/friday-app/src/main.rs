@@ -390,7 +390,10 @@ struct FridayApp {
     cpu: u8,
     ram: u8,
     graph_points: Vec<(f32, f32)>,
+    graph_ids: Vec<String>,
     graph_edges: Vec<(u32, u32)>,
+    graph_highlight: std::collections::HashSet<String>,
+    highlight_until: Option<std::time::Instant>,
     last_answer: String,
     assistant_selected: Option<String>,
     assistant_busy: bool,
@@ -445,7 +448,10 @@ impl FridayApp {
             cpu: 0,
             ram: 0,
             graph_points: Vec::new(),
+            graph_ids: Vec::new(),
             graph_edges: Vec::new(),
+            graph_highlight: std::collections::HashSet::new(),
+            highlight_until: None,
             last_answer: String::new(),
             assistant_selected: None,
             assistant_busy: false,
@@ -942,6 +948,14 @@ impl FridayApp {
                 if app.tick % 50 == 0 {
                     app.assistants = load_assistants();
                 }
+                if app
+                    .highlight_until
+                    .map(|until| std::time::Instant::now() > until)
+                    .unwrap_or(false)
+                {
+                    app.graph_highlight.clear();
+                    app.highlight_until = None;
+                }
 
                 let messages = {
                     let mut inbox = match overlay_inbox().lock() {
@@ -954,7 +968,10 @@ impl FridayApp {
                     match message {
                         OverlayMsg::Show(request) => open_overlay(cx, request),
                         OverlayMsg::Graph(highlight) => {
-                            let _ = graph_panel::open(cx, highlight);
+                            app.graph_highlight = highlight.into_iter().collect();
+                            app.highlight_until = Some(
+                                std::time::Instant::now() + Duration::from_secs(30),
+                            );
                         }
                         OverlayMsg::Close => close_overlays(cx),
                     }
@@ -1111,15 +1128,17 @@ impl FridayApp {
                         Some((*index.get(&edge.src)?, *index.get(&edge.dst)?))
                     })
                     .collect();
-                let _ = graph_tx.send((points, links));
+                let ids: Vec<String> = nodes.iter().map(|node| node.id.clone()).collect();
+                let _ = graph_tx.send((points, ids, links));
                 std::thread::sleep(Duration::from_secs(8));
                 }
             })
             .ok();
         cx.spawn(async move |this, cx| {
-            while let Some((points, links)) = graph_rx.recv().await {
+            while let Some((points, ids, links)) = graph_rx.recv().await {
                 let _ = this.update(cx, |state, cx| {
                     state.graph_points = points;
+                    state.graph_ids = ids;
                     state.graph_edges = links;
                     cx.notify();
                 });
@@ -1393,6 +1412,9 @@ impl FridayApp {
         self.notify_on_done = false;
         mobile::user_message(&text);
         self.activity.clear();
+        // A new turn starts clean: previous graph highlights must not linger.
+        self.graph_highlight.clear();
+        self.highlight_until = None;
         self.push_activity("enviado ao código", StepState::Completed);
 
         match self.codex.as_ref() {
@@ -1605,6 +1627,8 @@ impl Render for FridayApp {
                 || label.contains("memoria")
         });
         let graph_points_snapshot = self.graph_points.clone();
+        let graph_ids_snapshot = self.graph_ids.clone();
+        let graph_highlight_snapshot = self.graph_highlight.clone();
         let graph_edges_snapshot = self.graph_edges.clone();
         let orb = canvas(
             move |_bounds, _window, _cx| {},
@@ -1673,9 +1697,17 @@ impl Render for FridayApp {
                 }
                 for (edge_index, &(a, b)) in links.iter().enumerate() {
                     if let (Some(pa), Some(pb)) = (moved.get(a as usize), moved.get(b as usize)) {
+                        let hot = graph_ids_snapshot
+                            .get(a as usize)
+                            .map(|id| graph_highlight_snapshot.contains(id))
+                            .unwrap_or(false)
+                            && graph_ids_snapshot
+                                .get(b as usize)
+                                .map(|id| graph_highlight_snapshot.contains(id))
+                                .unwrap_or(false);
                         let pulse = 0.55 + 0.45 * (clock * 2.0 + edge_index as f32 * 0.9).sin().abs();
-                        let width = (1.2 + 1.2 * pulse) * scale.max(0.6);
-                        let color = if pulse > 0.8 { 0x9a1226 } else { 0x6a0c1c };
+                        let width = if hot { 3.2 } else { (1.2 + 1.2 * pulse) * scale.max(0.6) };
+                        let color = if hot { 0xff3448 } else if pulse > 0.8 { 0x9a1226 } else { 0x6a0c1c };
                         paint_segment(
                             window,
                             cx0 + pa.0 * radius,
@@ -1698,13 +1730,17 @@ impl Render for FridayApp {
                 if nodes.is_empty() {
                     paint_arc(window, cx0, cy0, 3.0 * scale, 0.0, TAU, 2.0, bright);
                 }
-                for &(x, y) in &moved {
+                for (index, &(x, y)) in moved.iter().enumerate() {
                     let px0 = cx0 + x * radius;
                     let py0 = cy0 + y * radius;
-                    let dot = (2.6 + 1.6 * ((clock * 1.5).sin() * 0.5 + 0.5)) * scale;
-                    paint_arc(window, px0, py0, dot + 3.0 * scale, 0.0, TAU, 1.0, 0x3a0810);
-                    paint_filled_circle(window, px0, py0, dot, bright);
-                    paint_arc(window, px0, py0, dot, 0.0, TAU, 0.8, 0xff6b7c);
+                    let hot = graph_ids_snapshot
+                        .get(index)
+                        .map(|id| graph_highlight_snapshot.contains(id))
+                        .unwrap_or(false);
+                    let dot = if hot { 6.2 * scale } else { (2.6 + 1.6 * ((clock * 1.5).sin() * 0.5 + 0.5)) * scale };
+                    paint_arc(window, px0, py0, dot + if hot { 6.0 } else { 3.0 } * scale, 0.0, TAU, 1.0, 0x3a0810);
+                    paint_filled_circle(window, px0, py0, dot, if hot { 0xff5a6e } else { bright });
+                    paint_arc(window, px0, py0, dot, 0.0, TAU, if hot { 1.6 } else { 0.8 }, 0xff6b7c);
                 }
             },
         )

@@ -174,7 +174,7 @@ impl Tool for KnowledgeTool {
                                     "ok": true,
                                     "native": true,
                                     "highlighted": highlight,
-                                    "note": "grafo aberto na janela nativa da Friday"
+                                    "note": "nós destacados no grafo da interface principal"
                                 }));
                             }
                         }
