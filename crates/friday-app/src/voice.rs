@@ -342,7 +342,59 @@ fn speak_sentences(sentences: &[String], cancel: &Arc<AtomicBool>) -> Result<(),
     Ok(())
 }
 
+/// Last time audible playback started (ms since epoch). A fresh start after
+/// silence gets leading padding: cold audio devices drop the first
+/// ~100–200 ms, which otherwise eats the first syllable.
+static LAST_PLAY_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Prepends ~180 ms of digital silence plus a short fade-in. Only for the
+/// first playback after idle; between sentences the device is already warm
+/// and padding would just add gaps.
+fn pad_first_playback(path: &Path) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    if now.saturating_sub(LAST_PLAY_MS.load(Ordering::Relaxed)) <= 3_000 {
+        return;
+    }
+    let Ok(bytes) = std::fs::read(path) else { return };
+    let Ok(pcm) = parse_wav(&bytes) else { return };
+    let rate = pcm.sample_rate.max(8_000);
+    let mono = pcm.mono_f32();
+    if mono.is_empty() {
+        return;
+    }
+    let silence = (rate as usize * 180 / 1_000).clamp(1, rate as usize);
+    let fade = (rate as usize * 10 / 1_000).clamp(1, mono.len());
+    let mut padded = Vec::with_capacity(silence + mono.len());
+    padded.resize(silence, 0.0f32);
+    padded.extend_from_slice(&mono);
+    for i in 0..fade {
+        let gain = (i as f32 + 1.0) / (fade as f32 + 1.0);
+        padded[silence + i] *= gain;
+    }
+    let samples: Vec<i16> = padded
+        .iter()
+        .map(|v| (v.clamp(-1.0, 1.0) * 32_767.0).round() as i16)
+        .collect();
+    if std::fs::write(path, encode_pcm16_wav(&samples, rate)).is_ok() {
+        vlog("áudio: pad inicial de 180ms (dispositivo frio)");
+    }
+}
+
 fn play_file(path: &Path, cancel: &AtomicBool) -> Result<(), String> {
+    // Fresh audible start: restart the echo grace in the VAD so her own voice
+    // through the speakers is not mistaken for a barge-in that cuts the start.
+    friday_tools::tools::voice::mark_audible_playback();
+    pad_first_playback(path);
+    LAST_PLAY_MS.store(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+        Ordering::Relaxed,
+    );
     // Drive the orb from the synthesized envelope, window by window.
     let stop = Arc::new(AtomicBool::new(false));
     if let Ok(bytes) = std::fs::read(path) {

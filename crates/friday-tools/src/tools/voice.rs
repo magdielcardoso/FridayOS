@@ -32,6 +32,17 @@ use crate::registry::{Registry, Tool, ToolCtx, ToolError, ToolResult, ToolSpec};
 pub const SPEECH_THRESHOLD: f32 = 0.03;
 /// RMS above this while Friday is speaking triggers barge-in.
 pub const BARGE_THRESHOLD: f32 = 0.18;
+/// Set when audible playback actually starts. The capture loop consumes it to
+/// restart the echo grace period there — not at first token, when synthesis
+/// still needs ~1 s and the grace would already be half spent.
+static ECHO_RESET: AtomicBool = AtomicBool::new(false);
+
+/// Restarts the echo grace period. Call it when the first audible sample is
+/// about to play, so Friday's own voice through the speakers is not mistaken
+/// for a barge-in that kills the start of her sentence.
+pub fn mark_audible_playback() {
+    ECHO_RESET.store(true, Ordering::Relaxed);
+}
 /// Silence that ends a short command (~0.75 s).
 pub const SHORT_HANGOVER_FRAMES: u32 = 3;
 /// Silence that ends a long thought (~1.5 s), where natural pauses are common.
@@ -313,6 +324,9 @@ struct VadState {
     barge_capturing: bool,
     /// Consecutive voiced frames, so a single click does not open an utterance.
     voiced_run: u32,
+    /// Consecutive loud frames while Friday speaks, so one echo transient
+    /// cannot kill her sentence; a real interruption sustains.
+    barge_run: u32,
     /// Frames kept before speech starts, so the first syllable is not clipped.
     pre_roll: std::collections::VecDeque<Vec<f32>>,
     /// Fixed hangover override (`FRIDAY_VAD_HANGOVER_MS`) for tuning without a rebuild.
@@ -333,6 +347,7 @@ impl VadState {
             speaking_frames: 0,
             barge_capturing: false,
             voiced_run: 0,
+            barge_run: 0,
             pre_roll: std::collections::VecDeque::with_capacity(3),
             hangover_override: std::env::var("FRIDAY_VAD_HANGOVER_MS")
                 .ok()
@@ -370,12 +385,27 @@ impl VadState {
         // as an utterance: only a much louder voice after a short grace period
         // counts as barge-in, so she never transcribes her own tail.
         if speaking && !self.barge_capturing {
+            // Audible playback just (re)started: the echo grace restarts here,
+            // where the speakers actually make sound — not at first token.
+            if ECHO_RESET.swap(false, Ordering::Relaxed) {
+                self.speaking_frames = 0;
+                self.barge_sent = false;
+                self.barge_run = 0;
+            }
             self.speaking_frames += 1;
             self.in_speech = false;
             self.silence_frames = 0;
             self.frames_captured = 0;
             let barge_gate = (self.noise * 6.0).max(BARGE_THRESHOLD);
-            if self.speaking_frames > 9 && rms >= barge_gate {
+            if rms >= barge_gate {
+                self.barge_run += 1;
+            } else {
+                self.barge_run = 0;
+            }
+            // ~3 s grace from first audible sample, then two loud frames in a
+            // row (~0.5 s of sustained voice) so a single echo transient
+            // cannot cut the start of her sentence.
+            if self.speaking_frames > 12 && self.barge_run >= 2 {
                 if !self.barge_sent {
                     self.barge_sent = true;
                     // Start capturing right away: the words that interrupted
