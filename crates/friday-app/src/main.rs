@@ -1571,36 +1571,46 @@ impl Render for FridayApp {
             )
             .child(
                 div()
-                    .absolute()
-                    .top(px(48.0))
-                    .left(px(26.0))
-                    .w(px(320.0))
-                    .child(answer_block),
-            )
-            .child(
-                div()
                     .flex()
                     .flex_1()
-                    .items_center()
-                    .justify_center()
+                    .min_h(px(0.0))
+                    .gap(px(24.0))
+                    .px(px(26.0))
+                    .pt(px(8.0))
                     .child(
                         div()
-                            .relative()
-                            .size(px(560.0))
+                            .w(px(320.0))
                             .flex_none()
-                            .child(orb)
+                            .flex()
+                            .flex_col()
+                            .overflow_hidden()
+                            .child(answer_block),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_1()
+                            .items_center()
+                            .justify_center()
                             .child(
                                 div()
-                                    .absolute()
-                                    .inset_0()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
+                                    .relative()
+                                    .size(px(560.0))
+                                    .flex_none()
+                                    .child(orb)
                                     .child(
                                         div()
-                                            .text_size(px(30.0))
-                                            .text_color(rgb(RED))
-                                            .child(SharedString::from("F.R.I.D.A.Y.")),
+                                            .absolute()
+                                            .inset_0()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .child(
+                                                div()
+                                                    .text_size(px(30.0))
+                                                    .text_color(rgb(RED))
+                                                    .child(SharedString::from("F.R.I.D.A.Y.")),
+                                            ),
                                     ),
                             ),
                     ),
