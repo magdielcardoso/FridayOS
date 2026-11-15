@@ -53,6 +53,28 @@ pub struct Bridge {
 
 static BRIDGE: OnceLock<Arc<Bridge>> = OnceLock::new();
 
+fn history_path() -> PathBuf {
+    data_dir().join("chat-history.json")
+}
+
+fn load_history() -> Vec<ChatLine> {
+    std::fs::read_to_string(history_path())
+        .ok()
+        .and_then(|text| serde_json::from_str::<Vec<ChatLine>>(&text).ok())
+        .unwrap_or_default()
+}
+
+fn save_history(history: &[ChatLine]) {
+    let _ = std::fs::create_dir_all(data_dir());
+    if let Ok(text) = serde_json::to_vec_pretty(history) {
+        let path = history_path();
+        let tmp = path.with_extension("tmp");
+        if std::fs::write(&tmp, text).is_ok() {
+            let _ = std::fs::rename(tmp, path);
+        }
+    }
+}
+
 pub fn bridge() -> Option<Arc<Bridge>> {
     BRIDGE.get().cloned()
 }
@@ -86,6 +108,7 @@ pub fn user_message(text: &str) {
             if len > 200 {
                 history.drain(0..len - 200);
             }
+            save_history(&history);
         }
         let _ = bridge.events.send(Event::User {
             text: text.into(),
@@ -115,6 +138,7 @@ pub fn assistant_done(full: &str, notify: bool) {
             if len > 200 {
                 history.drain(0..len - 200);
             }
+            save_history(&history);
         }
         if let Ok(mut streaming) = bridge.streaming.lock() {
             streaming.clear();
@@ -776,7 +800,7 @@ pub fn start(port: u16) -> String {
     let bridge = Arc::new(Bridge {
         requests: Mutex::new(Vec::new()),
         events: broadcast::channel(256).0,
-        history: Mutex::new(Vec::new()),
+        history: Mutex::new(load_history()),
         streaming: Mutex::new(String::new()),
     });
     let _ = BRIDGE.set(Arc::clone(&bridge));

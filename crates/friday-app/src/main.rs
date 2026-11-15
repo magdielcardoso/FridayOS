@@ -516,6 +516,7 @@ impl FridayApp {
                                     if app.voice_phase == voice::VoicePhase::Speaking {
                                         app.stop_speech_now();
                                     }
+                                    mobile::user_message(&format!("[orientação] {text}"));
                                     app.messages.push(Line {
                                         role: Role::User,
                                         text: format!("[orientação] {text}"),
@@ -533,6 +534,7 @@ impl FridayApp {
                                         voice::VoicePhase::Idle
                                     };
                                 } else {
+                                    mobile::user_message(&text);
                                     app.messages.push(Line {
                                         role: Role::User,
                                         text: text.clone(),
