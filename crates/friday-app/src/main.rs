@@ -1036,7 +1036,13 @@ impl FridayApp {
         let (graph_tx, mut graph_rx) = tokio::sync::mpsc::unbounded_channel();
         std::thread::Builder::new()
             .name("friday-graph".into())
-            .spawn(move || loop {
+            .spawn(move || {
+                let mut cycles = 0u32;
+                loop {
+                if cycles % 8 == 0 {
+                    let _ = friday_brain::index_all();
+                }
+                cycles = cycles.wrapping_add(1);
                 let nodes = friday_brain::all_nodes().unwrap_or_default();
                 let edges = friday_brain::all_edges().unwrap_or_default();
                 let mut index = std::collections::HashMap::new();
@@ -1059,6 +1065,7 @@ impl FridayApp {
                     .collect();
                 let _ = graph_tx.send((points, links));
                 std::thread::sleep(Duration::from_secs(8));
+                }
             })
             .ok();
         cx.spawn(async move |this, cx| {

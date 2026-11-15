@@ -285,6 +285,75 @@ fn index_memories(conn: &Connection) -> anyhow::Result<usize> {
     Ok(count)
 }
 
+/// Deterministic, cheap relation inference: nodes that share meaningful words
+/// get an inferred `related_to` edge. No LLM, no embeddings.
+fn infer_edges(conn: &Connection) -> anyhow::Result<usize> {
+    let mut statement = conn.prepare("SELECT id, title, body FROM nodes")?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut items: Vec<(String, String, String)> = rows.filter_map(|row| row.ok()).collect();
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let tokens = |text: &str| -> std::collections::HashSet<String> {
+        const STOP: [&str; 24] = [
+            "para", "pelo", "pela", "como", "mais", "menos", "this", "that", "with", "have",
+            "from", "user", "você", "voce", "senhor", "friday", "deve", "deveria", "pode",
+            "quando", "onde", "sobre", "isso", "esta",
+        ];
+        text.to_lowercase()
+            .split(|ch: char| !ch.is_alphanumeric() && ch != '-')
+            .filter(|word| word.len() >= 4)
+            .filter(|word| !STOP.contains(word))
+            .map(str::to_string)
+            .collect()
+    };
+
+    let sets: Vec<std::collections::HashSet<String>> = items
+        .iter()
+        .map(|(_, title, body)| tokens(&format!("{title} {body}")))
+        .collect();
+
+    let mut created = 0;
+    for a in 0..items.len() {
+        let mut candidates: Vec<(usize, f32, usize)> = Vec::new();
+        for b in (a + 1)..items.len() {
+            if sets[a].is_empty() || sets[b].is_empty() {
+                continue;
+            }
+            let common = sets[a].intersection(&sets[b]).count();
+            if common < 2 {
+                continue;
+            }
+            let score = common as f32
+                / ((sets[a].len() as f32).sqrt() * (sets[b].len() as f32).sqrt()).max(1.0);
+            if score >= 0.16 {
+                candidates.push((b, score, common));
+            }
+        }
+        candidates.sort_by(|left, right| right.1.partial_cmp(&left.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (b, score, _) in candidates.into_iter().take(4) {
+            let inserted = conn.execute(
+                "INSERT OR IGNORE INTO edges(src, dst, rel, source, confidence, explicit, created)
+                 VALUES (?1, ?2, 'related_to', 'inferred', ?3, 0, ?4)",
+                params![items[a].0, items[b].0, score as f64, now()],
+            )?;
+            created += inserted;
+            let inserted = conn.execute(
+                "INSERT OR IGNORE INTO edges(src, dst, rel, source, confidence, explicit, created)
+                 VALUES (?2, ?1, 'related_to', 'inferred', ?3, 0, ?4)",
+                params![items[a].0, items[b].0, score as f64, now()],
+            )?;
+            created += inserted;
+        }
+    }
+    Ok(created)
+}
+
 fn walk(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -313,6 +382,7 @@ pub fn index_all() -> anyhow::Result<IndexReport> {
     let conn = connection()?;
     let notes = index_markdown(&conn)?;
     let memories = index_memories(&conn)?;
+    let _ = infer_edges(&conn);
     Ok(IndexReport {
         notes,
         memories,

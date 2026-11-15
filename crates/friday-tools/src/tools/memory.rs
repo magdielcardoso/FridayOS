@@ -69,6 +69,9 @@ impl Tool for MemoryTool {
                     .open(path())
                     .map_err(|e| ToolError::failed(e.to_string()))?;
                 writeln!(file, "{entry}").map_err(|e| ToolError::failed(e.to_string()))?;
+                // Keep the knowledge graph in sync: new memories get inferred
+                // relations immediately.
+                let _ = friday_brain::index_all();
                 Ok(entry)
             }
             "memory_list" => {
