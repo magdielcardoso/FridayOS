@@ -1004,6 +1004,13 @@ fn voice_label(phase: voice::VoicePhase, level: f32) -> String {
 }
 
 fn main() {
+    if std::env::args().any(|arg| arg == "--codex-path") {
+        match friday_core::codex::codex_path() {
+            Some(path) => println!("{}", path.display()),
+            None => println!("não encontrado"),
+        }
+        return;
+    }
     if std::env::args().any(|arg| arg == "--persona") {
         println!("{}", persona());
         return;

@@ -23,6 +23,87 @@ use crate::auth::CodexAuth;
 
 const CODEX_BIN: &str = "codex";
 
+/// GUI-launched apps inherit a minimal PATH (`/usr/bin:/bin:...`), so `codex`
+/// installed by nvm/homebrew is invisible. Resolve it once through the user's
+/// login shell, and reuse that same PATH for the child process.
+fn login_path() -> String {
+    static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        let fallback = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string();
+        let output = std::process::Command::new("/bin/zsh")
+            .args(["-lc", "printf %s \"$PATH\""])
+            .output();
+        match output {
+            Ok(output) if output.status.success() => {
+                let path = String::from_utf8_lossy(&output.stdout).to_string();
+                if path.trim().is_empty() {
+                    fallback
+                } else {
+                    path
+                }
+            }
+            _ => fallback,
+        }
+    })
+    .clone()
+}
+
+fn codex_binary() -> Option<std::path::PathBuf> {
+    static RESOLVED: std::sync::OnceLock<Option<std::path::PathBuf>> =
+        std::sync::OnceLock::new();
+    RESOLVED
+        .get_or_init(|| {
+            if let Ok(explicit) = std::env::var("FRIDAY_CODEX_BIN") {
+                let path = std::path::PathBuf::from(explicit);
+                if path.is_file() {
+                    return Some(path);
+                }
+            }
+
+            if let Ok(output) = std::process::Command::new("/bin/zsh")
+                .args(["-lc", "command -v codex"])
+                .output()
+            {
+                if output.status.success() {
+                    let found = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if !found.is_empty() {
+                        let path = std::path::PathBuf::from(found);
+                        if path.is_file() {
+                            return Some(path);
+                        }
+                    }
+                }
+            }
+
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
+            let mut candidates = vec![
+                std::path::PathBuf::from("/opt/homebrew/bin/codex"),
+                std::path::PathBuf::from("/usr/local/bin/codex"),
+                home.join(".local/bin/codex"),
+            ];
+            // nvm: pick the highest installed Node version that has codex.
+            let nvm = home.join(".nvm/versions/node");
+            if let Ok(entries) = std::fs::read_dir(&nvm) {
+                let mut versions: Vec<_> = entries
+                    .filter_map(|entry| entry.ok())
+                    .map(|entry| entry.path())
+                    .collect();
+                versions.sort();
+                versions.reverse();
+                for version in versions {
+                    candidates.push(version.join("bin/codex"));
+                }
+            }
+            candidates.into_iter().find(|path| path.is_file())
+        })
+        .clone()
+}
+
+/// Absolute path to the resolved Codex CLI (for diagnostics).
+pub fn codex_path() -> Option<std::path::PathBuf> {
+    codex_binary()
+}
+
 #[derive(Debug, Clone)]
 pub struct CodexConfig {
     pub cwd: String,
@@ -203,8 +284,19 @@ async fn supervise(
 type Parts = (Child, Lines<BufReader<ChildStdout>>, ChildStdin);
 
 async fn launch(config: &CodexConfig) -> Result<Parts, String> {
-    let mut child = tokio::process::Command::new(CODEX_BIN)
+    let binary = codex_binary().ok_or_else(|| {
+        "O CLI do Codex não foi encontrado. Instale com `npm i -g @openai/codex`, faça login uma vez e reabra a Friday.".to_string()
+    })?;
+
+    // Also expose node's directory (nvm/homebrew) so the codex shim can find it.
+    let mut path = login_path();
+    if let Some(dir) = binary.parent() {
+        path = format!("{}:{}", dir.display(), path);
+    }
+
+    let mut child = tokio::process::Command::new(&binary)
         .args(&config.extra_args)
+        .env("PATH", path)
         .envs(config.env.iter().map(|(key, value)| (key, value)))
         .arg("app-server")
         .arg("--stdio")
@@ -214,13 +306,7 @@ async fn launch(config: &CodexConfig) -> Result<Parts, String> {
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => {
-                "O CLI do Codex não está instalado. Instale com `npm i -g @openai/codex` e faça login."
-                    .to_string()
-            }
-            _ => format!("Não foi possível iniciar o Codex: {e}"),
-        })?;
+        .map_err(|e| format!("Não foi possível iniciar o Codex ({}): {e}", binary.display()))?;
 
     let stdout = child.stdout.take().ok_or("Codex sem stdout")?;
     let stdin = child.stdin.take().ok_or("Codex sem stdin")?;
