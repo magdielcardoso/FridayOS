@@ -1524,8 +1524,8 @@ impl Render for FridayApp {
                             cy0 + pa.1 * radius,
                             cx0 + pb.0 * radius,
                             cy0 + pb.1 * radius,
-                            0.8,
-                            0x5a0a16,
+                            1.8,
+                            0x7a0f22,
                         );
                     }
                 }
