@@ -1,6 +1,8 @@
 //! Local automation: webhooks and scheduled routines that wake Friday without
 //! the user typing anything.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -78,12 +80,13 @@ pub fn start(port: u16, push: Arc<dyn Fn(Trigger) + Send + Sync>) {
             .ok();
     }
 
-    // Scheduler
+    // Scheduler + system watchers
     std::thread::Builder::new()
         .name("friday-routines".into())
         .spawn(move || loop {
-            std::thread::sleep(Duration::from_secs(10));
+            std::thread::sleep(Duration::from_secs(5));
             run_due_routines(&push);
+            run_due_watchers(&push);
         })
         .ok();
 }
@@ -247,6 +250,198 @@ fn run_due_routines(push: &Arc<dyn Fn(Trigger) + Send + Sync>) {
             changed = true;
         }
         updated.push(routine);
+    }
+
+    if changed {
+        write_json(path, &Value::Array(updated));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// System watchers: shell output, files, URLs, clipboard, iMessage, Mail.
+// ---------------------------------------------------------------------------
+
+fn signature(value: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    format!("{:x}", hasher.finish())
+}
+
+fn run_capture(program: &str, args: &[&str], timeout: Duration) -> Result<String, String> {
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    let started = SystemTime::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        if started.elapsed().unwrap_or_default() > timeout {
+            let _ = child.kill();
+            return Err("tempo esgotado".into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mut output = String::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        let _ = stdout.read_to_string(&mut output);
+    }
+    Ok(output)
+}
+
+/// Reads one source and returns (signature, human detail).
+fn read_source(source: &str, params: &Value) -> Result<(String, String), String> {
+    match source {
+        "shell" => {
+            let command = params
+                .get("command")
+                .and_then(|value| value.as_str())
+                .ok_or("watcher shell sem `command`")?;
+            let output = run_capture("/bin/zsh", &["-lc", command], Duration::from_secs(20))?;
+            let trimmed: String = output.chars().take(2000).collect();
+            Ok((signature(&output), trimmed))
+        }
+        "file" => {
+            let path = params
+                .get("path")
+                .and_then(|value| value.as_str())
+                .ok_or("watcher file sem `path`")?;
+            let expanded = if let Some(rest) = path.strip_prefix("~/") {
+                let home = std::env::var("HOME").unwrap_or_default();
+                format!("{home}/{rest}")
+            } else {
+                path.to_string()
+            };
+            let metadata = std::fs::metadata(&expanded).map_err(|error| error.to_string())?;
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_secs())
+                .unwrap_or(0);
+            let detail = format!(
+                "{} · {} bytes · modificado em {}",
+                expanded, metadata.len(), modified
+            );
+            Ok((signature(&format!("{modified}:{}", metadata.len())), detail))
+        }
+        "http" => {
+            let url = params
+                .get("url")
+                .and_then(|value| value.as_str())
+                .ok_or("watcher http sem `url`")?;
+            let output = run_capture(
+                "/usr/bin/curl",
+                &["-sL", "--max-time", "20", "-A", "FridayOS/0.1", url],
+                Duration::from_secs(25),
+            )?;
+            let trimmed: String = output.chars().take(2000).collect();
+            Ok((signature(&output), trimmed))
+        }
+        "clipboard" => {
+            let output = run_capture("/usr/bin/pbpaste", &[], Duration::from_secs(5))?;
+            let trimmed: String = output.chars().take(2000).collect();
+            Ok((signature(&output), trimmed))
+        }
+        "imessage" => {
+            // Needs Full Disk Access. Reads the newest messages, not the whole DB.
+            let home = std::env::var("HOME").unwrap_or_default();
+            let db = format!("{home}/Library/Messages/chat.db");
+            let query = "SELECT ROWID, is_from_me, COALESCE(text,'') FROM message ORDER BY ROWID DESC LIMIT 5;";
+            let output = run_capture("/usr/bin/sqlite3", &[&db, query], Duration::from_secs(10))?;
+            let max_row: String = output
+                .lines()
+                .filter_map(|line| line.split('|').next())
+                .max_by_key(|row| row.parse::<u64>().unwrap_or(0))
+                .unwrap_or("0")
+                .to_string();
+            let detail: String = output.chars().take(1200).collect();
+            Ok((format!("imessage:{max_row}"), detail))
+        }
+        "email" => {
+            // Mail.app via JXA; count + newest subject is enough to detect change.
+            let script = "const Mail = Application('Mail'); const inbox = Mail.inbox; const msgs = inbox.messages; JSON.stringify({count: msgs.length, subject: msgs.length ? msgs[0].subject() : '', sender: msgs.length ? (msgs[0].sender() || '') : ''});";
+            let output = run_capture(
+                "/usr/bin/osascript",
+                &["-l", "JavaScript", "-e", script],
+                Duration::from_secs(25),
+            )?;
+            Ok((signature(&output), output.trim().to_string()))
+        }
+        other => Err(format!("fonte desconhecida: {other}")),
+    }
+}
+
+fn run_due_watchers(push: &Arc<dyn Fn(Trigger) + Send + Sync>) {
+    let path = data_dir().join("watchers.json");
+    let data = read_json(path.clone(), json!([]));
+    let Some(watchers) = data.as_array() else {
+        return;
+    };
+    let now = now_secs();
+    let mut updated: Vec<Value> = Vec::new();
+    let mut changed = false;
+
+    for watcher in watchers {
+        let mut watcher = watcher.clone();
+        let enabled = watcher.get("enabled").and_then(|value| value.as_bool()).unwrap_or(true);
+        let interval = watcher
+            .get("interval_secs")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(60)
+            .max(15);
+        let last_check = watcher.get("last_check").and_then(|value| value.as_u64()).unwrap_or(0);
+        if !enabled || now.saturating_sub(last_check) < interval {
+            updated.push(watcher);
+            continue;
+        }
+
+        let source = watcher.get("source").and_then(|value| value.as_str()).unwrap_or("");
+        let params = watcher.get("params").cloned().unwrap_or(Value::Null);
+        let name = watcher.get("name").and_then(|value| value.as_str()).unwrap_or("watcher").to_string();
+
+        match read_source(source, &params) {
+            Ok((sig, detail)) => {
+                let previous = watcher.get("last_value").and_then(|value| value.as_str()).unwrap_or("");
+                let first = previous.is_empty();
+                let fire_on_start = watcher
+                    .get("fire_on_start")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false);
+                let contains_ok = params
+                    .get("contains")
+                    .and_then(|value| value.as_str())
+                    .map(|needle| detail.to_lowercase().contains(&needle.to_lowercase()))
+                    .unwrap_or(true);
+
+                if (!first && previous != sig && contains_ok) || (first && fire_on_start) {
+                    let prompt = watcher.get("prompt").and_then(|value| value.as_str()).unwrap_or("");
+                    push(Trigger {
+                        source: format!("watcher:{name}"),
+                        prompt: format!(
+                            "{prompt}\n\nMudança detectada em `{name}` ({source}):\n{}",
+                            detail.chars().take(1500).collect::<String>()
+                        ),
+                    });
+                }
+                watcher["last_value"] = json!(sig);
+                if first {
+                    watcher["baseline_at"] = json!(now);
+                }
+            }
+            Err(error) => {
+                watcher["last_error"] = json!(error);
+            }
+        }
+        watcher["last_check"] = json!(now);
+        changed = true;
+        updated.push(watcher);
     }
 
     if changed {
