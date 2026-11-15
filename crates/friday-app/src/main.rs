@@ -1832,11 +1832,12 @@ impl Render for FridayApp {
                     .absolute()
                     .right(lx(28.0))
                     .bottom(ly(170.0))
-                    .w(sx(230.0))
+                    .w(sx(260.0))
                     .flex()
                     .flex_col()
                     .gap(sx(6.0))
                     .p(sx(12.0))
+                    .overflow_hidden()
                     .border_1()
                     .border_color(rgb(0x3b0d0d))
                     .rounded(sx(10.0))
@@ -1854,6 +1855,13 @@ impl Render for FridayApp {
                     );
                 for (name, role) in self.assistants.iter().take(6) {
                     let target = name.clone();
+                    let role_short: String = if role.chars().count() > 18 {
+                        let mut short: String = role.chars().take(17).collect();
+                        short.push('…');
+                        short
+                    } else {
+                        role.clone()
+                    };
                     panel = panel.child(
                         div()
                             .id(SharedString::from(format!("agent-{name}")))
@@ -1882,9 +1890,12 @@ impl Render for FridayApp {
                             )
                             .child(
                                 div()
+                                    .flex_none()
+                                    .max_w(sx(110.0))
+                                    .overflow_hidden()
                                     .text_size(sx(9.0))
                                     .text_color(rgb(0x5e1414))
-                                    .child(SharedString::from(role.clone())),
+                                    .child(SharedString::from(role_short)),
                             ),
                     );
                 }
