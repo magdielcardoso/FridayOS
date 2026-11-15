@@ -94,6 +94,7 @@ struct FridayApp {
     speech_pending: String,
     speech_batch: String,
     speech_sent_first: bool,
+    tts_stream: bool,
     speaking_since: Option<std::time::Instant>,
     wake: bool,
     wake_flag: Option<Arc<AtomicBool>>,
@@ -126,6 +127,9 @@ impl FridayApp {
             speech_pending: String::new(),
             speech_batch: String::new(),
             speech_sent_first: false,
+            tts_stream: std::env::var("FRIDAY_TTS_MODE")
+                .map(|mode| mode == "stream")
+                .unwrap_or(false),
             speaking_since: None,
             wake: false,
             wake_flag: None,
@@ -348,6 +352,11 @@ impl FridayApp {
             self.begin_speech(cx);
         }
         self.speech_pending.push_str(delta);
+        if !self.tts_stream {
+            // Single-request mode: one TTS call per answer keeps us inside
+            // ChatGPT's hourly read-aloud quota.
+            return;
+        }
         let sentences = take_sentences(&mut self.speech_pending);
         if let Some(tx) = self.speech_tx.as_ref() {
             for sentence in sentences {
@@ -365,6 +374,20 @@ impl FridayApp {
     }
 
     fn end_speech(&mut self, cx: &mut Context<Self>) {
+        if !self.tts_stream {
+            let text = self.speech_pending.trim().to_string();
+            self.speech_pending.clear();
+            if text.is_empty() {
+                return;
+            }
+            self.begin_speech(cx);
+            if let Some(tx) = self.speech_tx.as_ref() {
+                let _ = tx.send(text);
+            }
+            self.speech_tx = None;
+            return;
+        }
+
         let rest = self.speech_pending.trim().to_string();
         if !rest.is_empty() {
             if !self.speech_sent_first {

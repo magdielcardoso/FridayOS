@@ -936,14 +936,84 @@ fn stream_sentences(
     }
 }
 
+fn usage_path() -> PathBuf {
+    let home = std::env::var_os("HOME").unwrap_or_default();
+    PathBuf::from(home).join("Library/Application Support/FridayOS/tts-usage.json")
+}
+
+/// Persisted per-hour budget: ChatGPT read-aloud is limited by requests per
+/// hour, and a 429 is slow to recover from. Better to stay under it.
+fn check_budget() -> Result<(), String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let path = usage_path();
+    let mut value: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_else(|| serde_json::json!({ "requests": [], "blocked_until": 0 }));
+
+    let blocked_until = value.get("blocked_until").and_then(|v| v.as_u64()).unwrap_or(0);
+    if blocked_until > now {
+        let wait = (blocked_until - now + 59) / 60;
+        return Err(format!(
+            "limite por hora da voz ChatGPT (conta Plus) atingido — volta em ~{wait} min"
+        ));
+    }
+
+    let mut requests: Vec<u64> = value
+        .get("requests")
+        .and_then(|v| v.as_array())
+        .map(|items| items.iter().filter_map(|v| v.as_u64()).collect())
+        .unwrap_or_default();
+    requests.retain(|ts| now.saturating_sub(*ts) < 3600);
+    let budget = std::env::var("FRIDAY_TTS_BUDGET")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(18);
+    if requests.len() >= budget {
+        return Err(format!(
+            "orçamento local de voz por hora esgotado ({budget} pedidos); tenta de novo em alguns minutos"
+        ));
+    }
+    requests.push(now);
+    value["requests"] = serde_json::json!(requests);
+    value["blocked_until"] = serde_json::json!(0);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, value.to_string());
+    Ok(())
+}
+
+fn mark_blocked(seconds: u64) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let path = usage_path();
+    let mut value: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_else(|| serde_json::json!({ "requests": [], "blocked_until": 0 }));
+    value["blocked_until"] = serde_json::json!(now + seconds);
+    value["requests"] = serde_json::json!([]);
+    let _ = std::fs::write(&path, value.to_string());
+}
+
 fn synthesize_file(
     rt: &tokio::runtime::Runtime,
     auth: &CodexAuth,
     text: &str,
 ) -> Result<PathBuf, String> {
-    let pcm = rt
-        .block_on(tts::synthesize(auth, text))
-        .map_err(|e| e.to_string())?;
+    check_budget()?;
+    let pcm = rt.block_on(tts::synthesize(auth, text)).map_err(|e| {
+        if e.to_string().contains("limite") {
+            mark_blocked(3600);
+        }
+        e.to_string()
+    })?;
     let samples: Vec<i16> = pcm
         .mono_f32()
         .iter()
