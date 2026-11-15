@@ -15,6 +15,7 @@ use gpui::{
     WindowBounds, WindowHandle, WindowKind, WindowOptions,
 };
 
+mod automation;
 mod voice;
 
 const BG: u32 = 0x050505;
@@ -65,6 +66,11 @@ When the user says something like `you have total access`, confirm out loud
 (pergunte em voz alta se confirma o acesso total) and, on the next turn, call
 `friday__autonomy_set` with level `full` and `__confirm: true`. Never raise
 your own autonomy without that explicit grant.
+Automations: `webhook_create` exposes POST http://127.0.0.1:8787/hook/<nome>
+with a prompt that wakes you, and `routine_create` schedules prompts by
+interval, daily time, weekly time or a specific date. Use `webhook_test` and
+`routine_run_now` to validate. These run while the app is open and wake you
+without the user typing.
 You also have: `diagnose` (read logs, list recent errors and environment
 problems), `say` (macOS speech as an explicit fallback), `memory_save` /
 `memory_list` (persistent memories that survive restarts), and the permanent
@@ -119,6 +125,11 @@ enum OverlayMsg {
 }
 
 static OVERLAY_INBOX: OnceLock<Mutex<Vec<OverlayMsg>>> = OnceLock::new();
+static TRIGGER_INBOX: OnceLock<Mutex<VecDeque<automation::Trigger>>> = OnceLock::new();
+
+fn trigger_inbox() -> &'static Mutex<VecDeque<automation::Trigger>> {
+    TRIGGER_INBOX.get_or_init(|| Mutex::new(VecDeque::new()))
+}
 static OVERLAY_WINDOWS: OnceLock<Mutex<Vec<WindowHandle<OverlayView>>>> = OnceLock::new();
 
 fn overlay_inbox() -> &'static Mutex<Vec<OverlayMsg>> {
@@ -323,6 +334,7 @@ struct FridayApp {
     speech_batch: String,
     speech_sent_first: bool,
     transcript: String,
+    external_pending: VecDeque<(String, String)>,
     tts_stream: bool,
     speaking_since: Option<std::time::Instant>,
     wake: bool,
@@ -362,6 +374,7 @@ impl FridayApp {
             speech_batch: String::new(),
             speech_sent_first: false,
             transcript: String::new(),
+            external_pending: VecDeque::new(),
             tts_stream: std::env::var("FRIDAY_TTS_MODE")
                 .map(|mode| mode == "stream")
                 .unwrap_or(false),
@@ -825,6 +838,26 @@ impl FridayApp {
                         OverlayMsg::Close => close_overlays(cx),
                     }
                 }
+
+                let triggers = {
+                    let mut inbox = match trigger_inbox().lock() {
+                        Ok(inbox) => inbox,
+                        Err(_) => return,
+                    };
+                    std::mem::take(&mut *inbox)
+                };
+                for trigger in triggers {
+                    if app.status == Status::Thinking {
+                        app.push_activity(
+                            format!("evento enfileirado · {}", trigger.source),
+                            StepState::Completed,
+                        );
+                        app.external_pending
+                            .push_back((trigger.source, trigger.prompt));
+                    } else {
+                        app.inject_trigger(trigger.source, trigger.prompt, cx);
+                    }
+                }
                 cx.notify();
             });
         })
@@ -975,6 +1008,7 @@ impl FridayApp {
                 } else {
                     Status::Online
                 };
+                self.dispatch_pending(cx);
                 self.scroll.scroll_to_bottom();
                 if status == "interrupted" {
                     self.stop_speech_now();
@@ -993,6 +1027,32 @@ impl FridayApp {
             }
         }
         cx.notify();
+    }
+
+    fn inject_trigger(&mut self, source: String, prompt: String, cx: &mut Context<Self>) {
+        log(format!("gatilho: {source}"));
+        self.messages.push(Line {
+            role: Role::User,
+            text: format!("[{source}] {prompt}"),
+        });
+        self.activity.clear();
+        self.push_activity(format!("evento · {source}"), StepState::Completed);
+        self.stream.clear();
+        self.reasoning.clear();
+        self.status = Status::Thinking;
+        if let Some(codex) = self.codex.as_ref() {
+            codex.prompt(prompt);
+        }
+        cx.notify();
+    }
+
+    fn dispatch_pending(&mut self, cx: &mut Context<Self>) {
+        if self.status == Status::Thinking {
+            return;
+        }
+        if let Some((source, prompt)) = self.external_pending.pop_front() {
+            self.inject_trigger(source, prompt, cx);
+        }
     }
 
     fn push_activity(&mut self, label: impl Into<String>, state: StepState) {
@@ -2065,6 +2125,14 @@ fn main() {
     }
     start_screen_daemon();
     start_overlay_daemon();
+    automation::start(
+        automation::hook_port(),
+        Arc::new(|trigger| {
+            if let Ok(mut inbox) = trigger_inbox().lock() {
+                inbox.push_back(trigger);
+            }
+        }),
+    );
     Application::new().run(|cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1100.0), px(880.0)), cx);
         let handle = cx

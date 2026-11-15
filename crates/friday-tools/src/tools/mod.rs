@@ -16,6 +16,7 @@ pub mod screen;
 pub mod shell;
 pub mod speech;
 pub mod voice;
+pub mod webhooks;
 pub mod voice_prefs;
 pub mod reasoning;
 
@@ -39,6 +40,7 @@ pub fn register_all(registry: &mut Registry) {
     net::register(registry);
     overlay::register(registry);
     voice::register(registry);
+    webhooks::register(registry);
     voice_prefs::register(registry);
     reasoning::register(registry);
 }
