@@ -208,19 +208,36 @@ pub fn speak(text: &str, cancel: &Arc<AtomicBool>) -> Result<(), String> {
     speak_sentences(&sentences, &cancel)
 }
 
-/// Synthesizes the acknowledgment once and leaves it in the TTS cache.
+/// Persistent path for the spoken acknowledgment, so it survives restarts.
+fn ack_path() -> PathBuf {
+    let home = std::env::var_os("HOME").unwrap_or_default();
+    PathBuf::from(home)
+        .join("Library/Caches/FridayOS/voice")
+        .join("ack-certo.wav")
+}
+
+/// Synthesizes the acknowledgment once and leaves it on disk.
 pub fn prewarm_ack() {
     const ACK: &str = "Certo.";
-    if cache_lookup(ACK).is_some() || tts_blocked() {
+    let target = ack_path();
+    if target.is_file() {
+        return;
+    }
+    if tts_blocked() {
         return;
     }
     let Ok(rt) = runtime() else { return };
     let auth = CodexAuth::discover();
     match synthesize_file(&rt, &auth, ACK) {
         Ok(path) => {
-            cache_store(ACK, &path);
+            if let Some(parent) = target.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match std::fs::copy(&path, &target) {
+                Ok(_) => vlog("ack: pronto no cache"),
+                Err(error) => vlog(format!("ack: não foi possível guardar ({error})")),
+            }
             let _ = std::fs::remove_file(path);
-            vlog("ack: pronto no cache");
         }
         Err(error) => vlog(format!("ack: não foi possível pré-sintetizar ({error})")),
     }
@@ -229,10 +246,11 @@ pub fn prewarm_ack() {
 /// Plays the cached acknowledgment immediately, if it exists. Never synthesizes
 /// on the hot path, so a missing cache simply means silence.
 pub fn play_ack_cached() {
-    let Some(path) = cache_lookup("Certo.") else {
+    let path = ack_path();
+    if !path.is_file() {
         vlog("ack: cache ausente");
         return;
-    };
+    }
     vlog("ack: tocando");
     stop_ack();
     let Ok(mut child) = Command::new("/usr/bin/afplay").arg(&path).spawn() else {
