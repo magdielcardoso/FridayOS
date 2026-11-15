@@ -369,6 +369,7 @@ struct FridayApp {
     ram: u8,
     graph_points: Vec<(f32, f32)>,
     graph_edges: Vec<(u32, u32)>,
+    last_answer: String,
     warming: bool,
     prewarmed: bool,
     last_activity: std::time::Instant,
@@ -419,6 +420,7 @@ impl FridayApp {
             ram: 0,
             graph_points: Vec::new(),
             graph_edges: Vec::new(),
+            last_answer: String::new(),
             warming: false,
             prewarmed: false,
             last_activity: std::time::Instant::now(),
@@ -453,17 +455,6 @@ impl FridayApp {
     }
 
     fn start_listen(&mut self, cx: &mut Context<Self>) {
-        // Speaking soon: if the thread has gone cold, warm it while the
-        // microphone opens so the first token is not penalised.
-        if !self.warming
-            && self.status == Status::Online
-            && self.last_activity.elapsed() > Duration::from_secs(45)
-        {
-            self.warming = true;
-            if let Some(codex) = self.codex.as_ref() {
-                codex.prompt("Aquecimento. Responda apenas: ok.");
-            }
-        }
         if self.voice_phase == voice::VoicePhase::Speaking {
             self.interrupt(cx);
         }
@@ -562,6 +553,10 @@ impl FridayApp {
                                 app.transcript = text.clone();
                                 let steering = app.status == Status::Thinking
                                     || app.voice_phase == voice::VoicePhase::Speaking;
+                                if app.warming {
+                                    app.external_pending.push_back(("orientação".into(), text));
+                                    return;
+                                }
                                 if steering {
                                     if app.voice_phase == voice::VoicePhase::Speaking {
                                         app.stop_speech_now();
@@ -862,6 +857,10 @@ impl FridayApp {
     }
 
     fn connect(&mut self, cx: &mut Context<Self>) {
+        log(format!(
+            "connect: iniciando codex (motivo: thread {:?}, status {:?})",
+            self.thread, self.status
+        ));
         let mcp = std::env::current_exe()
             .ok()
             .and_then(|exe| exe.parent().map(|dir| dir.join("friday-mcp")))
@@ -911,62 +910,6 @@ impl FridayApp {
                 app.blink = (app.tick / 12) % 2 == 0;
                 if app.tick % 50 == 0 {
                     app.assistants = load_assistants();
-                }
-                // Keep the Codex thread warm: a cold thread costs ~3x more.
-                if app.tick % 400 == 0
-                    && !app.warming
-                    && app.status == Status::Online
-                    && app.last_activity.elapsed() > Duration::from_secs(300)
-                {
-                    app.warming = true;
-                    if let Some(codex) = app.codex.as_ref() {
-                        codex.prompt("Aquecimento. Responda apenas: ok.");
-                    }
-                }
-                let messages = {
-                    let mut inbox = match overlay_inbox().lock() {
-                        Ok(inbox) => inbox,
-                        Err(_) => return,
-                    };
-                    std::mem::take(&mut *inbox)
-                };
-                for message in messages {
-                    match message {
-                        OverlayMsg::Show(request) => open_overlay(cx, request),
-                        OverlayMsg::Graph(highlight) => {
-                            let _ = graph_panel::open(cx, highlight);
-                        }
-                        OverlayMsg::Close => close_overlays(cx),
-                    }
-                }
-
-                let triggers = {
-                    let mut inbox = match trigger_inbox().lock() {
-                        Ok(inbox) => inbox,
-                        Err(_) => return,
-                    };
-                    std::mem::take(&mut *inbox)
-                };
-                for text in mobile::take_requests() {
-                    if app.status == Status::Thinking {
-                        app.external_pending
-                            .push_back(("mobile".to_string(), text));
-                    } else {
-                        app.inject_trigger("mobile".to_string(), text, cx);
-                    }
-                }
-
-                for trigger in triggers {
-                    if app.status == Status::Thinking {
-                        app.push_activity(
-                            format!("evento enfileirado · {}", trigger.source),
-                            StepState::Completed,
-                        );
-                        app.external_pending
-                            .push_back((trigger.source, trigger.prompt));
-                    } else {
-                        app.inject_trigger(trigger.source, trigger.prompt, cx);
-                    }
                 }
                 cx.notify();
             });
@@ -1219,6 +1162,9 @@ impl FridayApp {
                 let finished = spoken
                     .or_else(|| self.messages.iter().rev().find(|line| line.role == Role::Friday).map(|line| line.text.clone()))
                     .unwrap_or_default();
+                if !finished.is_empty() {
+                    self.last_answer = finished.clone();
+                }
                 mobile::assistant_done(&finished, self.notify_on_done);
                 self.notify_on_done = false;
                 let _ = finished;
@@ -1316,6 +1262,7 @@ impl FridayApp {
         self.stream.clear();
         self.status = Status::Thinking;
         self.last_activity = std::time::Instant::now();
+        self.last_answer.clear();
         self.reasoning.clear();
         self.notify_on_done = false;
         mobile::user_message(&text);
