@@ -1539,6 +1539,15 @@ impl Render for FridayApp {
             "Aguardando comando".to_string()
         };
 
+        // Connections only light up while Friday is actually working the graph.
+        let show_connections = self.activity.iter().rev().take(6).any(|activity| {
+            let label = activity.label.to_lowercase();
+            label.contains("knowledge")
+                || label.contains("grafo")
+                || label.contains("graph")
+                || label.contains("relaç")
+                || label.contains("relac")
+        });
         let graph_points_snapshot = self.graph_points.clone();
         let graph_edges_snapshot = self.graph_edges.clone();
         let orb = canvas(
@@ -1607,6 +1616,9 @@ impl Render for FridayApp {
                     ));
                 }
                 for (edge_index, &(a, b)) in links.iter().enumerate() {
+                    if !show_connections {
+                        continue;
+                    }
                     if let (Some(pa), Some(pb)) = (moved.get(a as usize), moved.get(b as usize)) {
                         let pulse = 0.55 + 0.45 * (clock * 2.0 + edge_index as f32 * 0.9).sin().abs();
                         let width = (1.2 + 1.2 * pulse) * scale.max(0.6);
