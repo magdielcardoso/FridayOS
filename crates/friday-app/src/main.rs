@@ -88,6 +88,8 @@ struct FridayApp {
     voice_phase: voice::VoicePhase,
     level: f32,
     speak_cancel: Option<Arc<AtomicBool>>,
+    speech_tx: Option<std::sync::mpsc::Sender<String>>,
+    speech_pending: String,
     wake: bool,
     wake_flag: Option<Arc<AtomicBool>>,
     blink: bool,
@@ -103,7 +105,7 @@ impl FridayApp {
             codex: None,
             messages: vec![Line {
                 role: Role::System,
-                text: "núcleo em espera · voz em montagem".into(),
+                text: "núcleo em espera · f2 falar · f3 wake word".into(),
             }],
             input: String::new(),
             stream: String::new(),
@@ -115,6 +117,8 @@ impl FridayApp {
             voice_phase: voice::VoicePhase::Idle,
             level: 0.0,
             speak_cancel: None,
+            speech_tx: None,
+            speech_pending: String::new(),
             wake: false,
             wake_flag: None,
             blink: true,
@@ -254,41 +258,88 @@ impl FridayApp {
         }
     }
 
-    fn speak_text(&mut self, text: String, cx: &mut Context<Self>) {
-        voice::stop_speaking();
-        if let Some(previous) = self.speak_cancel.take() {
-            previous.store(true, Ordering::Relaxed);
-        }
+    fn begin_speech(&mut self, cx: &mut Context<Self>) {
+        self.stop_speech_now();
         let cancel = Arc::new(AtomicBool::new(false));
         self.speak_cancel = Some(cancel.clone());
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        self.speech_tx = Some(tx);
+        self.speech_pending.clear();
         self.voice_phase = voice::VoicePhase::Speaking;
         if let Some(mic) = self.mic.as_ref() {
             mic.set_speaking(true);
         }
         cx.notify();
 
-        Self::blocking(
-            cx,
-            move || voice::speak(&text, &cancel),
-            |app, result, cx| {
-                if let Err(error) = result {
-                    app.messages.push(Line {
-                        role: Role::System,
-                        text: format!("voz: {error}"),
-                    });
+        let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        std::thread::spawn(move || {
+            for sentence in rx {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
                 }
-                if let Some(mic) = app.mic.as_ref() {
-                    mic.set_speaking(false);
+                if voice::speak(&sentence, &cancel).is_err() {
+                    break;
                 }
-                app.speak_cancel = None;
-                app.voice_phase = if app.mic.is_some() {
-                    voice::VoicePhase::Listening
-                } else {
-                    voice::VoicePhase::Idle
-                };
-                cx.notify();
-            },
-        );
+            }
+            let _ = done_tx.send(());
+        });
+
+        cx.spawn(async move |this, cx| {
+            if done_rx.recv().await.is_some() {
+                let _ = this.update(cx, |app, cx| {
+                    if let Some(mic) = app.mic.as_ref() {
+                        mic.set_speaking(false);
+                    }
+                    app.speak_cancel = None;
+                    app.speech_tx = None;
+                    app.voice_phase = if app.mic.is_some() {
+                        voice::VoicePhase::Listening
+                    } else {
+                        voice::VoicePhase::Idle
+                    };
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Streams finished sentences to the speaker while the model is still talking.
+    fn feed_speech(&mut self, delta: &str, cx: &mut Context<Self>) {
+        if self.speech_tx.is_none() {
+            self.begin_speech(cx);
+        }
+        self.speech_pending.push_str(delta);
+        let sentences = take_sentences(&mut self.speech_pending);
+        if let Some(tx) = self.speech_tx.as_ref() {
+            for sentence in sentences {
+                let _ = tx.send(sentence);
+            }
+        }
+    }
+
+    fn end_speech(&mut self, cx: &mut Context<Self>) {
+        let rest = self.speech_pending.trim().to_string();
+        if !rest.is_empty() {
+            if let Some(tx) = self.speech_tx.as_ref() {
+                let _ = tx.send(rest);
+            }
+        }
+        self.speech_pending.clear();
+        self.speech_tx = None; // closes the channel once queued audio is done
+        cx.notify();
+    }
+
+    fn stop_speech_now(&mut self) {
+        if let Some(cancel) = self.speak_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.speech_tx = None;
+        self.speech_pending.clear();
+        voice::stop_speaking();
+        if let Some(mic) = self.mic.as_ref() {
+            mic.set_speaking(false);
+        }
     }
 
     fn toggle_wake(&mut self, cx: &mut Context<Self>) {
@@ -352,10 +403,7 @@ impl FridayApp {
     }
 
     fn interrupt(&mut self, cx: &mut Context<Self>) {
-        if let Some(cancel) = self.speak_cancel.take() {
-            cancel.store(true, Ordering::Relaxed);
-        }
-        voice::stop_speaking();
+        self.stop_speech_now();
         if self.status == Status::Thinking {
             self.cancel_turn(cx);
         }
@@ -403,10 +451,10 @@ impl FridayApp {
             ));
         }
 
+        // Bundled apps launch with cwd "/", which is a terrible Codex workspace.
+        let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".into());
         let config = CodexConfig {
-            cwd: std::env::current_dir()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| ".".into()),
+            cwd,
             model: None,
             effort: Some("low".into()),
             developer_instructions: Some(persona()),
@@ -450,6 +498,7 @@ impl FridayApp {
             CodexEvent::Delta(delta) => {
                 self.status = Status::Thinking;
                 self.stream.push_str(&delta);
+                self.feed_speech(&delta, cx);
                 self.scroll.scroll_to_bottom();
             }
             CodexEvent::Reasoning(delta) => {
@@ -478,10 +527,9 @@ impl FridayApp {
                 };
                 self.scroll.scroll_to_bottom();
                 if status == "completed" {
-                    if let Some(text) = spoken {
-                        self.speak_text(text, cx);
-                    }
+                    self.end_speech(cx);
                 }
+                let _ = spoken;
             }
             CodexEvent::Error(error) => {
                 self.messages.push(Line {
@@ -730,6 +778,16 @@ impl Render for FridayApp {
                             .text_size(px(10.0))
                             .text_color(rgb(RED_FAINT))
                             .child(SharedString::from(format!("thread {thread}"))),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(rgb(if self.voice_phase == voice::VoicePhase::Idle {
+                                RED_FAINT
+                            } else {
+                                RED_SOFT
+                            }))
+                            .child(SharedString::from(voice_label(self.voice_phase, self.level))),
                     ),
             );
 
@@ -792,6 +850,42 @@ fn persona() -> String {
     )
 }
 
+/// Pulls complete sentences out of a growing stream buffer.
+fn take_sentences(buffer: &mut String) -> Vec<String> {
+    let mut out = Vec::new();
+    loop {
+        let mut cut = None;
+        for (index, ch) in buffer.char_indices() {
+            if matches!(ch, '.' | '!' | '?' | '…') {
+                let after = index + ch.len_utf8();
+                let rest = &buffer[after..];
+                if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+                    cut = Some(after);
+                    break;
+                }
+            }
+        }
+        if cut.is_none() && buffer.chars().count() > 220 {
+            // Break long clauses at the last comma/space before the limit.
+            let take: String = buffer.chars().take(220).collect();
+            if let Some(pos) = take.rfind([',', ';', ':', ' ']) {
+                cut = Some(pos + 1);
+            }
+        }
+        match cut {
+            Some(at) if at > 0 => {
+                let sentence = buffer[..at].trim().to_string();
+                buffer.replace_range(..at, "");
+                if !sentence.is_empty() {
+                    out.push(sentence);
+                }
+            }
+            _ => break,
+        }
+    }
+    out
+}
+
 fn shorten(value: &str, max: usize) -> String {
     if value.chars().count() <= max {
         value.to_string()
@@ -802,7 +896,24 @@ fn shorten(value: &str, max: usize) -> String {
     }
 }
 
+fn voice_label(phase: voice::VoicePhase, level: f32) -> String {
+    let bars = (level * 9.0).clamp(0.0, 9.0) as usize;
+    let meter: String = (0..9)
+        .map(|i| if i < bars { '▮' } else { '·' })
+        .collect();
+    match phase {
+        voice::VoicePhase::Idle => "voz · em repouso".to_string(),
+        voice::VoicePhase::Listening => format!("voz · OUVINDO {meter}"),
+        voice::VoicePhase::Transcribing => "voz · TRANSCREVENDO".to_string(),
+        voice::VoicePhase::Speaking => format!("voz · FALANDO {meter}"),
+    }
+}
+
 fn main() {
+    if std::env::args().any(|arg| arg == "--persona") {
+        println!("{}", persona());
+        return;
+    }
     Application::new().run(|cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(900.0), px(680.0)), cx);
         cx.open_window(

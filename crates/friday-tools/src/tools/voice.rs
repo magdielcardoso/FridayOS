@@ -297,6 +297,10 @@ struct VadState {
     silence_frames: u32,
     frames_captured: usize,
     barge_sent: bool,
+    /// Running ambient noise estimate, so a noisy room does not look like speech.
+    noise: f32,
+    /// Frames used to learn the room before we accept any speech.
+    calibrated: u32,
 }
 
 impl VadState {
@@ -308,6 +312,8 @@ impl VadState {
             silence_frames: 0,
             frames_captured: 0,
             barge_sent: false,
+            noise: 0.02,
+            calibrated: 0,
         }
     }
 
@@ -323,14 +329,28 @@ impl VadState {
         let rms = rms(frame);
         let _ = tx.send(VoiceEvent::Level(rms));
 
-        let voiced = rms >= SPEECH_THRESHOLD;
+        // Learn the room for ~1.5 s before trusting the gate: mics differ a lot
+        // and a noisy fan would otherwise look like non-stop speech.
+        if self.calibrated < 6 {
+            self.noise = self.noise.max(rms).min(0.2);
+            self.calibrated += 1;
+            return;
+        }
+        if !self.in_speech {
+            let target = rms.clamp(0.002, 0.08);
+            self.noise += (target - self.noise) * 0.04;
+        }
+        let gate = (self.noise * 2.5).max(SPEECH_THRESHOLD).min(0.16);
+        let barge_gate = (self.noise * 3.5).max(BARGE_THRESHOLD).min(0.2);
 
-        if speaking && rms >= BARGE_THRESHOLD {
+        let voiced = rms >= gate;
+
+        if speaking && rms >= barge_gate {
             if !self.barge_sent {
                 self.barge_sent = true;
                 let _ = tx.send(VoiceEvent::BargeIn);
             }
-        } else if rms < BARGE_THRESHOLD {
+        } else if rms < barge_gate {
             self.barge_sent = false;
         }
 
