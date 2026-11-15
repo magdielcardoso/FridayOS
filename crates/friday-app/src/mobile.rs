@@ -777,7 +777,13 @@ pub fn start(port: u16) -> String {
             };
             let _ = RUNTIME.set(runtime.handle().clone());
             runtime.block_on(async move {
-                let address = SocketAddr::from(([127, 0, 0, 1], port));
+                // Localhost by default. FRIDAY_MOBILE_BIND may point at the
+                // Tailscale IP for direct (non-Serve) access during setup.
+                let ip: IpAddr = std::env::var("FRIDAY_MOBILE_BIND")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(IpAddr::from([127, 0, 0, 1]));
+                let address = SocketAddr::new(ip, port);
                 let listener = match tokio::net::TcpListener::bind(address).await {
                     Ok(listener) => listener,
                     Err(_) => return,
