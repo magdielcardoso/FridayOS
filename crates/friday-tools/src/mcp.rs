@@ -507,7 +507,15 @@ fn tools_call(registry: &Registry, id: Option<Value>, params: &Value) -> Outcome
             }
             "search" => {
                 let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
-                return Outcome::Reply(json!({ "jsonrpc": "2.0", "id": id, "result": search_tools(registry, &args) }));
+                let payload = search_tools(registry, &args);
+                return Outcome::Reply(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "content": [{ "type": "text", "text": payload.to_string() }],
+                        "isError": false
+                    }
+                }));
             }
             "schema" => {
                 let wanted = params
@@ -516,16 +524,22 @@ fn tools_call(registry: &Registry, id: Option<Value>, params: &Value) -> Outcome
                     .unwrap_or("");
                 let found = registry.specs().into_iter().find(|spec| spec.name == wanted);
                 return match found {
-                    Some(spec) => Outcome::Reply(json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "result": {
+                    Some(spec) => {
+                        let payload = json!({
                             "name": spec.name,
                             "description": spec.summary,
                             "risk": spec.risk.label(),
                             "inputSchema": spec.args
-                        }
-                    })),
+                        });
+                        Outcome::Reply(json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "content": [{ "type": "text", "text": payload.to_string() }],
+                                "isError": false
+                            }
+                        }))
+                    }
                     None => Outcome::Reply(error_response(id, INVALID_PARAMS, format!("ferramenta desconhecida: {wanted}"))),
                 };
             }
