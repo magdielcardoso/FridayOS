@@ -483,10 +483,17 @@ fn tools_call(registry: &Registry, id: Option<Value>, params: &Value) -> Outcome
         match name {
             "exec" => {
                 let mut args = params.get("arguments").cloned().unwrap_or(Value::Null);
-                let inner_name = args
+                let raw_name = args
                     .get("name")
+                    .or_else(|| args.get("tool"))
                     .and_then(Value::as_str)
                     .unwrap_or("")
+                    .to_string();
+                // Models often add the server namespace; accept both forms.
+                let inner_name = raw_name
+                    .strip_prefix("friday__")
+                    .or_else(|| raw_name.strip_prefix("friday."))
+                    .unwrap_or(&raw_name)
                     .to_string();
                 let mut call_args = args
                     .get("arguments")
@@ -500,6 +507,23 @@ fn tools_call(registry: &Registry, id: Option<Value>, params: &Value) -> Outcome
                         map.insert("__confirm".into(), json!(confirm));
                         map.insert("__dry_run".into(), json!(dry));
                     }
+                }
+                if registry.get(&inner_name).is_none() {
+                    let suggestions: Vec<String> = registry
+                        .specs()
+                        .iter()
+                        .filter(|spec| spec.name.contains(&inner_name) || inner_name.contains(spec.name))
+                        .take(5)
+                        .map(|spec| spec.name.to_string())
+                        .collect();
+                    return Outcome::Reply(error_response(
+                        id,
+                        INVALID_PARAMS,
+                        format!(
+                            "ferramenta desconhecida: {inner_name} (tente: {})",
+                            suggestions.join(", ")
+                        ),
+                    ));
                 }
                 let forwarded = json!({ "name": inner_name, "arguments": call_args });
                 let _ = &mut args;
