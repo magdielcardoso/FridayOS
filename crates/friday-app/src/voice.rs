@@ -980,7 +980,7 @@ fn check_budget() -> Result<(), String> {
     let budget = std::env::var("FRIDAY_TTS_BUDGET")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(18);
+        .unwrap_or(60);
     if requests.len() >= budget {
         return Err(format!(
             "orçamento local de voz por hora esgotado ({budget} pedidos); tenta de novo em alguns minutos"
