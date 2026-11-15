@@ -362,6 +362,8 @@ struct FridayApp {
     notify_on_done: bool,
     active_app: String,
     active_category: String,
+    cpu: u8,
+    ram: u8,
     tts_stream: bool,
     speaking_since: Option<std::time::Instant>,
     wake: bool,
@@ -405,6 +407,8 @@ impl FridayApp {
             notify_on_done: false,
             active_app: String::new(),
             active_category: String::new(),
+            cpu: 0,
+            ram: 0,
             tts_stream: std::env::var("FRIDAY_TTS_MODE")
                 .map(|mode| mode == "stream")
                 .unwrap_or(false),
@@ -999,11 +1003,17 @@ impl FridayApp {
             })
             .ok();
         cx.spawn(async move |this, cx| {
-            while let Some((app, category)) = ctx_rx.recv().await {
+            while let Some((app, category, cpu, ram)) = ctx_rx.recv().await {
                 let _ = this.update(cx, |state, cx| {
-                    if state.active_app != app || state.active_category != category {
+                    if state.active_app != app
+                        || state.active_category != category
+                        || state.cpu != cpu
+                        || state.ram != ram
+                    {
                         state.active_app = app;
                         state.active_category = category;
+                        state.cpu = cpu;
+                        state.ram = ram;
                         cx.notify();
                     }
                 });
@@ -1329,25 +1339,67 @@ impl FridayApp {
 }
 
 impl Render for FridayApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (status, status_color) = self.status_line();
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let size = window.viewport_size();
+        let vw = f32::from(size.width).max(1.0);
+        let vh = f32::from(size.height).max(1.0);
+        let k = (vw / 1536.0).min(vh / 864.0);
+        let ox = (vw - 1536.0 * k) / 2.0;
+        let oy = (vh - 864.0 * k) / 2.0;
+        let sx = move |value: f32| px(value * k);
+        let lx = move |value: f32| px(ox + value * k);
+        let ly = move |value: f32| px(oy + value * k);
+
+        let (status, _) = self.status_line();
         let clock = self.booted_at.elapsed().as_secs_f32();
         let speaking = self.voice_phase == voice::VoicePhase::Speaking;
         let busy = matches!(self.status, Status::Thinking);
+        let listening = self.mic.is_some();
+        let error = matches!(self.status, Status::Offline);
         let audio = voice::speech_level();
-
-        let (glow, dim, bright) = if busy {
-            (0x3d1d05, 0x8f4a12, 0xff7a1f)
-        } else if speaking {
-            (0x3a0d0d, 0x8f1c1c, 0xff4632)
-        } else {
-            (0x260808, 0x5e1414, 0xd92b23)
-        };
-        let angle = clock * if speaking { 2.0 + audio * 2.0 } else { 0.22 };
+        let meter_source = if speaking { audio } else { self.level };
         let pulse = if speaking {
-            1.0 + 0.10 * audio + 0.012 * (clock * 7.5).sin()
+            1.0 + 0.06 * audio + 0.008 * (clock * 6.0).sin()
+        } else if busy {
+            1.0 + 0.006 * (clock * 1.5).sin()
         } else {
-            1.0 + 0.012 * (clock * 0.8).sin()
+            1.0 + 0.004 * (clock * 0.7).sin()
+        };
+
+        let (red, bright, dark, warm) = if busy {
+            (0xff5a1f, 0xff8a32, 0x5a1a0a, true)
+        } else if error {
+            (0xff1738, 0xff3448, 0x5a0a16, false)
+        } else {
+            (0xff1738, 0xff3448, 0x5a0a16, false)
+        };
+
+        let state_label = if error {
+            "ATENÇÃO"
+        } else if busy {
+            "PENSANDO…"
+        } else if speaking {
+            "FALANDO…"
+        } else if listening {
+            "OUVINDO…"
+        } else {
+            "PRONTO"
+        };
+        let state_sub = if error {
+            "Verifique o diagnóstico".to_string()
+        } else if busy {
+            self.activity
+                .iter()
+                .rev()
+                .find(|activity| activity.state == StepState::Started)
+                .map(|activity| activity.label.clone())
+                .unwrap_or_else(|| "Analisando o contexto…".into())
+        } else if speaking {
+            "Respondendo em voz".to_string()
+        } else if listening {
+            "Fale com a Friday".to_string()
+        } else {
+            "Aguardando comando".to_string()
         };
 
         let orb = canvas(
@@ -1357,508 +1409,540 @@ impl Render for FridayApp {
                 let h = f32::from(bounds.size.height);
                 let cx0 = f32::from(bounds.origin.x) + w / 2.0;
                 let cy0 = f32::from(bounds.origin.y) + h / 2.0;
-                let base = w.min(h) * 0.44 * pulse;
+                let scale = w.min(h) / 570.0;
+                let angle = clock * if warm { 0.45 } else { 0.22 };
+                let breath = pulse;
 
-                paint_arc(window, cx0, cy0, base * 1.03, 0.0, TAU, 12.0, 0x180505);
-                paint_arc(window, cx0, cy0, base * 1.00, 0.0, TAU, 1.2, dim);
-                for i in 0..4 {
-                    let start = angle + i as f32 * TAU / 4.0 + 0.16;
-                    paint_arc(window, cx0, cy0, base * 0.965, start, start + 1.02, 6.0, bright);
+                for radius in [285.0, 265.0, 245.0, 230.0] {
+                    paint_arc(window, cx0, cy0, radius * scale, 0.0, TAU, 0.8, 0x4a0a14);
                 }
-                paint_dashed_ring(window, cx0, cy0, base * 0.90, 2.0, 0x6d1717);
-                for i in 0..3 {
-                    let start = -angle * 0.7 + i as f32 * TAU / 3.0 + 0.32;
-                    paint_arc(window, cx0, cy0, base * 0.78, start, start + 0.95, 11.0, dim);
+                for radius in [215.0, 195.0] {
+                    paint_arc(window, cx0, cy0, radius * scale, 0.0, TAU, 0.6, 0x2e060d);
                 }
-                for i in 0..3 {
-                    let start = angle * 1.6 + i as f32 * TAU / 3.0;
-                    paint_arc(window, cx0, cy0, base * 0.61, start, start + 0.55, 3.0, bright);
+
+                // 120 radial ticks with varying length/opacity.
+                for index in 0..120 {
+                    let t = index as f32 * TAU / 120.0 + angle * 0.15;
+                    let major = index % 10 == 0;
+                    let r1 = 205.0 * scale;
+                    let r2 = (205.0 + if major { 12.0 } else if index % 5 == 0 { 7.0 } else { 3.5 })
+                        * scale;
+                    let color = if major { dark } else { 0x3a0810 };
+                    paint_line(window, cx0, cy0, r1, r2, t, 0.8, color);
                 }
-                for i in 0..48 {
-                    let t = i as f32 * TAU / 48.0 + angle * 0.35;
-                    let r1 = base * 0.50;
-                    let r2 = base * if i % 4 == 0 { 0.545 } else { 0.525 };
-                    paint_line(window, cx0, cy0, r1, r2, t, 1.2, if i % 4 == 0 { dim } else { glow });
+
+                // Luminous arcs: three shells each (glow + mid + core).
+                let mut arc = |start_deg: f32, end_deg: f32, radius: f32, width: f32, color: u32| {
+                    let start = start_deg.to_radians();
+                    let end = end_deg.to_radians();
+                    paint_arc(window, cx0, cy0, radius * scale, start, end, width * 3.0, 0x2a050b);
+                    paint_arc(window, cx0, cy0, radius * scale, start, end, width * 1.8, color);
+                    paint_arc(window, cx0, cy0, radius * scale, start, end, width * 0.8, bright);
+                };
+                arc(280.0 + angle * 8.0, 325.0 + angle * 8.0, 190.0, 9.0, red);
+                arc(20.0 + angle * 6.0, 80.0 + angle * 6.0, 192.0, 6.0, red);
+                arc(120.0 - angle * 5.0, 175.0 - angle * 5.0, 188.0, 8.0, red);
+                arc(200.0 + angle * 4.0, 250.0 + angle * 4.0, 185.0, 5.0, dark);
+                arc(255.0, 268.0, 175.0, 3.0, dark);
+
+                // Inner core.
+                paint_arc(window, cx0, cy0, 120.0 * scale, 0.0, TAU, 1.4, 0x3a0810);
+                paint_arc(window, cx0, cy0, 104.0 * scale, 0.0, TAU, 0.8, 0x26060c);
+                paint_arc(window, cx0, cy0, 88.0 * scale, 0.0, TAU, 0.6, 0x1c050a);
+                paint_arc(window, cx0, cy0, 120.0 * scale, 200.0 + angle * 20.0, 300.0 + angle * 20.0, 3.0, 0x8a0f20);
+
+                // Emblem: hollow inverted triangle (three trapezoid segments).
+                let emblem_cy = cy0 + 15.0 * scale;
+                let top_y = emblem_cy - 43.0 * scale;
+                let bottom_y = emblem_cy + 42.0 * scale;
+                let half = 46.0 * scale;
+                let mut builder = gpui::PathBuilder::fill();
+                builder.move_to(point(px(cx0), px(top_y)));
+                builder.line_to(point(px(cx0 - half), px(bottom_y)));
+                builder.line_to(point(px(cx0 - half + 22.0 * scale), px(bottom_y)));
+                builder.line_to(point(px(cx0), px(top_y + 30.0 * scale)));
+                builder.line_to(point(px(cx0 + half - 22.0 * scale), px(bottom_y)));
+                builder.line_to(point(px(cx0 + half), px(bottom_y)));
+                if let Ok(path) = builder.build() {
+                    window.paint_path(path, rgb(bright));
                 }
-                paint_arc(window, cx0, cy0, base * 0.46, 0.0, TAU, 2.0, glow);
-                paint_arc(window, cx0, cy0, base * 0.34, 0.0, TAU, 1.2, glow);
-                paint_arc(window, cx0, cy0, base * 0.22, 0.0, TAU, 1.0, glow);
-                paint_arc(
-                    window,
-                    cx0,
-                    cy0,
-                    base * 0.99,
-                    -2.55 + angle * 0.2,
-                    -2.05 + angle * 0.2,
-                    4.0,
-                    0x7c1a1a,
-                );
+                let mut inner = gpui::PathBuilder::fill();
+                inner.move_to(point(px(cx0), px(top_y + 26.0 * scale)));
+                inner.line_to(point(px(cx0 - 16.0 * scale), px(bottom_y - 16.0 * scale)));
+                inner.line_to(point(px(cx0 + 16.0 * scale), px(bottom_y - 16.0 * scale)));
+                if let Ok(path) = inner.build() {
+                    window.paint_path(path, rgb(0x030304));
+                }
             },
         )
-        .size(px(520.0));
+        .size(sx(570.0));
 
-        let answer = if !self.stream.is_empty() {
+        let logo = canvas(
+            |_bounds, _window, _cx| {},
+            move |bounds, _, window, _cx| {
+                let x = f32::from(bounds.origin.x);
+                let y = f32::from(bounds.origin.y);
+                let w = f32::from(bounds.size.width);
+                let h = f32::from(bounds.size.height);
+                let mut builder = gpui::PathBuilder::fill();
+                builder.move_to(point(px(x), px(y)));
+                builder.line_to(point(px(x + w), px(y)));
+                builder.line_to(point(px(x + w / 2.0), px(y + h)));
+                builder.line_to(point(px(x), px(y)));
+                if let Ok(path) = builder.build() {
+                    window.paint_path(path, rgb(0xff1738));
+                }
+            },
+        )
+        .size(sx(35.0));
+
+        let speech = if !self.stream.is_empty() {
             self.stream.replace('\r', "")
-        } else {
+        } else if speaking || busy {
             self.messages
                 .iter()
                 .rev()
                 .find(|line| line.role == Role::Friday)
                 .map(|line| line.text.replace('\r', ""))
                 .unwrap_or_default()
-        };
-        let trace: String = self
-            .reasoning
-            .replace('\r', "")
-            .chars()
-            .rev()
-            .take(420)
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect();
-        let waiting = busy || self.activity.iter().any(|a| a.state == StepState::Started);
-        let phase_line = match self.voice_phase {
-            voice::VoicePhase::Idle => "em repouso",
-            voice::VoicePhase::Listening => "ouvindo",
-            voice::VoicePhase::Transcribing => "transcrevendo",
-            voice::VoicePhase::Speaking => "falando",
-        };
-        let level = if speaking { audio.max(self.level * 0.6) } else { self.level };
-        let meter = bars(level, 22);
-        let clock_text = clock_hhmm();
-
-        let mut left = div().flex().flex_col().gap(px(16.0)).w(px(330.0)).flex_none();
-        left = left.child(
-            hud_panel("RESPOSTA", bright).child(
-                div()
-                    .text_size(px(14.0))
-                    .line_height(px(22.0))
-                    .text_color(rgb(BONE))
-                    .child(SharedString::from(if answer.is_empty() {
-                        "aguardando comando…".to_string()
-                    } else {
-                        answer
-                    })),
-            ),
-        );
-        if !trace.is_empty() {
-            left = left.child(
-                hud_panel("RACIOCÍNIO", dim).child(
-                    div()
-                        .text_size(px(10.0))
-                        .line_height(px(15.0))
-                        .text_color(rgb(RED_DIM))
-                        .child(SharedString::from(format_reasoning(&trace))),
-                ),
-            );
-        }
-        if waiting {
-            let mut tasks = hud_panel("TAREFAS", 0xff7a1f);
-            let pending: Vec<&Activity> = self
-                .activity
-                .iter()
-                .filter(|a| a.state != StepState::Completed)
-                .collect();
-            for activity in pending.iter().rev().take(5).rev() {
-                let color = match activity.state {
-                    StepState::Started => 0xff7a1f,
-                    StepState::Failed => RED,
-                    StepState::Completed => RED_FAINT,
-                };
-                tasks = tasks.child(
-                    div()
-                        .flex()
-                        .gap(px(8.0))
-                        .text_size(px(10.5))
-                        .text_color(rgb(color))
-                        .child(SharedString::from(match activity.state {
-                            StepState::Started => "▸",
-                            StepState::Failed => "✗",
-                            StepState::Completed => "✓",
-                        }))
-                        .child(SharedString::from(activity.label.clone())),
-                );
-            }
-            if self.activity.iter().all(|a| a.state == StepState::Completed) {
-                tasks = tasks.child(
-                    div()
-                        .text_size(px(10.0))
-                        .text_color(rgb(RED_FAINT))
-                        .child(SharedString::from("aguardando o modelo…")),
-                );
-            }
-            left = left.child(tasks);
-        }
-
-        let mut agents = hud_panel("SUBAGENTES", RED_DIM);
-        if self.assistants.is_empty() {
-            agents = agents.child(
-                div()
-                    .text_size(px(10.0))
-                    .text_color(rgb(RED_FAINT))
-                    .child(SharedString::from("nenhum criado")),
-            );
         } else {
-            for (name, role) in self.assistants.iter().take(6) {
-                agents = agents.child(
-                    div()
-                        .flex()
-                        .justify_between()
-                        .gap(px(8.0))
-                        .child(
-                            div()
-                                .text_size(px(11.0))
-                                .text_color(rgb(RED))
-                                .child(SharedString::from(format!("◇ {name}"))),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(9.0))
-                                .text_color(rgb(RED_FAINT))
-                                .child(SharedString::from(role.clone())),
-                        ),
-                );
-            }
-        }
-        left = left.child(agents);
+            String::new()
+        };
+        let speech: String = speech.chars().take(180).collect();
+        let show_speech = !speech.is_empty() && (speaking || busy);
 
-        let mut right = div().flex().flex_col().gap(px(16.0)).w(px(250.0)).flex_none();
-        right = right.child(
-            hud_panel("VOCÊ", RED_DIM).child(
+        let mut waveform = div().flex().items_center().gap(sx(3.0));
+        let bars = 64usize;
+        for index in 0..bars {
+            let center_distance = ((index as f32 - bars as f32 / 2.0) / (bars as f32 / 2.0)).abs();
+            let envelope = (1.0 - center_distance).powf(1.4);
+            let wobble = if busy {
+                0.25 + 0.2 * ((clock * 3.0 + index as f32 * 0.7).sin() * 0.5 + 0.5)
+            } else {
+                0.08
+            };
+            let amplitude = if speaking || listening {
+                (meter_source * 1.2 + 0.05).clamp(0.0, 1.0)
+            } else {
+                wobble
+            };
+            let height = (6.0 + 58.0 * envelope * amplitude) * k;
+            waveform = waveform.child(
                 div()
-                    .text_size(px(11.0))
-                    .line_height(px(17.0))
-                    .text_color(rgb(BONE))
-                    .child(SharedString::from(if self.transcript.is_empty() {
-                        "—".to_string()
-                    } else {
-                        self.transcript.clone()
-                    })),
-            ),
-        );
-        right = right.child(
-            hud_panel("VOZ", RED_DIM)
-                .child(
-                    div()
-                        .flex()
-                        .justify_between()
-                        .text_size(px(10.0))
-                        .text_color(rgb(if speaking { bright } else { RED_DIM }))
-                        .child(SharedString::from(phase_line))
-                        .child(SharedString::from(if speaking {
-                            "● live"
-                        } else {
-                            "○"
-                        })),
-                )
-                .child(
-                    div()
-                        .text_size(px(12.0))
-                        .text_color(rgb(if speaking { bright } else { dim }))
-                        .child(SharedString::from(meter.clone())),
-                )
-                .child(
-                    div()
-                        .text_size(px(9.0))
-                        .text_color(rgb(RED_FAINT))
-                        .child(SharedString::from("f2 alterna mic · f3 wake word")),
-                ),
-        );
-        right = right.child(
-            hud_panel("SISTEMA", RED_DIM)
-                .child(
-                    div()
-                        .flex()
-                        .justify_between()
-                        .text_size(px(10.0))
-                        .text_color(rgb(RED_DIM))
-                        .child(SharedString::from("ferramentas"))
-                        .child(SharedString::from(format!("{}", self.tools))),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .justify_between()
-                        .text_size(px(10.0))
-                        .text_color(rgb(RED_DIM))
-                        .child(SharedString::from("uptime"))
-                        .child(SharedString::from(format!(
-                            "{}s",
-                            self.booted_at.elapsed().as_secs()
-                        ))),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .justify_between()
-                        .text_size(px(10.0))
-                        .text_color(rgb(RED_DIM))
-                        .child(SharedString::from("contexto"))
-                        .child(SharedString::from(if self.active_app.is_empty() {
-                            "—".to_string()
-                        } else {
-                            self.active_app.clone()
-                        })),
-                ),
-        );
+                    .w(sx(2.0))
+                    .h(px(height.max(1.0)))
+                    .bg(rgb(if amplitude > 0.25 { bright } else { dark })),
+            );
+        }
 
-        let input_line = format!("› {}{}", self.input, if self.blink { "█" } else { " " });
+        let pending_tasks = self
+            .activity
+            .iter()
+            .filter(|activity| activity.state == StepState::Started)
+            .count();
 
         div()
             .flex()
             .flex_col()
             .size_full()
             .relative()
-            .bg(rgb(BG))
-            .text_color(rgb(RED))
-            .font_family("Menlo")
+            .bg(rgb(0x030304))
+            .text_color(rgb(0xff1738))
+            .font_family("SF Pro Display")
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
                 this.on_key(event, cx)
             }))
-            .child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .child(matrix_background(clock)),
-            )
             // Header
             .child(
                 div()
+                    .absolute()
+                    .left(lx(35.0))
+                    .top(ly(22.0))
+                    .child(logo),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(lx(92.0))
+                    .top(ly(20.0))
                     .flex()
-                    .justify_between()
                     .items_center()
-                    .px(px(26.0))
-                    .py(px(16.0))
-                    .border_b_1()
-                    .border_color(rgb(RED_FAINT))
+                    .gap(sx(14.0))
+                    .child(
+                        div()
+                            .text_size(sx(27.0))
+                            .text_color(rgb(0xf4f4f6))
+                            .child(SharedString::from("FRIDAY")),
+                    )
+                    .child(div().w(sx(1.0)).h(sx(20.0)).bg(rgb(0x64101d)))
+                    .child(
+                        div()
+                            .font_family("SF Mono")
+                            .text_size(sx(12.0))
+                            .text_color(rgb(0x85848c))
+                            .child(SharedString::from("ASSISTENTE PESSOAL DE IA")),
+                    ),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .right(lx(36.0))
+                    .top(ly(24.0))
+                    .flex()
+                    .items_center()
+                    .gap(sx(16.0))
+                    .font_family("SF Mono")
+                    .text_size(sx(12.0))
+                    .text_color(rgb(0x85848c))
+                    .child(div().w(sx(7.0)).h(sx(7.0)).rounded_full().bg(rgb(0xff1738)))
+                    .child(SharedString::from(if self.active_app.is_empty() {
+                        "FORA"
+                    } else {
+                        "EM CASA"
+                    }))
+                    .child(SharedString::from("≋"))
+                    .child(div().w(sx(1.0)).h(sx(16.0)).bg(rgb(0x64101d)))
+                    .child(
+                        div()
+                            .text_color(rgb(0xf4f4f6))
+                            .child(SharedString::from(clock_hhmm())),
+                    )
+                    .child(SharedString::from(date_label())),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(lx(20.0))
+                    .right(lx(20.0))
+                    .top(ly(66.0))
+                    .h(px(1.0))
+                    .bg(rgb(0x64101d)),
+            )
+            // Orb
+            .child(
+                div()
+                    .absolute()
+                    .left(lx(483.0))
+                    .top(ly(45.0))
+                    .child(orb),
+            )
+            // Processing indicator (left)
+            .child(
+                div()
+                    .absolute()
+                    .left(lx(155.0))
+                    .top(ly(280.0))
+                    .flex()
+                    .flex_col()
+                    .gap(sx(8.0))
                     .child(
                         div()
                             .flex()
                             .items_center()
-                            .gap(px(14.0))
+                            .gap(sx(14.0))
                             .child(
                                 div()
-                                    .text_size(px(13.0))
-                                    .text_color(rgb(RED))
-                                    .child(SharedString::from("F R I D A Y")),
+                                    .w(sx(22.0))
+                                    .h(sx(22.0))
+                                    .rounded_full()
+                                    .border_2()
+                                    .border_color(rgb(if busy { 0xff8a32 } else { 0xff1738 })),
                             )
                             .child(
                                 div()
-                                    .text_size(px(8.5))
-                                    .text_color(rgb(RED_FAINT))
-                                    .child(SharedString::from("OS · 0.1 · CODEX")),
+                                    .font_family("SF Pro Display")
+                                    .text_size(sx(20.0))
+                                    .text_color(rgb(if busy { 0xff8a32 } else { 0xff1738 }))
+                                    .child(SharedString::from(state_label)),
                             ),
                     )
                     .child(
                         div()
-                            .flex()
-                            .items_center()
-                            .gap(px(18.0))
-                            .child(
-                                div()
-                                    .text_size(px(9.0))
-                                    .text_color(rgb(RED_DIM))
-                                    .child(SharedString::from(if self.active_app.is_empty() {
-                                        "ctx —".to_string()
-                                    } else {
-                                        format!(
-                                            "ctx · {}{}",
-                                            self.active_app,
-                                            if self.active_category.is_empty() {
-                                                String::new()
-                                            } else {
-                                                format!(" · {}", short_category(&self.active_category))
-                                            }
-                                        )
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(9.0))
-                                    .text_color(rgb(RED_FAINT))
-                                    .child(SharedString::from(clock_text)),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(8.0))
-                                    .text_size(px(10.0))
-                                    .text_color(rgb(status_color))
-                                    .child(SharedString::from(if busy { "◉" } else { "○" }))
-                                    .child(SharedString::from(status)),
-                            ),
+                            .font_family("SF Mono")
+                            .text_size(sx(13.0))
+                            .text_color(rgb(0x85848c))
+                            .child(SharedString::from(state_sub)),
                     ),
             )
-            // Body: left rail / orb / right rail
             .child(
                 div()
+                    .absolute()
+                    .left(lx(390.0))
+                    .top(ly(292.0))
+                    .w(sx(210.0))
+                    .h(px(1.0))
+                    .bg(rgb(0x64101d)),
+            )
+            // Context panel (right)
+            .child(
+                div()
+                    .absolute()
+                    .left(lx(1195.0))
+                    .top(ly(204.0))
+                    .w(sx(300.0))
+                    .rounded(sx(18.0))
+                    .border_1()
+                    .border_color(rgb(0x5a0a16))
+                    .bg(rgb(0x080608))
+                    .p(sx(18.0))
                     .flex()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .gap(px(24.0))
-                    .px(px(26.0))
-                    .py(px(20.0))
-                    .child(left)
+                    .flex_col()
+                    .gap(sx(12.0))
                     .child(
                         div()
                             .flex()
+                            .items_center()
+                            .gap(sx(10.0))
+                            .child(div().w(sx(6.0)).h(sx(6.0)).rounded_full().bg(rgb(0xff1738)))
+                            .child(
+                                div()
+                                    .font_family("SF Mono")
+                                    .text_size(sx(13.0))
+                                    .text_color(rgb(0xf4f4f6))
+                                    .child(SharedString::from("CONTEXTO ATUAL")),
+                            ),
+                    )
+                    .child(div().h(px(1.0)).bg(rgb(0x64101d)))
+                    .child(context_row(
+                        "⌂",
+                        "Em casa",
+                        &format!("Rede Wi-Fi: {}", if self.active_app.is_empty() { "—" } else { "Casa" }),
+                        sx,
+                    ))
+                    .child(div().h(px(1.0)).bg(rgb(0x3a0810)))
+                    .child(context_row("▦", "Próximos compromissos", "Nenhum agendado", sx))
+                    .child(div().h(px(1.0)).bg(rgb(0x3a0810)))
+                    .child(context_row(
+                        "✓",
+                        "Tarefas pendentes",
+                        &format!("{pending_tasks} em andamento"),
+                        sx,
+                    )),
+            )
+            // Speech capsule
+            .child(
+                div()
+                    .absolute()
+                    .left(lx(462.0))
+                    .top(ly(580.0))
+                    .w(sx(610.0))
+                    .h(sx(82.0))
+                    .rounded(sx(41.0))
+                    .border_1()
+                    .border_color(rgb(0xff1738))
+                    .bg(rgba(0x0a0305f0))
+                    .flex()
+                    .items_center()
+                    .gap(sx(18.0))
+                    .px(sx(28.0))
+                    .when(!show_speech, |capsule| capsule.opacity(0.35))
+                    .child(
+                        div()
+                            .font_family("SF Mono")
+                            .text_size(sx(14.0))
+                            .text_color(rgb(0xff3448))
+                            .child(SharedString::from("▮▮▮")),
+                    )
+                    .child(
+                        div()
                             .flex_1()
-                            .flex_col()
-                            .items_center()
-                            .justify_center()
-                            .gap(px(14.0))
-                            .child(
-                                div()
-                                    .relative()
-                                    .size(px(520.0))
-                                    .flex_none()
-                                    .child(orb)
-                                    .child(
-                                        div()
-                                            .absolute()
-                                            .inset_0()
-                                            .flex()
-                                            .flex_col()
-                                            .items_center()
-                                            .justify_center()
-                                            .gap(px(6.0))
-                                            .child(
-                                                div()
-                                                    .text_size(px(26.0))
-                                                    .text_color(rgb(bright))
-                                                    .child(SharedString::from("F.R.I.D.A.Y.")),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_size(px(8.5))
-                                                    .text_color(rgb(RED_FAINT))
-                                                    .child(SharedString::from("SISTEMA NOMINAL")),
-                                            ),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(12.0))
-                                    .text_color(rgb(if speaking { bright } else { dim }))
-                                    .child(SharedString::from(meter)),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(9.0))
-                                    .text_color(rgb(RED_FAINT))
-                                    .child(SharedString::from(match self.voice_phase {
-                                        voice::VoicePhase::Idle => "aguardando",
-                                        voice::VoicePhase::Listening => "ouvindo você",
-                                        voice::VoicePhase::Transcribing => "transcrevendo…",
-                                        voice::VoicePhase::Speaking => "respondendo em voz",
-                                    })),
-                            ),
-                    )
-                    .child(right),
+                            .text_size(sx(16.0))
+                            .text_color(rgb(0xf4f4f6))
+                            .child(SharedString::from(if speech.is_empty() {
+                                "Aguardando o senhor…".to_string()
+                            } else {
+                                speech
+                            })),
+                    ),
             )
-            // Command bar
+            // Waveform
             .child(
                 div()
+                    .absolute()
+                    .left(lx(518.0))
+                    .top(ly(708.0))
+                    .w(sx(500.0))
+                    .h(sx(80.0))
                     .flex()
-                    .justify_between()
                     .items_center()
-                    .px(px(26.0))
-                    .py(px(14.0))
-                    .border_t_1()
-                    .border_color(rgb(RED_FAINT))
+                    .child(waveform),
+            )
+            // System status (bottom-left)
+            .child(
+                div()
+                    .absolute()
+                    .left(lx(28.0))
+                    .top(ly(792.0))
+                    .w(sx(300.0))
+                    .h(sx(56.0))
+                    .rounded(sx(14.0))
+                    .border_1()
+                    .border_color(rgb(0x5a0a16))
+                    .bg(rgb(0x080608))
+                    .flex()
+                    .items_center()
+                    .gap(sx(14.0))
+                    .px(sx(16.0))
                     .child(
                         div()
-                            .text_size(px(13.0))
-                            .text_color(rgb(RED))
-                            .child(SharedString::from(input_line)),
+                            .text_size(sx(16.0))
+                            .text_color(rgb(0xff1738))
+                            .child(SharedString::from("⌁")),
                     )
                     .child(
                         div()
-                            .text_size(px(9.0))
-                            .text_color(rgb(RED_FAINT))
-                            .child(SharedString::from("⏎ enviar · f2 mic · f3 wake · esc interromper")),
+                            .flex()
+                            .flex_col()
+                            .gap(sx(2.0))
+                            .child(
+                                div()
+                                    .font_family("SF Mono")
+                                    .text_size(sx(12.0))
+                                    .text_color(rgb(0xf4f4f6))
+                                    .child(SharedString::from("SISTEMA")),
+                            )
+                            .child(
+                                div()
+                                    .font_family("SF Mono")
+                                    .text_size(sx(11.0))
+                                    .text_color(rgb(0x85848c))
+                                    .child(SharedString::from(format!(
+                                        "CPU {}% • RAM {}%",
+                                        self.cpu, self.ram
+                                    ))),
+                            ),
+                    ),
+            )
+            // Listening status (bottom-right)
+            .child(
+                div()
+                    .absolute()
+                    .right(lx(28.0))
+                    .top(ly(792.0))
+                    .w(sx(250.0))
+                    .h(sx(56.0))
+                    .rounded(sx(14.0))
+                    .border_1()
+                    .border_color(rgb(0x5a0a16))
+                    .bg(rgb(0x080608))
+                    .flex()
+                    .items_center()
+                    .gap(sx(12.0))
+                    .px(sx(16.0))
+                    .child(
+                        div()
+                            .font_family("SF Mono")
+                            .text_size(sx(14.0))
+                            .text_color(rgb(0xff1738))
+                            .child(SharedString::from("▮▮▮")),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(sx(2.0))
+                            .child(
+                                div()
+                                    .font_family("SF Mono")
+                                    .text_size(sx(12.0))
+                                    .text_color(rgb(if listening { 0xf4f4f6 } else { 0x85848c }))
+                                    .child(SharedString::from(if listening {
+                                        "OUVINDO…"
+                                    } else {
+                                        "MIC FECHADO"
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .font_family("SF Mono")
+                                    .text_size(sx(11.0))
+                                    .text_color(rgb(0x85848c))
+                                    .child(SharedString::from(if listening {
+                                        "Diga “Friday” para acordar"
+                                    } else {
+                                        "F2 para ouvir"
+                                    })),
+                            ),
                     ),
             )
     }
-}
-
-fn format_reasoning(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut in_code = false;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("```") {
-            in_code = !in_code;
-            continue;
-        }
-        if in_code {
-            out.push_str(trimmed);
-            out.push('\n');
-            continue;
-        }
-        let mut clean = trimmed.to_string();
-        if clean.starts_with('#') {
-            clean = clean.trim_start_matches('#').trim().to_string();
-        }
-        if clean.starts_with("- ") || clean.starts_with("* ") || clean.starts_with("+ ") {
-            clean = format!("· {}", clean[2..].trim());
-        }
-        clean = clean.replace("**", "").replace("__", "").replace("`", "");
-        if !clean.trim().is_empty() {
-            out.push_str(&clean);
-            out.push('\n');
-        }
-    }
-    out
-}
-
-/// Reusable HUD panel: thin border, translucent fill, uppercase label.
-fn hud_panel(title: &'static str, accent: u32) -> gpui::Div {
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(10.0))
-        .p(px(14.0))
-        .border_1()
-        .border_color(rgb(RED_FAINT))
-        .bg(rgba(0x090303e6))
-        .child(
-            div()
-                .flex()
-                .justify_between()
-                .items_center()
-                .child(
-                    div()
-                        .text_size(px(9.0))
-                        .text_color(rgb(accent))
-                        .child(SharedString::from(format!("▌ {title}"))),
-                )
-                .child(
-                    div()
-                        .text_size(px(8.0))
-                        .text_color(rgb(RED_FAINT))
-                        .child(SharedString::from("◇")),
-                ),
-        )
-}
-
-fn bars(level: f32, width: usize) -> String {
-    let filled = (level.clamp(0.0, 1.0) * width as f32).round() as usize;
-    (0..width)
-        .map(|index| if index < filled { '▮' } else { '·' })
-        .collect()
 }
 
 fn clock_hhmm() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|duration| duration.as_secs())
         .unwrap_or(0);
     let rem = secs % 86_400;
     format!("{:02}:{:02}", rem / 3600, (rem % 3600) / 60)
+}
+
+fn context_row(
+    icon: &'static str,
+    title: &str,
+    subtitle: &str,
+    sx: impl Fn(f32) -> gpui::Pixels,
+) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(sx(14.0))
+        .child(
+            div()
+                .text_size(sx(20.0))
+                .text_color(rgb(0xff1738))
+                .child(SharedString::from(icon)),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(sx(2.0))
+                .child(
+                    div()
+                        .font_family("SF Mono")
+                        .text_size(sx(13.0))
+                        .text_color(rgb(0xf4f4f6))
+                        .child(SharedString::from(title.to_string())),
+                )
+                .child(
+                    div()
+                        .font_family("SF Mono")
+                        .text_size(sx(11.0))
+                        .text_color(rgb(0x85848c))
+                        .child(SharedString::from(subtitle.to_string())),
+                ),
+        )
+}
+
+fn date_label() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let days = (secs / 86_400) as i64;
+    let (year, month, day) = civil(days);
+    let weekday = ((days + 4) % 7) as usize;
+    let names = ["DOM", "SEG", "TER", "QUA", "QUI", "SEX", "SÁB"];
+    let months = [
+        "JAN", "FEV", "MAR", "ABR", "MAI", "JUN", "JUL", "AGO", "SET", "OUT", "NOV", "DEZ",
+    ];
+    let _ = year;
+    format!("{}, {:02} {}", names[weekday], day, months[(month - 1) as usize])
+}
+
+fn civil(days_since_epoch: i64) -> (i64, u32, u32) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 const TAU: f32 = std::f32::consts::TAU;
@@ -2605,7 +2689,7 @@ fn main() {
     });
 }
 
-fn current_context() -> (String, String) {
+fn current_context() -> (String, String, u8, u8) {
     let front = std::process::Command::new("/usr/bin/lsappinfo")
         .arg("front")
         .output()
@@ -2613,7 +2697,7 @@ fn current_context() -> (String, String) {
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
         .unwrap_or_default();
     if front.is_empty() {
-        return (String::new(), String::new());
+        return (String::new(), String::new(), 0, 0);
     }
     let info = std::process::Command::new("/usr/bin/lsappinfo")
         .args(["info", "-only", "bundleID,name", &front])
@@ -2679,7 +2763,60 @@ fn current_context() -> (String, String) {
             }
         }
     }
-    (name, category)
+    (name, category, cpu_usage(), ram_usage())
+}
+
+fn cpu_usage() -> u8 {
+    let output = std::process::Command::new("/bin/ps")
+        .args(["-A", "-o", "%cpu="])
+        .output();
+    let Ok(output) = output else { return 0 };
+    let total: f32 = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse::<f32>().ok())
+        .sum();
+    let cores = std::thread::available_parallelism()
+        .map(|value| value.get() as f32)
+        .unwrap_or(4.0);
+    ((total / cores).clamp(0.0, 100.0)) as u8
+}
+
+fn ram_usage() -> u8 {
+    let output = std::process::Command::new("/usr/bin/vm_stat").output();
+    let Ok(output) = output else { return 0 };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let page = text
+        .lines()
+        .next()
+        .and_then(|line| line.split("page size of ").nth(1))
+        .and_then(|part| part.split(' ').next())
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(4096.0);
+    let mut active = 0.0;
+    let mut wired = 0.0;
+    let mut compressed = 0.0;
+    for line in text.lines() {
+        let value = || {
+            line.split(':')
+                .nth(1)
+                .map(|part| part.trim().trim_end_matches('.').parse::<f64>().unwrap_or(0.0))
+        };
+        if line.starts_with("Pages active") {
+            active = value().unwrap_or(0.0);
+        } else if line.starts_with("Pages wired") {
+            wired = value().unwrap_or(0.0);
+        } else if line.starts_with("Pages occupied by compressor") {
+            compressed = value().unwrap_or(0.0);
+        }
+    }
+    let total = std::process::Command::new("/usr/sbin/sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8_lossy(&out.stdout).trim().parse::<f64>().ok())
+        .unwrap_or(16.0 * 1024.0 * 1024.0 * 1024.0);
+    let used = (active + wired + compressed) * page;
+    ((used / total) * 100.0).clamp(0.0, 100.0) as u8
 }
 
 fn short_category(category: &str) -> &str {
