@@ -914,6 +914,15 @@ fn main() {
         println!("{}", persona());
         return;
     }
+    if let Some(index) = std::env::args().position(|arg| arg == "--say") {
+        let text = std::env::args().nth(index + 1).unwrap_or_else(|| "Friday online.".into());
+        let cancel = Arc::new(AtomicBool::new(false));
+        match voice::speak(&text, &cancel) {
+            Ok(()) => println!("voz: ok"),
+            Err(error) => eprintln!("voz: {error}"),
+        }
+        return;
+    }
     Application::new().run(|cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(900.0), px(680.0)), cx);
         cx.open_window(
