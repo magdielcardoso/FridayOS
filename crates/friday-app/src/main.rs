@@ -1919,14 +1919,36 @@ impl Render for FridayApp {
                     .bg(rgba(0x080608f0))
                     .child(
                         div()
-                            .font_family("SF Mono")
-                            .text_size(sx(9.0))
-                            .text_color(rgb(0x8a1c1c))
-                            .child(SharedString::from(if self.assistant_busy {
-                                "SUBAGENTES · trabalhando…"
-                            } else {
-                                "SUBAGENTES · clique para escrever"
-                            })),
+                            .flex()
+                            .justify_between()
+                            .items_center()
+                            .child(
+                                div()
+                                    .font_family("SF Mono")
+                                    .text_size(sx(9.0))
+                                    .text_color(rgb(0x8a1c1c))
+                                    .child(SharedString::from(if self.assistant_busy {
+                                        "SUBAGENTES · trabalhando…"
+                                    } else {
+                                        "SUBAGENTES · clique para escrever"
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("agents-close")
+                                    .cursor_pointer()
+                                    .px(sx(4.0))
+                                    .text_size(sx(11.0))
+                                    .text_color(rgb(0x8a1c1c))
+                                    .child(SharedString::from("×"))
+                                    .on_mouse_down(
+                                        gpui::MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.agents_hidden = true;
+                                            cx.notify();
+                                        }),
+                                    ),
+                            ),
                     );
                 for (name, role) in self.assistants.iter().take(6) {
                     let target = name.clone();

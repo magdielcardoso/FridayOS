@@ -111,7 +111,7 @@ pub fn open_from_query(cx: &mut App, query: &str) -> Result<WindowHandle<GraphPa
 }
 
 impl Render for GraphPanel {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let nodes = self.nodes.clone();
         let edges = self.edges.clone();
         let highlight = self.highlight.clone();
@@ -228,9 +228,31 @@ impl Render for GraphPanel {
                 .border_color(rgb(RED_GHOST))
                 .child(
                     div()
-                        .text_size(px(10.5))
-                        .text_color(rgb(RED))
-                        .child(SharedString::from("▌ GRAFO DE CONHECIMENTO")),
+                        .flex()
+                        .justify_between()
+                        .items_center()
+                        .gap(px(24.0))
+                        .child(
+                            div()
+                                .text_size(px(10.5))
+                                .text_color(rgb(RED))
+                                .child(SharedString::from("▌ GRAFO DE CONHECIMENTO")),
+                        )
+                        .child(
+                            div()
+                                .id("graph-close")
+                                .cursor_pointer()
+                                .px(px(5.0))
+                                .rounded(px(4.0))
+                                .hover(|style| style.bg(rgba(0x2a0505ff)))
+                                .text_size(px(12.0))
+                                .text_color(rgb(RED_BRIGHT))
+                                .child(SharedString::from("×"))
+                                .on_mouse_down(
+                                    gpui::MouseButton::Left,
+                                    cx.listener(|_, _, window, _| window.remove_window()),
+                                ),
+                        ),
                 )
                 .child(div().text_size(px(9.0)).text_color(rgb(RED_DIM)).child(
                     SharedString::from(format!(
