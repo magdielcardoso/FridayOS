@@ -1133,6 +1133,10 @@ impl FridayApp {
                     return;
                 }
                 let mut spoken = None;
+                log(format!(
+                    "done: status={status} stream={} chars",
+                    self.stream.chars().count()
+                ));
                 if !self.stream.trim().is_empty() {
                     let text = std::mem::take(&mut self.stream);
                     spoken = Some(text.clone());
@@ -1183,7 +1187,7 @@ impl FridayApp {
     }
 
     fn inject_trigger(&mut self, source: String, prompt: String, cx: &mut Context<Self>) {
-        log(format!("gatilho: {source}"));
+        log(format!("gatilho: {source} · {} chars", prompt.chars().count()));
         if self.warming {
             self.external_pending.push_back((source, prompt));
             return;
@@ -1262,7 +1266,6 @@ impl FridayApp {
         self.stream.clear();
         self.status = Status::Thinking;
         self.last_activity = std::time::Instant::now();
-        self.last_answer.clear();
         self.reasoning.clear();
         self.notify_on_done = false;
         mobile::user_message(&text);
