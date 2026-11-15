@@ -35,6 +35,24 @@ func hasOutput(_ device: AudioDeviceID) -> Bool {
     return status == noErr && size > 0
 }
 
+func jackConnected(_ device: AudioDeviceID) -> Bool? {
+    // 'jack' — whether something is plugged into the analog jack.
+    let selector = AudioObjectPropertySelector(0x6A61636B)
+    var address = propertyAddress(selector)
+    var value: UInt32 = 0
+    var size = UInt32(MemoryLayout<UInt32>.size)
+    let status = AudioObjectGetPropertyData(device, &address, 0, nil, &size, &value)
+    return status == noErr ? value != 0 : nil
+}
+
+func outputVolume(_ device: AudioDeviceID) -> Float? {
+    var address = propertyAddress(kAudioDevicePropertyVolumeScalar, scope: kAudioObjectPropertyScopeOutput)
+    var value: Float32 = 0
+    var size = UInt32(MemoryLayout<Float32>.size)
+    let status = AudioObjectGetPropertyData(device, &address, 0, nil, &size, &value)
+    return status == noErr ? value : nil
+}
+
 func allDevices() -> [AudioDeviceID] {
     var address = propertyAddress(kAudioHardwarePropertyDevices)
     var size: UInt32 = 0
@@ -55,12 +73,15 @@ let current = readDefaultOutput()
 
 switch command {
 case "current":
-    print("{\"name\":\"\(jsonEscape(deviceName(current)))\",\"id\":\(current)}")
+    let jack = jackConnected(current).map { $0 ? "true" : "false" } ?? "null"
+    let volume = outputVolume(current).map { String(format: "%.2f", $0) } ?? "null"
+    print("{\"name\":\"\(jsonEscape(deviceName(current)))\",\"id\":\(current),\"jack\":\(jack),\"volume\":\(volume)}")
 case "list":
     var rows: [String] = []
     for device in allDevices() where hasOutput(device) {
         let marker = device == current ? "true" : "false"
-        rows.append("{\"name\":\"\(jsonEscape(deviceName(device)))\",\"id\":\(device),\"default\":\(marker)}")
+        let jack = jackConnected(device).map { $0 ? "true" : "false" } ?? "null"
+        rows.append("{\"name\":\"\(jsonEscape(deviceName(device)))\",\"id\":\(device),\"default\":\(marker),\"jack\":\(jack)}")
     }
     print("[" + rows.joined(separator: ",") + "]")
 case "set":

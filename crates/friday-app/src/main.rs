@@ -524,20 +524,25 @@ impl FridayApp {
                 current
             },
             |app, raw, cx| {
-                let name = raw
+                let value = raw
                     .as_deref()
                     .and_then(|text| serde_json::from_str::<serde_json::Value>(text.trim()).ok())
-                    .and_then(|value| {
-                        value
-                            .get("name")
-                            .and_then(|name| name.as_str())
-                            .map(str::to_owned)
-                    })
-                    .unwrap_or_else(|| "desconhecida".into());
-                log(format!("áudio: saída atual {name}"));
+                    .unwrap_or(serde_json::Value::Null);
+                let name = value
+                    .get("name")
+                    .and_then(|name| name.as_str())
+                    .unwrap_or("desconhecida")
+                    .to_string();
+                let jack = value.get("jack").and_then(|jack| jack.as_bool());
+                let detail = match jack {
+                    Some(false) => format!("saída de áudio: {name} · FONE DESCONECTADO"),
+                    Some(true) => format!("saída de áudio: {name} · fone conectado"),
+                    None => format!("saída de áudio: {name}"),
+                };
+                log(format!("áudio: {detail}"));
                 app.messages.push(Line {
                     role: Role::System,
-                    text: format!("saída de áudio: {name}"),
+                    text: detail,
                 });
                 cx.notify();
             },
