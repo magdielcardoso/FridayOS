@@ -92,6 +92,7 @@ struct FridayApp {
     speak_cancel: Option<Arc<AtomicBool>>,
     speech_tx: Option<std::sync::mpsc::Sender<String>>,
     speech_pending: String,
+    speaking_since: Option<std::time::Instant>,
     wake: bool,
     wake_flag: Option<Arc<AtomicBool>>,
     blink: bool,
@@ -121,6 +122,7 @@ impl FridayApp {
             speak_cancel: None,
             speech_tx: None,
             speech_pending: String::new(),
+            speaking_since: None,
             wake: false,
             wake_flag: None,
             blink: true,
@@ -206,6 +208,7 @@ impl FridayApp {
     fn on_mic(&mut self, event: voice::MicEvent, cx: &mut Context<Self>) {
         match event {
             voice::MicEvent::SpeechStarted => {
+                log("mic: fala detectada");
                 self.voice_phase = voice::VoicePhase::Listening;
                 cx.notify();
             }
@@ -214,6 +217,7 @@ impl FridayApp {
                 cx.notify();
             }
             voice::MicEvent::Utterance { path } => {
+                log(format!("mic: utterance {}", path.display()));
                 // Never start a second turn on top of the running one: drop the
                 // capture and keep the current answer going.
                 if self.status == Status::Thinking
@@ -230,6 +234,7 @@ impl FridayApp {
                     cx,
                     move || voice::transcribe_wav(&path),
                     |app, result, cx| {
+                        log(format!("stt: {:?}", result.as_ref().map(|t| t.chars().take(80).collect::<String>())));
                         match result {
                             Ok(text) if !text.trim().is_empty() => {
                                 app.messages.push(Line {
@@ -269,6 +274,7 @@ impl FridayApp {
                 }
             }
             voice::MicEvent::Error(error) => {
+                log(format!("mic: erro {error}"));
                 self.messages.push(Line {
                     role: Role::System,
                     text: format!("áudio: {error}"),
@@ -287,6 +293,8 @@ impl FridayApp {
         self.speech_tx = Some(tx);
         self.speech_pending.clear();
         self.voice_phase = voice::VoicePhase::Speaking;
+        self.speaking_since = Some(std::time::Instant::now());
+        log("speech: começa");
         if let Some(mic) = self.mic.as_ref() {
             mic.set_speaking(true);
         }
@@ -301,6 +309,8 @@ impl FridayApp {
         cx.spawn(async move |this, cx| {
             if done_rx.recv().await.is_some() {
                 let _ = this.update(cx, |app, cx| {
+                    log("speech: termina");
+                    app.speaking_since = None;
                     if let Some(mic) = app.mic.as_ref() {
                         mic.set_speaking(false);
                     }
@@ -345,6 +355,7 @@ impl FridayApp {
     }
 
     fn stop_speech_now(&mut self) {
+        self.speaking_since = None;
         if let Some(cancel) = self.speak_cancel.take() {
             cancel.store(true, Ordering::Relaxed);
         }
@@ -500,6 +511,28 @@ impl FridayApp {
         })
         .detach();
 
+        // Watchdog: never stay "speaking" forever because of a stuck TTS.
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_secs(2))
+                .await;
+            let _ = this.update(cx, |app, cx| {
+                if app.voice_phase == voice::VoicePhase::Speaking {
+                    let stale = app
+                        .speaking_since
+                        .map(|since| since.elapsed() > Duration::from_secs(12))
+                        .unwrap_or(true);
+                    if stale {
+                        log("watchdog: fala travada, resetando");
+                        app.stop_speech_now();
+                        app.voice_phase = voice::VoicePhase::Listening;
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+
         self.status = Status::Connecting;
     }
 
@@ -542,7 +575,9 @@ impl FridayApp {
                     Status::Online
                 };
                 self.scroll.scroll_to_bottom();
-                if status == "completed" {
+                if status == "interrupted" {
+                    self.stop_speech_now();
+                } else {
                     self.end_speech(cx);
                 }
                 let _ = spoken;
@@ -935,6 +970,23 @@ fn shorten(value: &str, max: usize) -> String {
         let mut out: String = value.chars().take(max).collect();
         out.push('…');
         out
+    }
+}
+
+/// Appends to ~/Library/Logs/FridayOS.log for post-mortem debugging.
+fn log(message: impl AsRef<str>) {
+    use std::io::Write;
+    let home = std::env::var_os("HOME").unwrap_or_default();
+    let path = std::path::PathBuf::from(home).join("Library/Logs/FridayOS.log");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = writeln!(file, "[{secs}] {}", message.as_ref());
     }
 }
 

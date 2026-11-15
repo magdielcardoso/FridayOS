@@ -31,26 +31,56 @@ pub enum TtsError {
 
 type Result<T> = std::result::Result<T, TtsError>;
 
+/// Default voice. ChatGPT read-aloud accepts a `voice` name; "viola" is the
+/// Brazilian-Portuguese voice used by Friday.
+pub const DEFAULT_VOICE: &str = "viola";
+pub const DEFAULT_LANGUAGE: &str = "pt-BR";
+
 /// Synthesizes `text` and returns decoded PCM ready for playback.
 pub async fn synthesize(auth: &CodexAuth, text: &str) -> Result<Pcm> {
+    synthesize_with(auth, text, None, None).await
+}
+
+/// Same, but lets the caller pick the voice and language explicitly.
+pub async fn synthesize_with(
+    auth: &CodexAuth,
+    text: &str,
+    voice: Option<&str>,
+    language: Option<&str>,
+) -> Result<Pcm> {
     let clean = normalize(text);
     if clean.is_empty() {
         return Err(TtsError::Empty);
     }
-    try_synthesize(auth, &clean, false).await
+    try_synthesize(auth, &clean, voice, language, false).await
 }
 
-async fn try_synthesize(auth: &CodexAuth, text: &str, force_refresh: bool) -> Result<Pcm> {
+async fn try_synthesize(
+    auth: &CodexAuth,
+    text: &str,
+    voice: Option<&str>,
+    language: Option<&str>,
+    force_refresh: bool,
+) -> Result<Pcm> {
     let session = if force_refresh {
         auth.force_refresh().await?
     } else {
         auth.session().await?
     };
 
+    let voice = voice
+        .map(str::to_owned)
+        .or_else(|| std::env::var("FRIDAY_VOICE").ok())
+        .unwrap_or_else(|| DEFAULT_VOICE.to_string());
+    let language = language
+        .map(str::to_owned)
+        .or_else(|| std::env::var("FRIDAY_TTS_LANGUAGE").ok())
+        .unwrap_or_else(|| DEFAULT_LANGUAGE.to_string());
+
     let request = backend_headers(
-        reqwest::Client::new()
-            .post(READ_ALOUD_URL)
-            .json(&serde_json::json!({ "text": text })),
+        reqwest::Client::new().post(READ_ALOUD_URL).json(
+            &serde_json::json!({ "text": text, "voice": voice, "language": language }),
+        ),
         &session,
     )
     .header("Accept", "audio/*")
@@ -65,7 +95,9 @@ async fn try_synthesize(auth: &CodexAuth, text: &str, force_refresh: bool) -> Re
     if !status.is_success() {
         let code = status.as_u16();
         return match code {
-            401 if !force_refresh => Box::pin(try_synthesize(auth, text, true)).await,
+            401 if !force_refresh => {
+                Box::pin(try_synthesize(auth, text, Some(&voice), Some(&language), true)).await
+            }
             401 | 403 | 404 => Err(TtsError::Unavailable),
             429 => Err(TtsError::RateLimited),
             408 | 504 => Err(TtsError::Service),
