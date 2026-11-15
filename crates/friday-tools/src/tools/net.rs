@@ -13,7 +13,8 @@
 
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
@@ -45,20 +46,50 @@ impl CmdOut {
 
 /// Spawn + poll + kill. `try_wait` é chamado em laço curto e o filho é morto
 /// quando o prazo estoura, então nenhuma ferramenta trava a sessão.
-fn run_timeout(cmd: &str, args: &[&str], timeout: Duration, clean_locale: bool) -> Result<CmdOut, ToolError> {
+///
+/// A saída vai para arquivos temporários em vez de pipes: assim um comando
+/// verboso (500 lembretes, dezenas de redes) nunca enche o buffer de 64 KB e
+/// trava o processo antes de ser lido.
+fn run_timeout(
+    cmd: &str,
+    args: &[&str],
+    timeout: Duration,
+    clean_locale: bool,
+) -> Result<CmdOut, ToolError> {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let base = format!("friday-net-{}-{stamp}-{seq}", std::process::id());
+    let out_path = std::env::temp_dir().join(format!("{base}.out"));
+    let err_path = std::env::temp_dir().join(format!("{base}.err"));
+
+    let out_file = std::fs::File::create(&out_path)
+        .map_err(|e| ToolError::Failed(format!("{cmd}: não foi possível criar saída temporária: {e}")))?;
+    let err_file = std::fs::File::create(&err_path)
+        .map_err(|e| ToolError::Failed(format!("{cmd}: não foi possível criar erro temporário: {e}")))?;
+
     let mut command = Command::new(cmd);
     command
         .args(args)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdout(Stdio::from(out_file))
+        .stderr(Stdio::from(err_file));
     if clean_locale {
         command.env("LC_ALL", "C").env("LANG", "C");
     }
 
-    let mut child = command
-        .spawn()
-        .map_err(|e| ToolError::Failed(format!("{cmd}: {e}")))?;
+    let spawn = command.spawn();
+    let mut child = match spawn {
+        Ok(child) => child,
+        Err(e) => {
+            let _ = std::fs::remove_file(&out_path);
+            let _ = std::fs::remove_file(&err_path);
+            return Err(ToolError::Failed(format!("{cmd}: {e}")));
+        }
+    };
 
     let started = Instant::now();
     let mut timed_out = false;
@@ -76,20 +107,24 @@ fn run_timeout(cmd: &str, args: &[&str], timeout: Duration, clean_locale: bool) 
             }
             Err(e) => {
                 let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_file(&out_path);
+                let _ = std::fs::remove_file(&err_path);
                 return Err(ToolError::Failed(format!("{cmd}: {e}")));
             }
         }
     };
 
-    let output = child
-        .wait_with_output()
-        .map_err(|e| ToolError::Failed(format!("{cmd}: {e}")))?;
+    let stdout = std::fs::read(&out_path).unwrap_or_default();
+    let stderr = std::fs::read(&err_path).unwrap_or_default();
+    let _ = std::fs::remove_file(&out_path);
+    let _ = std::fs::remove_file(&err_path);
 
     Ok(CmdOut {
         success: status.map(|s| s.success()).unwrap_or(false),
         timed_out,
-        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        stdout: String::from_utf8_lossy(&stdout).to_string(),
+        stderr: String::from_utf8_lossy(&stderr).to_string(),
     })
 }
 
@@ -280,6 +315,9 @@ fn valid_ssid(ssid: &str) -> Result<(), ToolError> {
     if ssid.contains('\n') || ssid.contains('\r') {
         return Err(ToolError::invalid("ssid não pode conter quebras de linha"));
     }
+    if ssid.starts_with('-') {
+        return Err(ToolError::invalid("ssid não pode começar com '-'"));
+    }
     Ok(())
 }
 
@@ -424,6 +462,7 @@ fn net_status(args: &Value, _ctx: &ToolCtx) -> ToolResult {
     let mut ipv6: Vec<String> = Vec::new();
     let mut ssid: Option<String> = None;
     let mut wifi_power: Option<String> = None;
+    let mut wifi_interface_used: Option<String> = None;
     let mut notes: Vec<String> = Vec::new();
 
     if let Some(iface) = interface.as_deref() {
@@ -458,6 +497,7 @@ fn net_status(args: &Value, _ctx: &ToolCtx) -> ToolResult {
             }
         }
         wifi_power = power;
+        wifi_interface_used = Some(wifi_iface.clone());
 
         // SSID: networksetup primeiro; em versões novas do macOS ele pode
         // responder "not associated" mesmo estando conectado, então cai para
@@ -467,7 +507,7 @@ fn net_status(args: &Value, _ctx: &ToolCtx) -> ToolResult {
             &["-getairportnetwork", &wifi_iface],
             QUICK,
         ) {
-            if let Some(rest) = out.stdout.split(':').nth(1) {
+            if let Some((_, rest)) = out.stdout.split_once(':') {
                 let candidate = rest.trim();
                 if !candidate.is_empty()
                     && !candidate.to_lowercase().contains("not associated")
@@ -505,6 +545,7 @@ fn net_status(args: &Value, _ctx: &ToolCtx) -> ToolResult {
         "ipv6": ipv6,
         "ssid": ssid,
         "wifi_power": wifi_power,
+        "wifi_interface": wifi_interface_used,
         "notes": notes,
     }))
 }
@@ -527,15 +568,18 @@ fn parse_airport_scan(text: &str) -> Vec<Value> {
             continue;
         }
         let ssid = tokens[..mac_idx].join(" ");
+        // Depois do BSSID: RSSI, CHANNEL, HT, CC, SECURITY
         let tail = &tokens[mac_idx + 1..];
         let rssi = tail.first().and_then(|t| t.parse::<i64>().ok());
         let channel = tail.get(1).map(|t| t.to_string());
-        let security = (tail.len() > 3).then(|| tail[3..].join(" "));
+        let cc = tail.get(3).map(|t| t.to_string());
+        let security = (tail.len() > 4).then(|| tail[4..].join(" "));
         networks.push(json!({
             "ssid": ssid,
             "bssid": tokens[mac_idx],
             "rssi": rssi,
             "channel": channel,
+            "country_code": cc,
             "security": security,
         }));
     }
@@ -903,29 +947,53 @@ fn net_public_ip(_args: &Value, _ctx: &ToolCtx) -> ToolResult {
 // calendar_today
 // ---------------------------------------------------------------------------
 
-fn calendar_today(_args: &Value, _ctx: &ToolCtx) -> ToolResult {
-    let script = format!(
+fn calendar_names() -> Result<Vec<String>, ToolError> {
+    let script = r#"
+var app = Application('Calendar');
+var out = [];
+var calendars = app.calendars();
+for (var i = 0; i < calendars.length; i++) {
+  try { out.push(String(calendars[i].name())); } catch (e) {}
+}
+JSON.stringify(out);
+"#;
+    let value = run_jxa_json(script, Duration::from_secs(45))?;
+    Ok(value
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// Eventos de um único calendário. Roda em processo próprio porque alguns
+/// calendários (feriados assinados, contas Google) travam o Calendar por tempo
+/// indeterminado; o timeout por processo isola o problema.
+fn calendar_events_script(calendar: &str) -> String {
+    format!(
         r#"
 {JXA_DATE_HELPERS}
 var app = Application('Calendar');
+var wanted = {calendar};
 var now = new Date();
 var start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
 var end = new Date(start.getTime() + 86400000);
 var out = [];
-var calendars = app.calendars();
-for (var i = 0; i < calendars.length; i++) {{
-  var cal = calendars[i];
-  var calName = '';
-  try {{ calName = String(cal.name()); }} catch (e) {{ continue; }}
+var cal = null;
+try {{ cal = app.calendars.byName(wanted); }} catch (e) {{ cal = null; }}
+if (cal) {{
   var events = [];
   try {{
-    // Um único objeto com dois operadores é ordens de magnitude mais rápido
-    // que `_and: [...]` (que trava o Calendar por dezenas de segundos).
+    // Um único objeto com dois operadores é muito mais rápido que
+    // `_and: [...]`, que trava o Calendar por dezenas de segundos.
     events = cal.events.whose({{
       startDate: {{ _greaterThanEquals: start, _lessThan: end }}
     }})();
   }} catch (e) {{ events = []; }}
-  for (var j = 0; j < events.length && out.length < 200; j++) {{
+  for (var j = 0; j < events.length && out.length < 50; j++) {{
     var ev = events[j];
     var title = '';
     try {{ title = String(ev.summary()); }} catch (e) {{ continue; }}
@@ -941,24 +1009,78 @@ for (var i = 0; i < calendars.length; i++) {{
       start_utc: utcIso(s),
       end_utc: utcIso(e2),
       all_day: allDay,
-      calendar: calName,
+      calendar: wanted,
       location: location
     }});
   }}
 }}
-out.sort(function (a, b) {{ return String(a.start) < String(b.start) ? -1 : 1; }});
 JSON.stringify(out);
-"#
-    );
+"#,
+        calendar = js_str(calendar),
+    )
+}
 
-    // Calendar pode gastar dezenas de segundos no primeiro acesso frio.
-    let value = run_jxa_json(&script, Duration::from_secs(45))?;
-    let events = value.as_array().cloned().unwrap_or_default();
+fn calendar_today(_args: &Value, _ctx: &ToolCtx) -> ToolResult {
+    let names = calendar_names()?;
+    let mut events: Vec<Value> = Vec::new();
+    let mut notes: Vec<String> = vec![
+        "horários em ISO local; `_utc` traz o mesmo instante em UTC".to_string(),
+    ];
+    let mut skipped: Vec<String> = Vec::new();
+
+    // Consultas em série com orçamento global: o Calendar serializa Apple
+    // Events, então paralelizar só aumenta a latência. Calendários de feriados
+    // e aniversários (quase sempre assinados/remotos) vão para o fim e são os
+    // primeiros a serem cortados pelo orçamento.
+    let mut ordered: Vec<String> = names;
+    ordered.sort_by_key(|name| {
+        let lower = name.to_lowercase();
+        u8::from(
+            lower.contains("feriado")
+                || lower.contains("holiday")
+                || lower.contains("aniversar")
+                || lower.contains("birthday"),
+        )
+    });
+
+    let budget = Duration::from_secs(15);
+    let started = Instant::now();
+    for name in ordered.into_iter().take(24) {
+        if started.elapsed() >= budget {
+            skipped.push(name);
+            continue;
+        }
+        let remaining = budget.saturating_sub(started.elapsed());
+        let timeout = remaining.min(Duration::from_secs(5));
+        let script = calendar_events_script(&name);
+        match run_jxa_json(&script, timeout)
+            .ok()
+            .and_then(|value| value.as_array().cloned())
+        {
+            Some(list) => events.extend(list),
+            None => skipped.push(name),
+        }
+    }
+
+    events.sort_by(|a, b| {
+        let left = a.get("start").and_then(Value::as_str).unwrap_or("");
+        let right = b.get("start").and_then(Value::as_str).unwrap_or("");
+        left.cmp(right)
+    });
+    events.truncate(200);
+
+    if !skipped.is_empty() {
+        notes.push(format!(
+            "calendários ignorados por lentidão/erro: {}",
+            skipped.join(", ")
+        ));
+    }
+
     Ok(json!({
         "date": "hoje",
         "count": events.len(),
         "events": events,
-        "notes": ["horários em ISO local; `_utc` traz o mesmo instante em UTC"],
+        "notes": notes,
     }))
 }
 
@@ -1020,12 +1142,8 @@ if (end.getTime() <= start.getTime()) throw new Error('o fim precisa ser depois 
 var wanted = {calendar};
 var target = null;
 if (wanted) {{
-  var calendars = app.calendars();
-  for (var i = 0; i < calendars.length; i++) {{
-    var name = '';
-    try {{ name = String(calendars[i].name()); }} catch (e) {{ continue; }}
-    if (name === wanted) {{ target = calendars[i]; break; }}
-  }}
+  try {{ target = app.calendars.byName(wanted); }} catch (e) {{ target = null; }}
+  if (target) {{ try {{ String(target.name()); }} catch (e) {{ target = null; }} }}
   if (!target) throw new Error('calendário não encontrado: ' + wanted);
 }} else {{
   target = app.defaultCalendar();
@@ -1056,7 +1174,7 @@ JSON.stringify(result);
         notes = notes.map(js_str).unwrap_or_else(|| "null".to_string()),
     );
 
-    run_jxa_json(&script, Duration::from_secs(25))
+    run_jxa_json(&script, Duration::from_secs(35))
 }
 
 // ---------------------------------------------------------------------------
@@ -1105,7 +1223,8 @@ JSON.stringify({{ count: out.length, reminders: out }});
         list = list.map(js_str).unwrap_or_else(|| "null".to_string()),
     );
 
-    run_jxa_json(&script, Duration::from_secs(30))
+    // O Reminders pode levar ~30s no primeiro acesso frio.
+    run_jxa_json(&script, Duration::from_secs(45))
 }
 
 // ---------------------------------------------------------------------------
@@ -1144,12 +1263,8 @@ var wanted = {list};
 var dueText = {due};
 var target = null;
 if (wanted) {{
-  var lists = app.lists();
-  for (var i = 0; i < lists.length; i++) {{
-    var name = '';
-    try {{ name = String(lists[i].name()); }} catch (e) {{ continue; }}
-    if (name === wanted) {{ target = lists[i]; break; }}
-  }}
+  try {{ target = app.lists.byName(wanted); }} catch (e) {{ target = null; }}
+  if (target) {{ try {{ String(target.name()); }} catch (e) {{ target = null; }} }}
   if (!target) throw new Error('lista não encontrada: ' + wanted);
 }} else {{
   try {{ target = app.defaultList(); }} catch (e) {{ target = null; }}
@@ -1190,43 +1305,53 @@ fn contacts_search(args: &Value, _ctx: &ToolCtx) -> ToolResult {
         return Err(ToolError::invalid("consulta longa demais"));
     }
 
-    // `whose` no Contacts é notoriamente instável para nomes, então filtramos
-    // em JS com limite e saída antecipada.
+    // Iterar todos os contatos custa dezenas de segundos (milhares de Apple
+    // Events). `whose` filtra do lado do Contacts; pedimos os detalhes
+    // completos apenas dos poucos que casaram.
     let script = format!(
         r#"
 var app = Application('Contacts');
 var query = {query}.toLowerCase();
 var limit = {limit};
 var out = [];
-var people = app.people();
-for (var i = 0; i < people.length && out.length < limit; i++) {{
-  var p = people[i];
-  var name = '', org = '';
-  try {{ name = String(p.name() || ''); }} catch (e) {{}}
-  try {{ org = String(p.organization() || ''); }} catch (e) {{}}
-  var emails = [], phones = [];
-  try {{
-    var es = p.emails();
-    for (var a = 0; a < es.length; a++) {{
-      try {{ var v = es[a].value(); if (v) emails.push(String(v)); }} catch (e) {{}}
+var seen = {{}};
+function collect(list) {{
+  for (var i = 0; i < list.length && out.length < limit; i++) {{
+    var p = list[i];
+    var name = '', org = '';
+    try {{ name = String(p.name() || ''); }} catch (e) {{}}
+    try {{ org = String(p.organization() || ''); }} catch (e) {{}}
+    var key = name + '|' + org;
+    if (seen[key]) continue;
+    seen[key] = true;
+    var emails = [], phones = [];
+    try {{
+      var es = p.emails();
+      for (var a = 0; a < es.length; a++) {{
+        try {{ var v = es[a].value(); if (v) emails.push(String(v)); }} catch (e) {{}}
+      }}
+    }} catch (e) {{}}
+    try {{
+      var ps = p.phones();
+      for (var b = 0; b < ps.length; b++) {{
+        try {{ var w = ps[b].value(); if (w) phones.push(String(w)); }} catch (e) {{}}
+      }}
+    }} catch (e) {{}}
+    if (name || org || emails.length || phones.length) {{
+      out.push({{ name: name, organization: org || null, emails: emails, phones: phones }});
     }}
-  }} catch (e) {{}}
-  try {{
-    var ps = p.phones();
-    for (var b = 0; b < ps.length; b++) {{
-      try {{ var w = ps[b].value(); if (w) phones.push(String(w)); }} catch (e) {{}}
-    }}
-  }} catch (e) {{}}
-  var hay = (name + ' ' + org + ' ' + emails.join(' ') + ' ' + phones.join(' ')).toLowerCase();
-  if (hay.indexOf(query) === -1) continue;
-  out.push({{ name: name, organization: org || null, emails: emails, phones: phones }});
+  }}
+}}
+try {{ collect(app.people.whose({{ name: {{ _contains: query }} }})()); }} catch (e) {{}}
+if (out.length < limit) {{
+  try {{ collect(app.people.whose({{ organization: {{ _contains: query }} }})()); }} catch (e) {{}}
 }}
 JSON.stringify({{ count: out.length, contacts: out }});
 "#,
         query = js_str(query),
     );
 
-    run_jxa_json(&script, Duration::from_secs(30))
+    run_jxa_json(&script, Duration::from_secs(25))
 }
 
 // ---------------------------------------------------------------------------
@@ -1250,12 +1375,16 @@ fn home_list_scenes(_args: &Value, _ctx: &ToolCtx) -> ToolResult {
         if shortcut.is_empty() {
             continue;
         }
-        let lowered = shortcut.to_lowercase();
-        let prefix = SCENE_PREFIX.to_lowercase();
-        if !lowered.starts_with(&prefix) {
+        // Comparação ASCII sem fatiar por offset de `to_lowercase()`, que pode
+        // mudar o número de bytes e quebrar no meio de um caractere.
+        let prefix_len = SCENE_PREFIX.len();
+        if shortcut.len() < prefix_len
+            || !shortcut.is_char_boundary(prefix_len)
+            || !shortcut[..prefix_len].eq_ignore_ascii_case(SCENE_PREFIX)
+        {
             continue;
         }
-        let name = shortcut[SCENE_PREFIX.len()..].trim();
+        let name = shortcut[prefix_len..].trim();
         if name.is_empty() {
             continue;
         }
@@ -1274,7 +1403,7 @@ fn home_list_scenes(_args: &Value, _ctx: &ToolCtx) -> ToolResult {
 
 fn home_run_scene(args: &Value, ctx: &ToolCtx) -> ToolResult {
     let name = req_str(args, "name")?.trim();
-    if name.chars().count() > 200 || name.contains('\n') {
+    if name.chars().count() > 200 || name.contains('\n') || name.starts_with('-') {
         return Err(ToolError::invalid("nome de cena inválido"));
     }
     let shortcut = if name.to_lowercase().starts_with(&SCENE_PREFIX.to_lowercase()) {
@@ -1330,7 +1459,7 @@ pub fn register(registry: &mut Registry) {
             json!({
                 "interface": {
                     "type": "string",
-                    "description": "Interface a inspecionar (padrão: a da rota default, ou en0)."
+                    "description": "Interface a inspecionar (padrão: a da rota default)."
                 }
             }),
             &[],
