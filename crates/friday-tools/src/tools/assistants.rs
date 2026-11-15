@@ -62,6 +62,25 @@ pub fn live_path(name: &str) -> PathBuf {
     dir().join(format!("{}.live.jsonl", slug(name)))
 }
 
+fn pid_path(name: &str) -> PathBuf {
+    dir().join(format!("{}.pid", slug(name)))
+}
+
+fn thread_path(name: &str) -> PathBuf {
+    dir().join(format!("{}.thread", slug(name)))
+}
+
+fn running_pid(name: &str) -> Option<u32> {
+    let raw = std::fs::read_to_string(pid_path(name)).ok()?;
+    let pid = raw.trim().parse::<u32>().ok()?;
+    let alive = Command::new("/bin/kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    alive.then_some(pid)
+}
+
 fn live_append(path: &PathBuf, kind: &str, text: &str) {
     use std::io::Write;
     let Ok(mut file) = std::fs::OpenOptions::new()
@@ -190,6 +209,11 @@ fn delegate(assistant: &Value, task: &str, timeout_secs: u64) -> Result<String, 
          Responda de forma objetiva e completa, em português."
     );
 
+    if let Some(pid) = running_pid(name) {
+        return Err(ToolError::failed(format!(
+            "`{name}` já está executando (pid {pid}); cancele antes de delegar outra tarefa"
+        )));
+    }
     // The HUD watches this file to show what the subagent is doing live.
     let live = live_path(name);
     let _ = std::fs::create_dir_all(dir());
@@ -200,9 +224,19 @@ fn delegate(assistant: &Value, task: &str, timeout_secs: u64) -> Result<String, 
     let out = std::env::temp_dir().join(format!("friday-assistant-{}.txt", std::process::id()));
     let _ = std::fs::remove_file(&out);
     let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+    let previous_thread = std::fs::read_to_string(thread_path(name))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
     let mut command = Command::new(binary);
+    if let Some(thread) = previous_thread.as_deref() {
+        command.args(["exec", "resume", thread]);
+        live_append(&live, "status", "retomando a sessão anterior…");
+    } else {
+        command.arg("exec");
+    }
     command
-        .args(["exec", "--json", "--skip-git-repo-check", "-C", &home, "-o"])
+        .args(["--json", "--skip-git-repo-check", "-o"])
         .arg(&out)
         .args([
             "-c",
@@ -211,6 +245,7 @@ fn delegate(assistant: &Value, task: &str, timeout_secs: u64) -> Result<String, 
             "sandbox_mode=\"workspace-write\"",
         ])
         .arg(&prompt)
+        .current_dir(&home)
         .env("PATH", login_path())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -225,7 +260,10 @@ fn delegate(assistant: &Value, task: &str, timeout_secs: u64) -> Result<String, 
             live_append(&live, "error", &format!("codex exec: {error}"));
             ToolError::failed(format!("codex exec: {error}"))
         })?;
+    let pid = child.id();
+    let _ = std::fs::write(pid_path(name), pid.to_string());
 
+    let thread_file = thread_path(name);
     let mut reader = child.stdout.take().map(|stdout| {
         let live = live.clone();
         std::thread::spawn(move || {
@@ -234,6 +272,11 @@ fn delegate(assistant: &Value, task: &str, timeout_secs: u64) -> Result<String, 
                 let Ok(event) = serde_json::from_str::<Value>(&line) else {
                     continue;
                 };
+                if event.get("type").and_then(Value::as_str) == Some("thread.started") {
+                    if let Some(id) = event.get("thread_id").and_then(Value::as_str) {
+                        let _ = std::fs::write(&thread_file, id);
+                    }
+                }
                 if let Some((kind, text)) = summarize_event(&event) {
                     live_append(&live, &kind, &text);
                 }
@@ -250,6 +293,7 @@ fn delegate(assistant: &Value, task: &str, timeout_secs: u64) -> Result<String, 
                 }
                 let answer = std::fs::read_to_string(&out).unwrap_or_default();
                 let _ = std::fs::remove_file(&out);
+                let _ = std::fs::remove_file(pid_path(name));
                 if answer.trim().is_empty() {
                     live_append(&live, "error", &format!("terminou sem resposta ({status})"));
                     return Err(ToolError::failed(format!(
@@ -261,6 +305,7 @@ fn delegate(assistant: &Value, task: &str, timeout_secs: u64) -> Result<String, 
             }
             Ok(None) => {}
             Err(error) => {
+                let _ = std::fs::remove_file(pid_path(name));
                 live_append(&live, "error", &error.to_string());
                 return Err(ToolError::failed(error.to_string()));
             }
@@ -268,6 +313,7 @@ fn delegate(assistant: &Value, task: &str, timeout_secs: u64) -> Result<String, 
         if Instant::now() > deadline {
             let _ = child.kill();
             let _ = child.wait();
+            let _ = std::fs::remove_file(pid_path(name));
             live_append(&live, "error", "tempo esgotado");
             return Err(ToolError::failed("o assistente demorou demais"));
         }
@@ -345,6 +391,45 @@ impl Tool for AssistantTool {
                 let answer = delegate(&assistant, task, timeout)?;
                 Ok(json!({ "ok": true, "assistant": slug(name), "answer": answer }))
             }
+            "assistant_cancel" => {
+                let name = args
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| ToolError::invalid("informe `name`"))?;
+                if ctx.dry_run {
+                    return Ok(json!({ "dry_run": true, "would_cancel": slug(name) }));
+                }
+                let Some(pid) = running_pid(name) else {
+                    let _ = std::fs::remove_file(pid_path(name));
+                    return Ok(json!({
+                        "ok": true,
+                        "cancelled": false,
+                        "assistant": slug(name),
+                        "note": "não havia tarefa em execução"
+                    }));
+                };
+                let _ = Command::new("/bin/kill")
+                    .args(["-TERM", &pid.to_string()])
+                    .status();
+                // Codex may leave children behind; take them down with it.
+                let _ = Command::new("/usr/bin/pkill")
+                    .args(["-TERM", "-P", &pid.to_string()])
+                    .status();
+                std::thread::sleep(Duration::from_millis(400));
+                if running_pid(name).is_some() {
+                    let _ = Command::new("/bin/kill")
+                        .args(["-KILL", &pid.to_string()])
+                        .status();
+                }
+                let _ = std::fs::remove_file(pid_path(name));
+                live_append(&live_path(name), "error", "cancelado pelo usuário");
+                Ok(json!({
+                    "ok": true,
+                    "cancelled": true,
+                    "assistant": slug(name),
+                    "pid": pid,
+                }))
+            }
             "assistant_delete" => {
                 let name = args
                     .get("name")
@@ -409,6 +494,17 @@ pub fn register(registry: &mut Registry) {
                 "task": { "type": "string" },
                 "timeout_secs": { "type": "integer", "minimum": 30, "maximum": 600, "default": 300 }
             }
+        }),
+    ));
+    registry.add(tool(
+        "assistant_cancel",
+        "Interrompe a tarefa em execução de um assistente permanente.",
+        crate::policy::Risk::Sensitive,
+        json!({
+            "type": "object",
+            "required": ["name"],
+            "additionalProperties": false,
+            "properties": { "name": { "type": "string" } }
         }),
     ));
     registry.add(tool(
