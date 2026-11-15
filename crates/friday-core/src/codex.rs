@@ -23,6 +23,17 @@ use crate::auth::CodexAuth;
 
 const CODEX_BIN: &str = "codex";
 
+fn configured_reasoning_effort() -> Option<String> {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
+    let path = home.join("Library/Application Support/FridayOS/reasoning.json");
+    let raw = std::fs::read_to_string(path).ok()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    match value.get("effort").and_then(Value::as_str)? {
+        effort @ ("low" | "medium" | "high" | "xhigh" | "max") => Some(effort.to_string()),
+        _ => None,
+    }
+}
+
 /// GUI-launched apps inherit a minimal PATH (`/usr/bin:/bin:...`), so `codex`
 /// installed by nvm/homebrew is invisible. Resolve it once through the user's
 /// login shell, and reuse that same PATH for the child process.
@@ -415,7 +426,7 @@ impl Session {
                 "excludeSlashTmp": true
             }
         });
-        if let Some(effort) = self.turn_effort.clone() {
+        if let Some(effort) = configured_reasoning_effort().or_else(|| self.turn_effort.clone()) {
             params["effort"] = json!(effort);
         }
         let id = self.send_request("turn/start", params).await?;
