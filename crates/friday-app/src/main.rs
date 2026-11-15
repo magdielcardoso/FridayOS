@@ -369,6 +369,8 @@ struct FridayApp {
     ram: u8,
     graph_points: Vec<(f32, f32)>,
     graph_edges: Vec<(u32, u32)>,
+    warming: bool,
+    prewarmed: bool,
     tts_stream: bool,
     speaking_since: Option<std::time::Instant>,
     wake: bool,
@@ -416,6 +418,8 @@ impl FridayApp {
             ram: 0,
             graph_points: Vec::new(),
             graph_edges: Vec::new(),
+            warming: false,
+            prewarmed: false,
             tts_stream: std::env::var("FRIDAY_TTS_MODE")
                 .map(|mode| mode != "single")
                 .unwrap_or(true),
@@ -1122,6 +1126,9 @@ impl FridayApp {
                 self.stream.clear();
             }
             CodexEvent::Delta(delta) => {
+                if self.warming {
+                    return;
+                }
                 self.status = Status::Thinking;
                 self.stream.push_str(&delta);
                 mobile::assistant_delta(&delta);
@@ -1149,6 +1156,14 @@ impl FridayApp {
                 }
             }
             CodexEvent::Done { status } => {
+                if self.warming {
+                    self.warming = false;
+                    self.status = Status::Online;
+                    self.stream.clear();
+                    self.dispatch_pending(cx);
+                    cx.notify();
+                    return;
+                }
                 let mut spoken = None;
                 if !self.stream.trim().is_empty() {
                     let text = std::mem::take(&mut self.stream);
@@ -1197,6 +1212,10 @@ impl FridayApp {
 
     fn inject_trigger(&mut self, source: String, prompt: String, cx: &mut Context<Self>) {
         log(format!("gatilho: {source}"));
+        if self.warming {
+            self.external_pending.push_back((source, prompt));
+            return;
+        }
         self.notify_on_done = source == "mobile"
             || source.starts_with("watcher:")
             || source.starts_with("rotina:");
@@ -1253,6 +1272,13 @@ impl FridayApp {
 
     fn submit(&mut self, cx: &mut Context<Self>) {
         let text = self.input.trim().to_string();
+        if self.warming {
+            if !text.is_empty() {
+                self.external_pending.push_back(("você".into(), text));
+                self.input.clear();
+            }
+            return;
+        }
         if text.is_empty() || self.status == Status::Thinking {
             return;
         }

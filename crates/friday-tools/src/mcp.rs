@@ -391,7 +391,55 @@ fn summary_tools(registry: &Registry, params: &Value) -> Value {
     json!({ "tools": tools, "count": count, "total": total })
 }
 
+fn compact_mode() -> bool {
+    std::env::var_os("FRIDAY_MCP_FULL").is_none()
+}
+
+fn compact_tools() -> Value {
+    json!({ "tools": [
+        {
+            "name": "exec",
+            "description": "Executa qualquer ferramenta do catálogo Friday pelo nome. Use search para descobrir nomes.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["name"],
+                "properties": {
+                    "name": { "type": "string" },
+                    "arguments": { "type": "object" },
+                    "__confirm": { "type": "boolean" },
+                    "__dry_run": { "type": "boolean" }
+                }
+            }
+        },
+        {
+            "name": "search",
+            "description": "Busca ferramentas por nome, descrição, categoria ou risco.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "category": { "type": "string" },
+                    "risk": { "type": "string" },
+                    "limit": { "type": "integer" }
+                }
+            }
+        },
+        {
+            "name": "schema",
+            "description": "Devolve o schema de argumentos de uma ferramenta específica.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["name"],
+                "properties": { "name": { "type": "string" } }
+            }
+        }
+    ]})
+}
+
 fn tools_list(registry: &Registry) -> Value {
+    if compact_mode() {
+        return compact_tools();
+    }
     let tools: Vec<Value> = registry
         .specs()
         .into_iter()
@@ -428,6 +476,62 @@ fn tools_call(registry: &Registry, id: Option<Value>, params: &Value) -> Outcome
             "params.name ausente ou não é string".to_string(),
         ));
     };
+
+    // Compact mode: three meta-tools keep the prompt small while exposing the
+    // whole catalog on demand.
+    if compact_mode() {
+        match name {
+            "exec" => {
+                let mut args = params.get("arguments").cloned().unwrap_or(Value::Null);
+                let inner_name = args
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let mut call_args = args
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                if let (Some(confirm), Some(dry)) = (
+                    args.get("__confirm").and_then(Value::as_bool),
+                    args.get("__dry_run").and_then(Value::as_bool),
+                ) {
+                    if let Value::Object(map) = &mut call_args {
+                        map.insert("__confirm".into(), json!(confirm));
+                        map.insert("__dry_run".into(), json!(dry));
+                    }
+                }
+                let forwarded = json!({ "name": inner_name, "arguments": call_args });
+                let _ = &mut args;
+                return tools_call(registry, Some(id), &forwarded);
+            }
+            "search" => {
+                let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                return Outcome::Reply(json!({ "jsonrpc": "2.0", "id": id, "result": search_tools(registry, &args) }));
+            }
+            "schema" => {
+                let wanted = params
+                    .pointer("/arguments/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let found = registry.specs().into_iter().find(|spec| spec.name == wanted);
+                return match found {
+                    Some(spec) => Outcome::Reply(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "name": spec.name,
+                            "description": spec.summary,
+                            "risk": spec.risk.label(),
+                            "inputSchema": spec.args
+                        }
+                    })),
+                    None => Outcome::Reply(error_response(id, INVALID_PARAMS, format!("ferramenta desconhecida: {wanted}"))),
+                };
+            }
+            _ => {}
+        }
+    }
 
     let Some(tool) = registry.get(name) else {
         eprintln!("friday-mcp: ferramenta desconhecida `{name}`");
