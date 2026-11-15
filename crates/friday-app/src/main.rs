@@ -83,7 +83,7 @@ Messages may also arrive from the iPhone PWA (source `mobile`), from webhooks
 or from routines; treat them as the same user and keep the shared context.
 Knowledge graph: use `knowledge_index`, `knowledge_search`,
 `knowledge_neighbors` and `knowledge_graph` (interactive panel; pass
-`highlight: ["Nome"]` to spotlight nodes and paths). Markdown notes live in
+`highlight: [Nome]` to spotlight nodes and paths). Markdown notes live in
 `~/Library/Application Support/FridayOS/knowledge` and support [[wiki links]].
 Forensics: `forensics_log`, `forensics_power`, `forensics_changes`,
 `forensics_health` gather real evidence for past incidents; separate observed
