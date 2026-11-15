@@ -1580,30 +1580,6 @@ impl Render for FridayApp {
         let speech: String = speech.chars().take(180).collect();
         let show_speech = !speech.is_empty() && (speaking || busy);
 
-        let mut waveform = div().flex().items_center().gap(sx(3.0));
-        let bars = 32usize;
-        for index in 0..bars {
-            let center_distance = ((index as f32 - bars as f32 / 2.0) / (bars as f32 / 2.0)).abs();
-            let envelope = (1.0 - center_distance).powf(1.4);
-            let wobble = if busy {
-                0.25 + 0.2 * ((clock * 3.0 + index as f32 * 0.7).sin() * 0.5 + 0.5)
-            } else {
-                0.08
-            };
-            let amplitude = if speaking || listening {
-                (meter_source * 1.2 + 0.05).clamp(0.0, 1.0)
-            } else {
-                wobble
-            };
-            let height = (6.0 + 58.0 * envelope * amplitude) * k;
-            waveform = waveform.child(
-                div()
-                    .w(sx(2.0))
-                    .h(px(height.max(1.0)))
-                    .bg(rgb(if amplitude > 0.25 { bright } else { dark })),
-            );
-        }
-
         let mut corner_wave = div().flex().items_center().gap(sx(3.0));
         for index in 0..24usize {
             let center_distance = ((index as f32 - 12.0) / 12.0).abs();
@@ -1748,18 +1724,6 @@ impl Render for FridayApp {
                                 speech
                             })),
                     ),
-            )
-            // Waveform
-            .child(
-                div()
-                    .absolute()
-                    .left(lx(518.0))
-                    .top(ly(712.0))
-                    .w(sx(500.0))
-                    .h(sx(80.0))
-                    .flex()
-                    .items_center()
-                    .child(waveform),
             )
     }
 }
