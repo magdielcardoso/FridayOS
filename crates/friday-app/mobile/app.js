@@ -201,6 +201,10 @@ async function encodeWav(blob) {
 let recorder = null;
 micBtn.onclick = async () => {
   if (recorder) { recorder.stop(); return; }
+  if (!window.isSecureContext || !navigator.mediaDevices) {
+    toast('voz exige HTTPS: habilite o Tailscale Serve e abra pela URL https');
+    return;
+  }
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     recorder = new MediaRecorder(stream);
@@ -223,7 +227,10 @@ micBtn.onclick = async () => {
     recorder.start();
     micBtn.classList.add('rec');
     toast('gravando… toque para parar');
-  } catch (error) { toast('microfone indisponível'); }
+  } catch (error) {
+    const denied = String(error && error.name).includes('NotAllowed');
+    toast(denied ? 'permissão de microfone negada' : 'microfone indisponível');
+  }
 };
 
 // ---- push ----
