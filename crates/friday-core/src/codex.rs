@@ -228,6 +228,7 @@ struct Session {
     thread_id: String,
     turn_effort: Option<String>,
     turn_finished: bool,
+    seen_deltas: std::collections::HashSet<String>,
     events: mpsc::UnboundedSender<CodexEvent>,
 }
 
@@ -248,6 +249,7 @@ impl Session {
             thread_id: String::new(),
             turn_effort: config.effort.clone(),
             turn_finished: false,
+            seen_deltas: std::collections::HashSet::new(),
             events: events.clone(),
         };
 
@@ -345,6 +347,12 @@ impl Session {
             match method {
                 "item/agentMessage/delta" => {
                     if let Some(delta) = params.get("delta").and_then(Value::as_str) {
+                        let item = params
+                            .get("itemId")
+                            .and_then(Value::as_str)
+                            .unwrap_or("default")
+                            .to_string();
+                        self.seen_deltas.insert(item);
                         let _ = self.events.send(CodexEvent::Delta(delta.to_string()));
                     }
                 }
@@ -356,10 +364,17 @@ impl Session {
                 "item/completed" => {
                     let item = params.get("item").cloned().unwrap_or(Value::Null);
                     if item.get("type").and_then(Value::as_str) == Some("agentMessage") {
-                        // Fallback when the server sent no deltas at all.
-                        if let Some(text) = item.get("text").and_then(Value::as_str) {
-                            if !text.is_empty() {
-                                let _ = self.events.send(CodexEvent::Delta(text.to_string()));
+                        // Fallback only when this item never streamed deltas.
+                        let item_id = item
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("default")
+                            .to_string();
+                        if !self.seen_deltas.contains(&item_id) {
+                            if let Some(text) = item.get("text").and_then(Value::as_str) {
+                                if !text.is_empty() {
+                                    let _ = self.events.send(CodexEvent::Delta(text.to_string()));
+                                }
                             }
                         }
                     }
