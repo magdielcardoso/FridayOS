@@ -858,8 +858,8 @@ impl FridayApp {
 
     fn connect(&mut self, cx: &mut Context<Self>) {
         log(format!(
-            "connect: iniciando codex (motivo: thread {:?}, status {:?})",
-            self.thread, self.status
+            "connect: iniciando codex (thread {:?})",
+            self.thread
         ));
         let mcp = std::env::current_exe()
             .ok()
