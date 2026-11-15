@@ -1516,23 +1516,44 @@ impl Render for FridayApp {
                 let nodes = graph_points_snapshot.clone();
                 let links = graph_edges_snapshot.clone();
                 let radius = 92.0 * scale;
-                for &(a, b) in &links {
-                    if let (Some(pa), Some(pb)) = (nodes.get(a as usize), nodes.get(b as usize)) {
+                // Slow drift so the network feels alive without breaking layout.
+                let spin = clock * 0.05;
+                let mut moved: Vec<(f32, f32)> = Vec::with_capacity(nodes.len());
+                for (index, &(x, y)) in nodes.iter().enumerate() {
+                    let wobble = 0.035 * (clock * 0.9 + index as f32 * 1.7).sin();
+                    let wobble_y = 0.035 * (clock * 0.7 + index as f32 * 2.3).cos();
+                    let (sin, cos) = spin.sin_cos();
+                    moved.push((
+                        x * cos - y * sin + wobble,
+                        x * sin + y * cos + wobble_y,
+                    ));
+                }
+                for (edge_index, &(a, b)) in links.iter().enumerate() {
+                    if let (Some(pa), Some(pb)) = (moved.get(a as usize), moved.get(b as usize)) {
+                        let pulse = 0.55 + 0.45 * (clock * 2.0 + edge_index as f32 * 0.9).sin().abs();
+                        let width = (1.2 + 1.2 * pulse) * scale.max(0.6);
+                        let color = if pulse > 0.8 { 0x9a1226 } else { 0x6a0c1c };
                         paint_segment(
                             window,
                             cx0 + pa.0 * radius,
                             cy0 + pa.1 * radius,
                             cx0 + pb.0 * radius,
                             cy0 + pb.1 * radius,
-                            1.8,
-                            0x7a0f22,
+                            width,
+                            color,
                         );
+                        // Bright packet travelling along the connection.
+                        let t = (clock * 0.35 + edge_index as f32 * 0.19).fract();
+                        let sx0 = cx0 + (pa.0 + (pb.0 - pa.0) * t) * radius;
+                        let sy0 = cy0 + (pa.1 + (pb.1 - pa.1) * t) * radius;
+                        paint_arc(window, sx0, sy0, 1.7 * scale, 0.0, TAU, 2.0, 0xff5a6e);
+                        paint_arc(window, sx0, sy0, 3.6 * scale, 0.0, TAU, 0.8, 0x5a0a16);
                     }
                 }
                 if nodes.is_empty() {
                     paint_arc(window, cx0, cy0, 3.0 * scale, 0.0, TAU, 2.0, bright);
                 }
-                for &(x, y) in &nodes {
+                for &(x, y) in &moved {
                     let px0 = cx0 + x * radius;
                     let py0 = cy0 + y * radius;
                     let dot = (2.6 + 1.6 * ((clock * 1.5).sin() * 0.5 + 0.5)) * scale;
@@ -1583,6 +1604,26 @@ impl Render for FridayApp {
             );
         }
 
+        let mut corner_wave = div().flex().items_center().gap(sx(3.0));
+        for index in 0..24usize {
+            let center_distance = ((index as f32 - 12.0) / 12.0).abs();
+            let envelope = (1.0 - center_distance).powf(1.3);
+            let amplitude = if speaking || listening {
+                (meter_source * 1.2 + 0.05).clamp(0.0, 1.0)
+            } else if busy {
+                0.22
+            } else {
+                0.06
+            };
+            let height = (4.0 + 34.0 * envelope * amplitude) * k;
+            corner_wave = corner_wave.child(
+                div()
+                    .w(sx(2.0))
+                    .h(px(height.max(1.0)))
+                    .bg(rgb(if amplitude > 0.25 { bright } else { dark })),
+            );
+        }
+
         let pending_tasks = self
             .activity
             .iter()
@@ -1605,6 +1646,18 @@ impl Render for FridayApp {
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
                 this.on_key(event, cx)
             }))
+            // Corner voice waveform (top-left)
+            .child(
+                div()
+                    .absolute()
+                    .left(lx(28.0))
+                    .top(ly(26.0))
+                    .w(sx(230.0))
+                    .h(sx(48.0))
+                    .flex()
+                    .items_center()
+                    .child(corner_wave),
+            )
             // Orb
             .child(
                 div()

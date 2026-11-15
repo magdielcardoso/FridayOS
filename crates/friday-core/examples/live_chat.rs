@@ -8,18 +8,26 @@ use friday_core::codex::{Codex, CodexConfig, CodexEvent};
 #[tokio::main]
 async fn main() {
     let prompt = std::env::args().nth(1).unwrap_or_else(|| "Responda apenas: online.".into());
-    let mcp = std::env::current_exe().ok().and_then(|exe| {
+    let mcp = if std::env::var_os("FRIDAY_NO_MCP").is_some() {
+        None
+    } else {
+        std::env::current_exe().ok().and_then(|exe| {
         let dir = exe.parent()?;
         [dir.join("friday-mcp"), dir.join("../friday-mcp")]
             .into_iter()
             .find(|path| path.is_file())
-    });
+        })
+    };
 
     let instructions = std::env::var("FRIDAY_PERSONA")
         .unwrap_or_else(|_| "Responda em português, em no máximo duas frases.".into());
-    let env = match friday_core::codex::prepare_isolated_home(mcp.as_deref()) {
-        Ok(home) => vec![("CODEX_HOME".to_string(), home.display().to_string())],
-        Err(_) => Vec::new(),
+    let env = if let Ok(home) = std::env::var("FRIDAY_CODEX_HOME") {
+        vec![("CODEX_HOME".to_string(), home)]
+    } else {
+        match friday_core::codex::prepare_isolated_home(mcp.as_deref()) {
+            Ok(home) => vec![("CODEX_HOME".to_string(), home.display().to_string())],
+            Err(_) => Vec::new(),
+        }
     };
 
     let config = CodexConfig {
@@ -32,6 +40,8 @@ async fn main() {
     let mut codex = Codex::spawn(config);
     let mut events = codex.take_events().expect("events");
 
+    let started = std::time::Instant::now();
+    let mut first = true;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     codex.prompt(prompt);
 
@@ -39,14 +49,20 @@ async fn main() {
         let timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
         match tokio::time::timeout(timeout, events.recv()).await {
             Ok(Some(CodexEvent::Online { thread_id })) => {
+                eprintln!("[online_ms {}]", started.elapsed().as_millis());
                 println!("[online thread={thread_id}]");
             }
             Ok(Some(CodexEvent::Delta(text))) => {
+                if first {
+                    first = false;
+                    eprintln!("[first_delta_ms {}]", started.elapsed().as_millis());
+                }
                 print!("{text}");
                 use std::io::Write;
                 let _ = std::io::stdout().flush();
             }
             Ok(Some(CodexEvent::Reasoning(_))) => {}
+            Ok(Some(_)) => {}
             Ok(Some(CodexEvent::Done { status })) => {
                 println!("\n[done {status}]");
                 break;
