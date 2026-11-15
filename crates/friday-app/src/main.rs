@@ -1607,52 +1607,6 @@ impl Render for FridayApp {
                     .h(px(1.0))
                     .bg(rgb(0x64101d)),
             )
-            // Context panel (right)
-            .child(
-                div()
-                    .absolute()
-                    .left(lx(1195.0))
-                    .top(ly(240.0))
-                    .w(sx(300.0))
-                    .rounded(sx(18.0))
-                    .border_1()
-                    .border_color(rgb(0x5a0a16))
-                    .bg(rgb(0x080608))
-                    .p(sx(18.0))
-                    .flex()
-                    .flex_col()
-                    .gap(sx(12.0))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(sx(10.0))
-                            .child(div().w(sx(6.0)).h(sx(6.0)).rounded_full().bg(rgb(0xff1738)))
-                            .child(
-                                div()
-                                    .font_family("SF Mono")
-                                    .text_size(sx(13.0))
-                                    .text_color(rgb(0xf4f4f6))
-                                    .child(SharedString::from("CONTEXTO ATUAL")),
-                            ),
-                    )
-                    .child(div().h(px(1.0)).bg(rgb(0x64101d)))
-                    .child(context_row(
-                        "⌂",
-                        "Em casa",
-                        &format!("Rede Wi-Fi: {}", if self.active_app.is_empty() { "—" } else { "Casa" }),
-                        sx,
-                    ))
-                    .child(div().h(px(1.0)).bg(rgb(0x3a0810)))
-                    .child(context_row("▦", "Próximos compromissos", "Nenhum agendado", sx))
-                    .child(div().h(px(1.0)).bg(rgb(0x3a0810)))
-                    .child(context_row(
-                        "✓",
-                        "Tarefas pendentes",
-                        &format!("{pending_tasks} em andamento"),
-                        sx,
-                    )),
-            )
             // Speech capsule
             .child(
                 div()
