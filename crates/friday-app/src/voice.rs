@@ -224,6 +224,18 @@ pub fn stop_speaking() {
 
 static PLAYBACK: Mutex<Option<Child>> = Mutex::new(None);
 
+/// Current TTS amplitude (0..1), updated while afplay runs so the orb can
+/// pulse with the actual voice instead of a fixed sine.
+static SPEECH_LEVEL: AtomicU32 = AtomicU32::new(0);
+
+pub fn speech_level() -> f32 {
+    f32::from_bits(SPEECH_LEVEL.load(Ordering::Relaxed))
+}
+
+fn set_speech_level(value: f32) {
+    SPEECH_LEVEL.store(value.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+}
+
 /// After a 429, stop hammering ChatGPT TTS for a minute and use the local voice.
 static TTS_COOLDOWN: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 
@@ -331,9 +343,35 @@ fn speak_sentences(sentences: &[String], cancel: &Arc<AtomicBool>) -> Result<(),
 }
 
 fn play_file(path: &Path, cancel: &AtomicBool) -> Result<(), String> {
+    // Drive the orb from the synthesized envelope, window by window.
+    let stop = Arc::new(AtomicBool::new(false));
+    if let Ok(bytes) = std::fs::read(path) {
+        if let Ok(pcm) = friday_core::wav::parse_wav(&bytes) {
+            let mono = pcm.mono_f32();
+            let window = (pcm.sample_rate as usize / 20).max(1);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                for chunk in mono.chunks(window) {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let rms = (chunk.iter().map(|sample| sample * sample).sum::<f32>()
+                        / chunk.len().max(1) as f32)
+                        .sqrt();
+                    set_speech_level((rms * 6.0).clamp(0.0, 1.0));
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                set_speech_level(0.0);
+            });
+        }
+    }
+
     let mut command = Command::new("/usr/bin/afplay");
     command.arg(path);
-    run_playback(&mut command, cancel)
+    let result = run_playback(&mut command, cancel);
+    stop.store(true, Ordering::Relaxed);
+    set_speech_level(0.0);
+    result
 }
 
 /// Inicia o comando, registra no global e espera checando `cancel`.

@@ -1281,9 +1281,13 @@ impl Render for FridayApp {
         let clock = self.booted_at.elapsed().as_secs_f32();
         let speaking = self.voice_phase == voice::VoicePhase::Speaking;
         let busy = matches!(self.status, Status::Thinking);
-        let angle = clock * if speaking { 2.4 } else { 0.22 };
+        let audio = voice::speech_level();
+        let angle = clock * if speaking { 2.0 + audio * 2.0 } else { 0.22 };
+        // While speaking, the orb follows the actual TTS envelope; idle keeps a
+        // slow breath.
+        let audio = voice::speech_level();
         let pulse = if speaking {
-            1.0 + 0.055 * (clock * 7.5).sin()
+            1.0 + 0.10 * audio + 0.012 * (clock * 7.5).sin()
         } else {
             1.0 + 0.012 * (clock * 0.8).sin()
         };
