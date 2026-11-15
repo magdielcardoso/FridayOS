@@ -2,16 +2,17 @@
 //!
 //! Black substrate, red phosphor, monospace grid. No light theme.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use friday_core::codex::{Codex, CodexConfig, CodexEvent, StepState};
 use gpui::prelude::*;
 use gpui::{
-    canvas, div, point, px, rgb, size, App, Application, Bounds, Context, FocusHandle,
-    KeyDownEvent, PathBuilder, Render, ScrollHandle, SharedString, Window, WindowBounds,
-    WindowOptions,
+    canvas, div, point, px, rgb, rgba, size, App, Application, Bounds, Context, FocusHandle,
+    AnyWindowHandle, KeyDownEvent, PathBuilder, Render, ScrollHandle, SharedString, Window,
+    WindowBounds, WindowHandle, WindowKind, WindowOptions,
 };
 
 mod voice;
@@ -64,6 +65,12 @@ When the user says something like `you have total access`, confirm out loud
 (pergunte em voz alta se confirma o acesso total) and, on the next turn, call
 `friday__autonomy_set` with level `full` and `__confirm: true`. Never raise
 your own autonomy without that explicit grant.
+For anything visual the user asks to SEE on screen (reports, dollar quotes,
+web research, comparisons), do not dump a wall of text: call
+`friday__overlay_show` with a short title and the body, choosing `anchor`
+(center, top, bottom, left, right, corners), width/height and optional
+`seconds`. The overlay is borderless, floats above other apps and works even
+when your window is not focused. Use `friday__overlay_close` to dismiss it.
 If voice fails because of the ChatGPT hourly limit, offer to authenticate
 another Codex account: ask for permission, then call `friday__codex_login`
 (the user confirms in the browser). It activates the new account by default and
@@ -86,6 +93,139 @@ enum Role {
     User,
     Friday,
     System,
+}
+
+struct OverlayRequest {
+    title: String,
+    body: String,
+    anchor: String,
+    width: f32,
+    height: f32,
+    offset_x: f32,
+    offset_y: f32,
+    seconds: u64,
+}
+
+enum OverlayMsg {
+    Show(OverlayRequest),
+    Close,
+}
+
+static OVERLAY_INBOX: OnceLock<Mutex<Vec<OverlayMsg>>> = OnceLock::new();
+static OVERLAY_WINDOWS: OnceLock<Mutex<Vec<AnyWindowHandle>>> = OnceLock::new();
+
+fn overlay_inbox() -> &'static Mutex<Vec<OverlayMsg>> {
+    OVERLAY_INBOX.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn overlay_windows() -> &'static Mutex<Vec<AnyWindowHandle>> {
+    OVERLAY_WINDOWS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+struct OverlayView {
+    title: String,
+    body: String,
+}
+
+impl Render for OverlayView {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let bracket = |top: bool, left: bool| {
+            let mut b = div().absolute().w(px(16.0)).h(px(16.0)).border_color(rgb(RED));
+            b = if top { b.top(px(0.0)).border_t_1() } else { b.bottom(px(0.0)).border_b_1() };
+            b = if left { b.left(px(0.0)).border_l_1() } else { b.right(px(0.0)).border_r_1() };
+            b
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .p(px(10.0))
+            .font_family("Menlo")
+            .child(
+                div()
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .bg(rgba(0x070303f2))
+                    .border_1()
+                    .border_color(rgb(0x7a1a1a))
+                    .p(px(20.0))
+                    .gap(px(12.0))
+                    .child(bracket(true, true))
+                    .child(bracket(true, false))
+                    .child(bracket(false, true))
+                    .child(bracket(false, false))
+                    // Header
+                    .child(
+                        div()
+                            .flex()
+                            .justify_between()
+                            .items_center()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.0))
+                                    .child(
+                                        div()
+                                            .w(px(6.0))
+                                            .h(px(6.0))
+                                            .bg(rgb(RED)),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(12.0))
+                                            .text_color(rgb(RED))
+                                            .child(SharedString::from(
+                                                self.title.to_uppercase(),
+                                            )),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(9.0))
+                                    .text_color(rgb(0x5e1414))
+                                    .child(SharedString::from("F.R.I.D.A.Y · HUD")),
+                            ),
+                    )
+                    // Rule with ticks
+                    .child(
+                        div()
+                            .flex()
+                            .justify_between()
+                            .text_size(px(7.0))
+                            .text_color(rgb(0x4a1010))
+                            .child(SharedString::from(
+                                "▏▏▏▏▏▏▏▏▏▏▏▏▏▏▏▏▏▏▏▏▏▏▏▏▏▏▏▏▏▏▏▏▏▏▏▏▏▏▏▏",
+                            ))
+                            .child(SharedString::from("◇")),
+                    )
+                    // Body
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(11.5))
+                            .line_height(px(17.0))
+                            .text_color(rgb(BONE))
+                            .child(SharedString::from(self.body.clone())),
+                    )
+                    // Footer
+                    .child(
+                        div()
+                            .flex()
+                            .justify_between()
+                            .pt(px(8.0))
+                            .border_t_1()
+                            .border_color(rgb(0x3b0d0d))
+                            .text_size(px(9.0))
+                            .text_color(rgb(0x7a1a1a))
+                            .child(SharedString::from("SISTEMA NOMINAL · CANAL SEGURO"))
+                            .child(SharedString::from("▮▮▮▯")),
+                    ),
+            )
+    }
 }
 
 struct Activity {
@@ -601,6 +741,19 @@ impl FridayApp {
             let _ = this.update(cx, |app, cx| {
                 app.tick = app.tick.wrapping_add(1);
                 app.blink = (app.tick / 12) % 2 == 0;
+                let messages = {
+                    let mut inbox = match overlay_inbox().lock() {
+                        Ok(inbox) => inbox,
+                        Err(_) => return,
+                    };
+                    std::mem::take(&mut *inbox)
+                };
+                for message in messages {
+                    match message {
+                        OverlayMsg::Show(request) => open_overlay(cx, request),
+                        OverlayMsg::Close => close_overlays(cx),
+                    }
+                }
                 cx.notify();
             });
         })
@@ -1519,6 +1672,174 @@ fn start_screen_daemon() {
     });
 }
 
+/// Local socket the agent's MCP server uses to ask for visual windows.
+fn start_overlay_daemon() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+
+    let home = std::env::var_os("HOME").unwrap_or_default();
+    let dir = std::path::PathBuf::from(home).join("Library/Application Support/FridayOS");
+    let _ = std::fs::create_dir_all(&dir);
+    let socket = dir.join("overlay.sock");
+    let _ = std::fs::remove_file(&socket);
+    let Ok(listener) = UnixListener::bind(&socket) else {
+        log("overlay: não consegui abrir o socket");
+        return;
+    };
+    let _ = std::fs::set_permissions(&socket, std::os::unix::fs::PermissionsExt::from_mode(0o600));
+    log("overlay: pronto");
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+            let mut line = String::new();
+            if reader.read_line(&mut line).is_err() {
+                continue;
+            }
+            let value: serde_json::Value =
+                serde_json::from_str(line.trim()).unwrap_or(serde_json::Value::Null);
+            let action = value
+                .get("action")
+                .and_then(|action| action.as_str())
+                .unwrap_or("show");
+            let reply = if action == "close" {
+                overlay_inbox().lock().map(|mut inbox| inbox.push(OverlayMsg::Close)).ok();
+                serde_json::json!({ "ok": true })
+            } else {
+                let request = OverlayRequest {
+                    title: value
+                        .get("title")
+                        .and_then(|title| title.as_str())
+                        .filter(|title| !title.trim().is_empty())
+                        .unwrap_or("Friday")
+                        .to_string(),
+                    body: value
+                        .get("body")
+                        .and_then(|body| body.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    anchor: value
+                        .get("anchor")
+                        .and_then(|anchor| anchor.as_str())
+                        .unwrap_or("center")
+                        .to_string(),
+                    width: value.get("width").and_then(|v| v.as_f64()).unwrap_or(560.0) as f32,
+                    height: value.get("height").and_then(|v| v.as_f64()).unwrap_or(380.0) as f32,
+                    offset_x: value.get("offset_x").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                    offset_y: value.get("offset_y").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                    seconds: value.get("seconds").and_then(|v| v.as_u64()).unwrap_or(0),
+                };
+                if request.body.trim().is_empty() {
+                    serde_json::json!({ "ok": false, "error": "body vazio" })
+                } else {
+                    if let Ok(mut inbox) = overlay_inbox().lock() {
+                        inbox.push(OverlayMsg::Show(request));
+                    }
+                    serde_json::json!({ "ok": true })
+                }
+            };
+            let mut stream = stream;
+            let mut payload = reply.to_string();
+            payload.push('\n');
+            let _ = stream.write_all(payload.as_bytes());
+        }
+    });
+}
+
+fn close_overlays(cx: &mut App) {
+    let handles = {
+        match overlay_windows().lock() {
+            Ok(mut windows) => std::mem::take(&mut *windows),
+            Err(_) => return,
+        }
+    };
+    for handle in handles {
+        let _ = handle.update(cx, |_, window, _| window.remove_window());
+    }
+}
+
+fn open_overlay(cx: &mut App, request: OverlayRequest) {
+    close_overlays(cx);
+
+    let display = cx.primary_display().map(|display| display.bounds());
+    let (screen_w, screen_h, screen_x, screen_y) = match display {
+        Some(bounds) => (
+            f32::from(bounds.size.width),
+            f32::from(bounds.size.height),
+            f32::from(bounds.origin.x),
+            f32::from(bounds.origin.y),
+        ),
+        None => (1440.0, 900.0, 0.0, 0.0),
+    };
+
+    let width = request.width.clamp(280.0, screen_w - 40.0);
+    let height = request.height.clamp(160.0, screen_h - 40.0);
+    let margin = 28.0;
+    let (mut x, mut y) = match request.anchor.to_lowercase().as_str() {
+        "top" | "top-center" => ((screen_w - width) / 2.0, margin),
+        "bottom" | "bottom-center" => ((screen_w - width) / 2.0, screen_h - height - margin),
+        "left" | "middle-left" => (margin, (screen_h - height) / 2.0),
+        "right" | "middle-right" => (screen_w - width - margin, (screen_h - height) / 2.0),
+        "top-left" => (margin, margin),
+        "top-right" => (screen_w - width - margin, margin),
+        "bottom-left" => (margin, screen_h - height - margin),
+        "bottom-right" => (screen_w - width - margin, screen_h - height - margin),
+        _ => ((screen_w - width) / 2.0, (screen_h - height) / 2.0),
+    };
+    x += request.offset_x;
+    y += request.offset_y;
+    x = x.clamp(0.0, (screen_w - width).max(0.0));
+    y = y.clamp(0.0, (screen_h - height).max(0.0));
+
+    let bounds = Bounds::new(
+        point(px(screen_x + x), px(screen_y + y)),
+        size(px(width), px(height)),
+    );
+
+    let title = request.title.clone();
+    let body = request.body.clone();
+    let opened = cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            titlebar: None,
+            focus: false,
+            show: true,
+            is_movable: false,
+            is_resizable: false,
+            is_minimizable: false,
+            kind: WindowKind::PopUp,
+            window_background: gpui::WindowBackgroundAppearance::Transparent,
+            ..Default::default()
+        },
+        |_, cx| {
+            cx.new(|_| OverlayView {
+                title: title.clone(),
+                body: body.clone(),
+            })
+        },
+    );
+
+    let Ok(handle) = opened else { return };
+    if let Ok(mut windows) = overlay_windows().lock() {
+        windows.push(handle.into());
+    }
+
+    if request.seconds > 0 {
+        let ttl = Duration::from_secs(request.seconds.clamp(3, 600));
+        cx.spawn(async move |cx| {
+            cx.background_executor().timer(ttl).await;
+            let handles = match overlay_windows().lock() {
+                Ok(mut windows) => std::mem::take(&mut *windows),
+                Err(_) => return,
+            };
+            for handle in handles {
+                let _ = handle.update(cx, |_, window, _| window.remove_window());
+            }
+        })
+        .detach();
+    }
+}
+
 fn main() {
     if std::env::args().any(|arg| arg == "--capture-test") {
         let result = friday_tools::Registry::with_defaults().call(
@@ -1596,6 +1917,7 @@ fn main() {
         return;
     }
     start_screen_daemon();
+    start_overlay_daemon();
     Application::new().run(|cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1100.0), px(880.0)), cx);
         cx.open_window(
@@ -1617,6 +1939,11 @@ fn main() {
             },
         )
         .expect("open FridayOS window");
+        // `WindowBounds::Fullscreen` only keeps the restore size on macOS; the
+        // actual transition has to be requested after the window exists.
+        if let Some(handle) = cx.active_window() {
+            let _ = handle.update(cx, |_, window, _| window.toggle_fullscreen());
+        }
         cx.activate(true);
     });
 }

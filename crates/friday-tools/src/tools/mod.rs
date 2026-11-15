@@ -8,6 +8,7 @@ pub mod ax;
 pub mod files;
 pub mod input;
 pub mod net;
+pub mod overlay;
 pub mod screen;
 pub mod shell;
 pub mod voice;
@@ -28,6 +29,7 @@ pub fn register_all(registry: &mut Registry) {
     screen::register(registry);
     files::register(registry);
     net::register(registry);
+    overlay::register(registry);
     voice::register(registry);
     voice_prefs::register(registry);
     reasoning::register(registry);
