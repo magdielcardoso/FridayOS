@@ -367,6 +367,8 @@ struct FridayApp {
     active_category: String,
     cpu: u8,
     ram: u8,
+    graph_points: Vec<(f32, f32)>,
+    graph_edges: Vec<(u32, u32)>,
     tts_stream: bool,
     speaking_since: Option<std::time::Instant>,
     wake: bool,
@@ -412,6 +414,8 @@ impl FridayApp {
             active_category: String::new(),
             cpu: 0,
             ram: 0,
+            graph_points: Vec::new(),
+            graph_edges: Vec::new(),
             tts_stream: std::env::var("FRIDAY_TTS_MODE")
                 .map(|mode| mode == "stream")
                 .unwrap_or(false),
@@ -1026,6 +1030,46 @@ impl FridayApp {
         })
         .detach();
 
+        // Knowledge graph projection for the orb core, refreshed slowly.
+        let (graph_tx, mut graph_rx) = tokio::sync::mpsc::unbounded_channel();
+        std::thread::Builder::new()
+            .name("friday-graph".into())
+            .spawn(move || loop {
+                let nodes = friday_brain::all_nodes().unwrap_or_default();
+                let edges = friday_brain::all_edges().unwrap_or_default();
+                let mut index = std::collections::HashMap::new();
+                for (position, node) in nodes.iter().enumerate() {
+                    index.insert(node.id.clone(), position as u32);
+                }
+                let total = nodes.len().max(1) as f32;
+                let points: Vec<(f32, f32)> = (0..nodes.len())
+                    .map(|position| {
+                        let radius = (position as f32 / total).sqrt() * 0.92;
+                        let angle = position as f32 * 2.399_963_2;
+                        (radius * angle.cos(), radius * angle.sin())
+                    })
+                    .collect();
+                let links: Vec<(u32, u32)> = edges
+                    .iter()
+                    .filter_map(|edge| {
+                        Some((*index.get(&edge.src)?, *index.get(&edge.dst)?))
+                    })
+                    .collect();
+                let _ = graph_tx.send((points, links));
+                std::thread::sleep(Duration::from_secs(8));
+            })
+            .ok();
+        cx.spawn(async move |this, cx| {
+            while let Some((points, links)) = graph_rx.recv().await {
+                let _ = this.update(cx, |state, cx| {
+                    state.graph_points = points;
+                    state.graph_edges = links;
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+
         // Watch for account switches made by the agent's account tools.
         cx.spawn(async move |this, cx| loop {
             cx.background_executor()
@@ -1408,6 +1452,8 @@ impl Render for FridayApp {
             "Aguardando comando".to_string()
         };
 
+        let graph_points_snapshot = self.graph_points.clone();
+        let graph_edges_snapshot = self.graph_edges.clone();
         let orb = canvas(
             move |_bounds, _window, _cx| {},
             move |bounds, _, window, _cx| {
@@ -1457,35 +1503,33 @@ impl Render for FridayApp {
                 paint_arc(window, cx0, cy0, 88.0 * scale, 0.0, TAU, 0.6, 0x1c050a);
                 paint_arc(window, cx0, cy0, 120.0 * scale, 200.0 + angle * 20.0, 300.0 + angle * 20.0, 3.0, 0x8a0f20);
 
-                // Inverted hollow triangle with a notch on the top edge.
-                let emblem_cy = cy0 + 10.0 * scale;
-                let top_y = emblem_cy - 42.0 * scale;
-                let bottom_y = emblem_cy + 42.0 * scale;
-                let half = 46.0 * scale;
-                let mut outer = gpui::PathBuilder::fill();
-                outer.move_to(point(px(cx0), px(bottom_y)));
-                outer.line_to(point(px(cx0 - half), px(top_y)));
-                outer.line_to(point(px(cx0 + half), px(top_y)));
-                if let Ok(path) = outer.build() {
-                    window.paint_path(path, rgb(bright));
+                // Knowledge graph core: points and links grow with the vault.
+                let nodes = graph_points_snapshot.clone();
+                let links = graph_edges_snapshot.clone();
+                let radius = 92.0 * scale;
+                for &(a, b) in &links {
+                    if let (Some(pa), Some(pb)) = (nodes.get(a as usize), nodes.get(b as usize)) {
+                        paint_segment(
+                            window,
+                            cx0 + pa.0 * radius,
+                            cy0 + pa.1 * radius,
+                            cx0 + pb.0 * radius,
+                            cy0 + pb.1 * radius,
+                            0.8,
+                            0x5a0a16,
+                        );
+                    }
                 }
-                let mut inner = gpui::PathBuilder::fill();
-                inner.move_to(point(px(cx0), px(bottom_y - 20.0 * scale)));
-                inner.line_to(point(px(cx0 - 24.0 * scale), px(top_y + 18.0 * scale)));
-                inner.line_to(point(px(cx0 + 24.0 * scale), px(top_y + 18.0 * scale)));
-                if let Ok(path) = inner.build() {
-                    window.paint_path(path, rgb(0x030304));
+                if nodes.is_empty() {
+                    paint_arc(window, cx0, cy0, 3.0 * scale, 0.0, TAU, 2.0, bright);
                 }
-                paint_line(
-                    window,
-                    cx0,
-                    top_y,
-                    top_y + 2.0 * scale,
-                    0.0,
-                    12.0 * scale,
-                    0.0,
-                    0x030304,
-                );
+                for &(x, y) in &nodes {
+                    let px0 = cx0 + x * radius;
+                    let py0 = cy0 + y * radius;
+                    let dot = (2.6 + 1.6 * ((clock * 1.5).sin() * 0.5 + 0.5)) * scale;
+                    paint_arc(window, px0, py0, dot + 2.5 * scale, 0.0, TAU, 1.0, 0x3a0810);
+                    paint_arc(window, px0, py0, dot, 0.0, TAU, 2.0, bright);
+                }
             },
         )
         .size(sx(520.0));
@@ -1735,6 +1779,23 @@ fn civil(days_since_epoch: i64) -> (i64, u32, u32) {
 }
 
 const TAU: f32 = std::f32::consts::TAU;
+
+fn paint_segment(
+    window: &mut Window,
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+    width: f32,
+    color: u32,
+) {
+    let mut builder = gpui::PathBuilder::stroke(px(width));
+    builder.move_to(point(px(x1), px(y1)));
+    builder.line_to(point(px(x2), px(y2)));
+    if let Ok(path) = builder.build() {
+        window.paint_path(path, rgb(color));
+    }
+}
 
 fn paint_arc(
     window: &mut Window,
