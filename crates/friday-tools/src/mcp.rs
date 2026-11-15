@@ -239,13 +239,13 @@ fn tools_call(registry: &Registry, id: Option<Value>, params: &Value) -> Outcome
     if args.is_null() {
         args = json!({});
     }
-    let Value::Object(_) = args else {
+    if !args.is_object() {
         return Outcome::Reply(error_response(
             id,
             INVALID_PARAMS,
             "params.arguments deve ser um objeto JSON".to_string(),
         ));
-    };
+    }
 
     let confirmed = args
         .get("__confirm")
@@ -399,6 +399,7 @@ pub fn codex_config_snippet() -> String {
 command = "{exe}"
 # args = []          # nenhum argumento é necessário
 # startup_timeout_sec = 10
+# Ajuste o caminho acima se o binário estiver em outro lugar.
 
 # Ou, sem editar o config.toml, passe a configuração na linha de comando:
 #   codex -c 'mcp_servers.friday.command="{exe}"' app-server --stdio
