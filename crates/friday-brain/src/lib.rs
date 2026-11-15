@@ -432,6 +432,43 @@ pub fn search(query: &str, limit: usize) -> anyhow::Result<Vec<SearchHit>> {
             content: body.chars().take(600).collect(),
         })
     })?;
+    let hits: Vec<SearchHit> = rows.filter_map(|row| row.ok()).collect();
+    if !hits.is_empty() {
+        return Ok(hits);
+    }
+
+    // FTS is strict about tokens. Fall back to a substring match on the most
+    // meaningful term so partial names ("StackLa", "Panoram") still resolve.
+    let needle = query
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|term| term.len() >= 3)
+        .max_by_key(|term| term.len())
+        .unwrap_or(query)
+        .to_lowercase();
+    if needle.is_empty() {
+        return Ok(hits);
+    }
+    let mut statement = conn.prepare(
+        "SELECT n.id, n.title, n.kind, n.path, substr(n.body, 1, 240), n.body
+         FROM nodes n
+         WHERE lower(n.title) LIKE ?1 OR lower(n.body) LIKE ?1
+         ORDER BY CASE WHEN lower(n.title) LIKE ?1 THEN 0 ELSE 1 END, n.updated DESC
+         LIMIT ?2",
+    )?;
+    let rows = statement.query_map(
+        params![format!("%{needle}%"), limit as i64],
+        |row| {
+            let body: String = row.get(5).unwrap_or_default();
+            Ok(SearchHit {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                kind: row.get(2)?,
+                path: row.get(3)?,
+                snippet: row.get(4)?,
+                content: body.chars().take(600).collect(),
+            })
+        },
+    )?;
     Ok(rows.filter_map(|row| row.ok()).collect())
 }
 
