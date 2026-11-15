@@ -395,7 +395,9 @@ pub struct SearchHit {
     pub id: String,
     pub title: String,
     pub kind: String,
+    pub path: String,
     pub snippet: String,
+    pub content: String,
 }
 
 fn fts_query(query: &str) -> String {
@@ -415,16 +417,19 @@ fn fts_query(query: &str) -> String {
 pub fn search(query: &str, limit: usize) -> anyhow::Result<Vec<SearchHit>> {
     let conn = connection()?;
     let mut statement = conn.prepare(
-        "SELECT n.id, n.title, n.kind, snippet(nodes_fts, 2, '', '', '…', 18)
+        "SELECT n.id, n.title, n.kind, n.path, COALESCE(snippet(nodes_fts, 2, '', '', '…', 48), ''), n.body
          FROM nodes_fts JOIN nodes n ON n.id = nodes_fts.id
          WHERE nodes_fts MATCH ?1 ORDER BY rank LIMIT ?2",
     )?;
     let rows = statement.query_map(params![fts_query(query), limit as i64], |row| {
+        let body: String = row.get(5).unwrap_or_default();
         Ok(SearchHit {
             id: row.get(0)?,
             title: row.get(1)?,
             kind: row.get(2)?,
-            snippet: row.get::<_, String>(3).unwrap_or_default(),
+            path: row.get(3)?,
+            snippet: row.get(4)?,
+            content: body.chars().take(600).collect(),
         })
     })?;
     Ok(rows.filter_map(|row| row.ok()).collect())
@@ -433,12 +438,51 @@ pub fn search(query: &str, limit: usize) -> anyhow::Result<Vec<SearchHit>> {
 /// Node ids matching an exact alias (e.g. a person or project name).
 pub fn resolve(name: &str) -> anyhow::Result<Vec<String>> {
     let conn = connection()?;
-    let mut statement = conn.prepare("SELECT node_id FROM aliases WHERE alias = ?1")?;
-    let rows = statement.query_map(params![name.to_lowercase()], |row| row.get(0))?;
-    let mut ids: Vec<String> = rows.filter_map(|row| row.ok()).collect();
-    if ids.is_empty() {
-        ids = search(name, 5)?.into_iter().map(|hit| hit.id).collect();
+    let wanted = name.trim();
+    let wanted_slug = slug(wanted);
+    let mut ids: Vec<String> = Vec::new();
+
+    // Exact id, path or title first.
+    if let Ok(mut statement) = conn.prepare(
+        "SELECT id FROM nodes WHERE id = ?1 OR lower(title) = ?2
+         OR path = ?1 OR lower(path) LIKE ?3 LIMIT 5",
+    ) {
+        if let Ok(rows) = statement.query_map(
+            params![wanted, wanted.to_lowercase(), format!("%{}%", wanted.to_lowercase())],
+            |row| row.get::<_, String>(0),
+        ) {
+            ids.extend(rows.filter_map(|row| row.ok()));
+        }
     }
+    if ids.is_empty() && !wanted_slug.is_empty() {
+        if let Ok(mut statement) = conn.prepare("SELECT id FROM nodes WHERE id LIKE ?1 LIMIT 5") {
+            if let Ok(rows) = statement.query_map(params![format!("%{wanted_slug}%")], |row| row.get::<_, String>(0)) {
+                ids.extend(rows.filter_map(|row| row.ok()));
+            }
+        }
+    }
+    if ids.is_empty() {
+        if let Ok(mut statement) = conn.prepare("SELECT node_id FROM aliases WHERE alias = ?1") {
+            if let Ok(rows) = statement.query_map(params![wanted.to_lowercase()], |row| row.get::<_, String>(0)) {
+                ids.extend(rows.filter_map(|row| row.ok()));
+            }
+        }
+    }
+    if ids.is_empty() {
+        // FTS: strip punctuation so "Obsidian / StackLab Docs" still matches.
+        let cleaned: Vec<String> = wanted
+            .split(|ch: char| !ch.is_alphanumeric())
+            .filter(|word| word.len() >= 3)
+            .map(|word| word.to_string())
+            .collect();
+        let query = if cleaned.is_empty() {
+            wanted.to_string()
+        } else {
+            cleaned.join(" OR ")
+        };
+        ids = search(&query, 5)?.into_iter().map(|hit| hit.id).collect();
+    }
+    ids.dedup();
     Ok(ids)
 }
 
@@ -475,10 +519,15 @@ pub fn neighbors(id: &str, depth: usize) -> anyhow::Result<Neighbors> {
         }
         frontier = next;
     }
-    let nodes = ids
+    let mut nodes: Vec<Node> = ids
         .iter()
         .filter_map(|id| node_by_id(&conn, id).ok().flatten())
         .collect();
+    if nodes.is_empty() {
+        if let Some(node) = node_by_id(&conn, id)? {
+            nodes.push(node);
+        }
+    }
     Ok(Neighbors { nodes, edges })
 }
 

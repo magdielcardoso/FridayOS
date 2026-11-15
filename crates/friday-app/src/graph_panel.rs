@@ -85,7 +85,7 @@ pub fn open(cx: &mut App, highlight: Vec<String>) -> Result<WindowHandle<GraphPa
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: None,
-            kind: WindowKind::Normal,
+            kind: WindowKind::PopUp,
             focus: false,
             show: true,
             is_movable: true,

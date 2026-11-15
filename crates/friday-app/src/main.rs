@@ -942,6 +942,47 @@ impl FridayApp {
                 if app.tick % 50 == 0 {
                     app.assistants = load_assistants();
                 }
+
+                let messages = {
+                    let mut inbox = match overlay_inbox().lock() {
+                        Ok(inbox) => inbox,
+                        Err(_) => return,
+                    };
+                    std::mem::take(&mut *inbox)
+                };
+                for message in messages {
+                    match message {
+                        OverlayMsg::Show(request) => open_overlay(cx, request),
+                        OverlayMsg::Graph(highlight) => {
+                            let _ = graph_panel::open(cx, highlight);
+                        }
+                        OverlayMsg::Close => close_overlays(cx),
+                    }
+                }
+
+                for text in mobile::take_requests() {
+                    if app.status == Status::Thinking {
+                        app.external_pending.push_back(("mobile".to_string(), text));
+                    } else {
+                        app.inject_trigger("mobile".to_string(), text, cx);
+                    }
+                }
+
+                let triggers = {
+                    let mut inbox = match trigger_inbox().lock() {
+                        Ok(inbox) => inbox,
+                        Err(_) => return,
+                    };
+                    std::mem::take(&mut *inbox)
+                };
+                for trigger in triggers {
+                    if app.status == Status::Thinking {
+                        app.external_pending
+                            .push_back((trigger.source, trigger.prompt));
+                    } else {
+                        app.inject_trigger(trigger.source, trigger.prompt, cx);
+                    }
+                }
                 cx.notify();
             });
         })
