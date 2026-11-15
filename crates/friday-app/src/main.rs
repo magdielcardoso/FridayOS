@@ -345,6 +345,7 @@ struct FridayApp {
     messages: Vec<Line>,
     input: String,
     stream: String,
+    reasoning: String,
     status: Status,
     thread: Option<String>,
     tools: usize,
@@ -387,6 +388,7 @@ impl FridayApp {
             }],
             input: String::new(),
             stream: String::new(),
+            reasoning: String::new(),
             status: Status::Connecting,
             thread: None,
             tools: friday_tools::Registry::with_defaults().specs().len(),
@@ -1059,6 +1061,7 @@ impl FridayApp {
                 self.scroll.scroll_to_bottom();
             }
             CodexEvent::Reasoning(delta) => {
+                self.reasoning.push_str(&delta);
                 if !delta.is_empty()
                     && self.activity.last().map(|a| a.label.as_str()) != Some("processando")
                 {
@@ -1192,6 +1195,7 @@ impl FridayApp {
         self.input.clear();
         self.stream.clear();
         self.status = Status::Thinking;
+        self.reasoning.clear();
         self.notify_on_done = false;
         mobile::user_message(&text);
         self.activity.clear();
@@ -1331,79 +1335,68 @@ impl Render for FridayApp {
         let speaking = self.voice_phase == voice::VoicePhase::Speaking;
         let busy = matches!(self.status, Status::Thinking);
         let audio = voice::speech_level();
+
+        let (glow, dim, bright) = if busy {
+            (0x3d1d05, 0x8f4a12, 0xff7a1f)
+        } else if speaking {
+            (0x3a0d0d, 0x8f1c1c, 0xff4632)
+        } else {
+            (0x260808, 0x5e1414, 0xd92b23)
+        };
         let angle = clock * if speaking { 2.0 + audio * 2.0 } else { 0.22 };
-        // While speaking, the orb follows the actual TTS envelope; idle keeps a
-        // slow breath.
-        let audio = voice::speech_level();
         let pulse = if speaking {
             1.0 + 0.10 * audio + 0.012 * (clock * 7.5).sin()
         } else {
             1.0 + 0.012 * (clock * 0.8).sin()
         };
 
-        let orb = canvas(move |_bounds, _window, _cx| {}, move |bounds, _, window, _cx| {
-            let w = f32::from(bounds.size.width);
-            let h = f32::from(bounds.size.height);
-            let cx = f32::from(bounds.origin.x) + w / 2.0;
-            let cy = f32::from(bounds.origin.y) + h / 2.0;
-            let base = w.min(h) * 0.44 * pulse;
-            // Thinking shifts the palette toward amber; speaking stays red.
-            let (glow, dim, bright) = if busy {
-                (0x3d1d05, 0x8f4a12, 0xff7a1f)
-            } else if speaking {
-                (0x3a0d0d, 0x8f1c1c, 0xff4632)
-            } else {
-                (0x260808, 0x5e1414, 0xd92b23)
-            };
+        let orb = canvas(
+            move |_bounds, _window, _cx| {},
+            move |bounds, _, window, _cx| {
+                let w = f32::from(bounds.size.width);
+                let h = f32::from(bounds.size.height);
+                let cx0 = f32::from(bounds.origin.x) + w / 2.0;
+                let cy0 = f32::from(bounds.origin.y) + h / 2.0;
+                let base = w.min(h) * 0.44 * pulse;
 
-            // Halo.
-            paint_arc(window, cx, cy, base * 1.02, 0.0, TAU, 10.0, 0x1c0606);
-            // Outer hairline ring.
-            paint_arc(window, cx, cy, base, 0.0, TAU, 1.4, dim);
-            // Rotating segmented outer ring.
-            for i in 0..4 {
-                let start = angle + i as f32 * TAU / 4.0 + 0.16;
-                paint_arc(window, cx, cy, base * 0.965, start, start + 1.02, 6.0, bright);
-            }
-            // Dashed tick ring.
-            paint_dashed_ring(window, cx, cy, base * 0.90, 2.0, 0x6d1717);
-            // Counter-rotating middle ring with thicker slabs.
-            for i in 0..3 {
-                let start = -angle * 0.7 + i as f32 * TAU / 3.0 + 0.32;
-                paint_arc(window, cx, cy, base * 0.78, start, start + 0.95, 11.0, dim);
-            }
-            // Inner thin arcs.
-            for i in 0..3 {
-                let start = angle * 1.6 + i as f32 * TAU / 3.0;
-                paint_arc(window, cx, cy, base * 0.61, start, start + 0.55, 3.0, bright);
-            }
-            // Radial ticks around the core.
-            for i in 0..48 {
-                let t = i as f32 * TAU / 48.0 + angle * 0.35;
-                let r1 = base * 0.50;
-                let r2 = base * if i % 4 == 0 { 0.545 } else { 0.525 };
-                paint_line(window, cx, cy, r1, r2, t, 1.2, if i % 4 == 0 { dim } else { glow });
-            }
-            // Core rings.
-            paint_arc(window, cx, cy, base * 0.46, 0.0, TAU, 2.0, glow);
-            paint_arc(window, cx, cy, base * 0.34, 0.0, TAU, 1.2, glow);
-            paint_arc(window, cx, cy, base * 0.22, 0.0, TAU, 1.0, glow);
-            // LED arc on the upper left, like the reference.
-            paint_arc(
-                window,
-                cx,
-                cy,
-                base * 0.99,
-                -2.55 + angle * 0.2,
-                -2.05 + angle * 0.2,
-                4.0,
-                0x7c1a1a,
-            );
-        })
-        .size(px(560.0));
+                paint_arc(window, cx0, cy0, base * 1.03, 0.0, TAU, 12.0, 0x180505);
+                paint_arc(window, cx0, cy0, base * 1.00, 0.0, TAU, 1.2, dim);
+                for i in 0..4 {
+                    let start = angle + i as f32 * TAU / 4.0 + 0.16;
+                    paint_arc(window, cx0, cy0, base * 0.965, start, start + 1.02, 6.0, bright);
+                }
+                paint_dashed_ring(window, cx0, cy0, base * 0.90, 2.0, 0x6d1717);
+                for i in 0..3 {
+                    let start = -angle * 0.7 + i as f32 * TAU / 3.0 + 0.32;
+                    paint_arc(window, cx0, cy0, base * 0.78, start, start + 0.95, 11.0, dim);
+                }
+                for i in 0..3 {
+                    let start = angle * 1.6 + i as f32 * TAU / 3.0;
+                    paint_arc(window, cx0, cy0, base * 0.61, start, start + 0.55, 3.0, bright);
+                }
+                for i in 0..48 {
+                    let t = i as f32 * TAU / 48.0 + angle * 0.35;
+                    let r1 = base * 0.50;
+                    let r2 = base * if i % 4 == 0 { 0.545 } else { 0.525 };
+                    paint_line(window, cx0, cy0, r1, r2, t, 1.2, if i % 4 == 0 { dim } else { glow });
+                }
+                paint_arc(window, cx0, cy0, base * 0.46, 0.0, TAU, 2.0, glow);
+                paint_arc(window, cx0, cy0, base * 0.34, 0.0, TAU, 1.2, glow);
+                paint_arc(window, cx0, cy0, base * 0.22, 0.0, TAU, 1.0, glow);
+                paint_arc(
+                    window,
+                    cx0,
+                    cy0,
+                    base * 0.99,
+                    -2.55 + angle * 0.2,
+                    -2.05 + angle * 0.2,
+                    4.0,
+                    0x7c1a1a,
+                );
+            },
+        )
+        .size(px(520.0));
 
-        // Streamed deltas occasionally carry carriage returns; rendering them
-        // makes lines overprint each other in the HUD.
         let answer = if !self.stream.is_empty() {
             self.stream.replace('\r', "")
         } else {
@@ -1414,95 +1407,203 @@ impl Render for FridayApp {
                 .map(|line| line.text.replace('\r', ""))
                 .unwrap_or_default()
         };
-
+        let trace: String = self
+            .reasoning
+            .replace('\r', "")
+            .chars()
+            .rev()
+            .take(420)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
         let waiting = busy || self.activity.iter().any(|a| a.state == StepState::Started);
-        let mut answer_block = div()
-            .flex()
-            .flex_col()
-            .gap(px(8.0))
-            .w(px(320.0))
-            .overflow_hidden();
-        if !answer.is_empty() {
-            answer_block = answer_block.child(
-                div()
-                    .w_full()
-                    .text_size(px(11.5))
-                    .line_height(px(16.0))
-                    .text_color(rgb(RED_SOFT))
-                    .child(SharedString::from(answer)),
-            );
-        }
-
-        if waiting {
-            let mut tasks = div()
-                .flex()
-                .flex_col()
-                .gap(px(3.0))
-                .mt(px(4.0))
-                .px(px(10.0))
-                .py(px(8.0))
-                .border_1()
-                .border_color(rgb(RED_FAINT))
-                .child(
-                    div()
-                        .text_size(px(8.5))
-                        .text_color(rgb(if busy { 0xff7a1f } else { RED_DIM }))
-                        .child(SharedString::from("▌ TAREFAS · aguardando")),
-                );
-            let pending: Vec<&Activity> = self
-                .activity
-                .iter()
-                .filter(|a| a.state != StepState::Completed)
-                .collect();
-            for activity in pending.iter().rev().take(5).rev() {
-                let (mark, color) = match activity.state {
-                    StepState::Started => ("▸", 0xff7a1f),
-                    StepState::Failed => ("✗", RED),
-                    StepState::Completed => ("✓", RED_FAINT),
-                };
-                tasks = tasks.child(
-                    div()
-                        .flex()
-                        .gap(px(6.0))
-                        .text_size(px(9.0))
-                        .text_color(rgb(color))
-                        .child(SharedString::from(mark))
-                        .child(SharedString::from(activity.label.clone())),
-                );
-            }
-            if self.activity.iter().all(|a| a.state == StepState::Completed) {
-                tasks = tasks.child(
-                    div()
-                        .text_size(px(9.0))
-                        .text_color(rgb(RED_FAINT))
-                        .child(SharedString::from("aguardando o modelo…")),
-                );
-            }
-            answer_block = answer_block.child(tasks);
-        }
-
-        let mut steps = div().flex().flex_col().gap(px(3.0));
-        for activity in self.activity.iter().rev().take(4).rev() {
-            let (mark, color) = match activity.state {
-                StepState::Started => ("▸", RED_DIM),
-                StepState::Completed => ("✓", RED_FAINT),
-                StepState::Failed => ("✗", RED),
-            };
-            steps = steps.child(
-                div()
-                    .text_size(px(9.0))
-                    .text_color(rgb(color))
-                    .child(SharedString::from(format!("{mark} {}", activity.label))),
-            );
-        }
-
-        let input_line = format!("› {}{}", self.input, if self.blink { "█" } else { " " });
         let phase_line = match self.voice_phase {
             voice::VoicePhase::Idle => "em repouso",
             voice::VoicePhase::Listening => "ouvindo",
             voice::VoicePhase::Transcribing => "transcrevendo",
             voice::VoicePhase::Speaking => "falando",
         };
+        let level = if speaking { audio.max(self.level * 0.6) } else { self.level };
+        let meter = bars(level, 22);
+        let clock_text = clock_hhmm();
+
+        let mut left = div().flex().flex_col().gap(px(16.0)).w(px(330.0)).flex_none();
+        left = left.child(
+            hud_panel("RESPOSTA", bright).child(
+                div()
+                    .text_size(px(14.0))
+                    .line_height(px(22.0))
+                    .text_color(rgb(BONE))
+                    .child(SharedString::from(if answer.is_empty() {
+                        "aguardando comando…".to_string()
+                    } else {
+                        answer
+                    })),
+            ),
+        );
+        if !trace.is_empty() {
+            left = left.child(
+                hud_panel("RACIOCÍNIO", dim).child(
+                    div()
+                        .text_size(px(10.0))
+                        .line_height(px(15.0))
+                        .text_color(rgb(RED_DIM))
+                        .child(SharedString::from(format_reasoning(&trace))),
+                ),
+            );
+        }
+        if waiting {
+            let mut tasks = hud_panel("TAREFAS", 0xff7a1f);
+            let pending: Vec<&Activity> = self
+                .activity
+                .iter()
+                .filter(|a| a.state != StepState::Completed)
+                .collect();
+            for activity in pending.iter().rev().take(5).rev() {
+                let color = match activity.state {
+                    StepState::Started => 0xff7a1f,
+                    StepState::Failed => RED,
+                    StepState::Completed => RED_FAINT,
+                };
+                tasks = tasks.child(
+                    div()
+                        .flex()
+                        .gap(px(8.0))
+                        .text_size(px(10.5))
+                        .text_color(rgb(color))
+                        .child(SharedString::from(match activity.state {
+                            StepState::Started => "▸",
+                            StepState::Failed => "✗",
+                            StepState::Completed => "✓",
+                        }))
+                        .child(SharedString::from(activity.label.clone())),
+                );
+            }
+            if self.activity.iter().all(|a| a.state == StepState::Completed) {
+                tasks = tasks.child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(rgb(RED_FAINT))
+                        .child(SharedString::from("aguardando o modelo…")),
+                );
+            }
+            left = left.child(tasks);
+        }
+
+        let mut agents = hud_panel("SUBAGENTES", RED_DIM);
+        if self.assistants.is_empty() {
+            agents = agents.child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(rgb(RED_FAINT))
+                    .child(SharedString::from("nenhum criado")),
+            );
+        } else {
+            for (name, role) in self.assistants.iter().take(6) {
+                agents = agents.child(
+                    div()
+                        .flex()
+                        .justify_between()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(rgb(RED))
+                                .child(SharedString::from(format!("◇ {name}"))),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(9.0))
+                                .text_color(rgb(RED_FAINT))
+                                .child(SharedString::from(role.clone())),
+                        ),
+                );
+            }
+        }
+        left = left.child(agents);
+
+        let mut right = div().flex().flex_col().gap(px(16.0)).w(px(250.0)).flex_none();
+        right = right.child(
+            hud_panel("VOCÊ", RED_DIM).child(
+                div()
+                    .text_size(px(11.0))
+                    .line_height(px(17.0))
+                    .text_color(rgb(BONE))
+                    .child(SharedString::from(if self.transcript.is_empty() {
+                        "—".to_string()
+                    } else {
+                        self.transcript.clone()
+                    })),
+            ),
+        );
+        right = right.child(
+            hud_panel("VOZ", RED_DIM)
+                .child(
+                    div()
+                        .flex()
+                        .justify_between()
+                        .text_size(px(10.0))
+                        .text_color(rgb(if speaking { bright } else { RED_DIM }))
+                        .child(SharedString::from(phase_line))
+                        .child(SharedString::from(if speaking {
+                            "● live"
+                        } else {
+                            "○"
+                        })),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(rgb(if speaking { bright } else { dim }))
+                        .child(SharedString::from(meter.clone())),
+                )
+                .child(
+                    div()
+                        .text_size(px(9.0))
+                        .text_color(rgb(RED_FAINT))
+                        .child(SharedString::from("f2 alterna mic · f3 wake word")),
+                ),
+        );
+        right = right.child(
+            hud_panel("SISTEMA", RED_DIM)
+                .child(
+                    div()
+                        .flex()
+                        .justify_between()
+                        .text_size(px(10.0))
+                        .text_color(rgb(RED_DIM))
+                        .child(SharedString::from("ferramentas"))
+                        .child(SharedString::from(format!("{}", self.tools))),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .justify_between()
+                        .text_size(px(10.0))
+                        .text_color(rgb(RED_DIM))
+                        .child(SharedString::from("uptime"))
+                        .child(SharedString::from(format!(
+                            "{}s",
+                            self.booted_at.elapsed().as_secs()
+                        ))),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .justify_between()
+                        .text_size(px(10.0))
+                        .text_color(rgb(RED_DIM))
+                        .child(SharedString::from("contexto"))
+                        .child(SharedString::from(if self.active_app.is_empty() {
+                            "—".to_string()
+                        } else {
+                            self.active_app.clone()
+                        })),
+                ),
+        );
+
+        let input_line = format!("› {}{}", self.input, if self.blink { "█" } else { " " });
 
         div()
             .flex()
@@ -1522,47 +1623,45 @@ impl Render for FridayApp {
                     .inset_0()
                     .child(matrix_background(clock)),
             )
+            // Header
             .child(
                 div()
                     .flex()
                     .justify_between()
                     .items_center()
                     .px(px(26.0))
-                    .pt(px(18.0))
+                    .py(px(16.0))
+                    .border_b_1()
+                    .border_color(rgb(RED_FAINT))
                     .child(
                         div()
-                            .text_size(px(12.0))
-                            .text_color(rgb(RED))
-                            .child(SharedString::from("F R I D A Y")),
+                            .flex()
+                            .items_center()
+                            .gap(px(14.0))
+                            .child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .text_color(rgb(RED))
+                                    .child(SharedString::from("F R I D A Y")),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(8.5))
+                                    .text_color(rgb(RED_FAINT))
+                                    .child(SharedString::from("OS · 0.1 · CODEX")),
+                            ),
                     )
                     .child(
                         div()
                             .flex()
-                            .flex_col()
-                            .items_end()
-                            .gap(px(4.0))
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(8.0))
-                                    .text_size(px(10.0))
-                                    .text_color(rgb(status_color))
-                                    .child(SharedString::from(if busy { "◉" } else { "○" }))
-                                    .child(SharedString::from(status)),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(9.0))
-                                    .text_color(rgb(RED_FAINT))
-                                    .child(SharedString::from("codex · ativo")),
-                            )
+                            .items_center()
+                            .gap(px(18.0))
                             .child(
                                 div()
                                     .text_size(px(9.0))
                                     .text_color(rgb(RED_DIM))
                                     .child(SharedString::from(if self.active_app.is_empty() {
-                                        "ctx · —".to_string()
+                                        "ctx —".to_string()
                                     } else {
                                         format!(
                                             "ctx · {}{}",
@@ -1575,67 +1674,25 @@ impl Render for FridayApp {
                                         )
                                     })),
                             )
-                            .when(busy, |col| {
-                                col.child(
-                                    div()
-                                        .text_size(px(9.0))
-                                        .text_color(rgb(RED_SOFT))
-                                        .child(SharedString::from("pensando…")),
-                                )
-                            })
+                            .child(
+                                div()
+                                    .text_size(px(9.0))
+                                    .text_color(rgb(RED_FAINT))
+                                    .child(SharedString::from(clock_text)),
+                            )
                             .child(
                                 div()
                                     .flex()
-                                    .flex_col()
-                                    .items_end()
-                                    .gap(px(3.0))
-                                    .mt(px(6.0))
-                                    .px(px(10.0))
-                                    .py(px(8.0))
-                                    .border_1()
-                                    .border_color(rgb(RED_FAINT))
-                                    .child(
-                                        div()
-                                            .text_size(px(8.5))
-                                            .text_color(rgb(RED_DIM))
-                                            .child(SharedString::from(format!(
-                                                "◇ SUBAGENTES · {}",
-                                                self.assistants.len()
-                                            ))),
-                                    )
-                                    .children(
-                                        self.assistants.iter().take(8).map(|(name, role)| {
-                                            div()
-                                                .flex()
-                                                .gap(px(6.0))
-                                                .items_center()
-                                                .child(
-                                                    div()
-                                                        .text_size(px(9.5))
-                                                        .text_color(rgb(RED))
-                                                        .child(SharedString::from(format!(
-                                                            "◇ {name}"
-                                                        ))),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .text_size(px(8.0))
-                                                        .text_color(rgb(RED_FAINT))
-                                                        .child(SharedString::from(role.clone())),
-                                                )
-                                        }),
-                                    )
-                                    .when(self.assistants.is_empty(), |col| {
-                                        col.child(
-                                            div()
-                                                .text_size(px(8.5))
-                                                .text_color(rgb(RED_FAINT))
-                                                .child(SharedString::from("nenhum criado")),
-                                        )
-                                    }),
+                                    .items_center()
+                                    .gap(px(8.0))
+                                    .text_size(px(10.0))
+                                    .text_color(rgb(status_color))
+                                    .child(SharedString::from(if busy { "◉" } else { "○" }))
+                                    .child(SharedString::from(status)),
                             ),
                     ),
             )
+            // Body: left rail / orb / right rail
             .child(
                 div()
                     .flex()
@@ -1643,26 +1700,20 @@ impl Render for FridayApp {
                     .min_h(px(0.0))
                     .gap(px(24.0))
                     .px(px(26.0))
-                    .pt(px(8.0))
-                    .child(
-                        div()
-                            .w(px(320.0))
-                            .flex_none()
-                            .flex()
-                            .flex_col()
-                            .overflow_hidden()
-                            .child(answer_block),
-                    )
+                    .py(px(20.0))
+                    .child(left)
                     .child(
                         div()
                             .flex()
                             .flex_1()
+                            .flex_col()
                             .items_center()
                             .justify_center()
+                            .gap(px(14.0))
                             .child(
                                 div()
                                     .relative()
-                                    .size(px(560.0))
+                                    .size(px(520.0))
                                     .flex_none()
                                     .child(orb)
                                     .child(
@@ -1670,75 +1721,144 @@ impl Render for FridayApp {
                                             .absolute()
                                             .inset_0()
                                             .flex()
+                                            .flex_col()
                                             .items_center()
                                             .justify_center()
+                                            .gap(px(6.0))
                                             .child(
                                                 div()
-                                                    .text_size(px(30.0))
-                                                    .text_color(rgb(RED))
+                                                    .text_size(px(26.0))
+                                                    .text_color(rgb(bright))
                                                     .child(SharedString::from("F.R.I.D.A.Y.")),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(8.5))
+                                                    .text_color(rgb(RED_FAINT))
+                                                    .child(SharedString::from("SISTEMA NOMINAL")),
                                             ),
                                     ),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .bottom(px(78.0))
-                    .right(px(26.0))
-                    .w(px(330.0))
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.0))
-                    .items_end()
-                    .when(!self.transcript.is_empty(), |block| {
-                        block
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(rgb(if speaking { bright } else { dim }))
+                                    .child(SharedString::from(meter)),
+                            )
                             .child(
                                 div()
                                     .text_size(px(9.0))
-                                    .text_color(rgb(RED_DIM))
-                                    .child(SharedString::from("▌ VOCÊ")),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(10.0))
-                                    .line_height(px(14.0))
-                                    .text_color(rgb(BONE))
-                                    .child(SharedString::from(self.transcript.clone())),
-                            )
-                    }),
+                                    .text_color(rgb(RED_FAINT))
+                                    .child(SharedString::from(match self.voice_phase {
+                                        voice::VoicePhase::Idle => "aguardando",
+                                        voice::VoicePhase::Listening => "ouvindo você",
+                                        voice::VoicePhase::Transcribing => "transcrevendo…",
+                                        voice::VoicePhase::Speaking => "respondendo em voz",
+                                    })),
+                            ),
+                    )
+                    .child(right),
             )
+            // Command bar
             .child(
                 div()
                     .flex()
-                    .flex_col()
-                    .gap(px(6.0))
+                    .justify_between()
+                    .items_center()
                     .px(px(26.0))
-                    .pb(px(10.0))
-                    .child(steps)
+                    .py(px(14.0))
+                    .border_t_1()
+                    .border_color(rgb(RED_FAINT))
                     .child(
                         div()
-                            .flex()
-                            .justify_between()
-                            .text_size(px(9.0))
-                            .text_color(rgb(RED_FAINT))
-                            .child(SharedString::from(
-                                "⏎ enviar · f2 ouvir · f3 wake word · esc interromper",
-                            ))
-                            .child(SharedString::from(format!(
-                                "{} ferramentas · voz: {phase_line}",
-                                self.tools
-                            ))),
+                            .text_size(px(13.0))
+                            .text_color(rgb(RED))
+                            .child(SharedString::from(input_line)),
                     )
                     .child(
                         div()
-                            .text_size(px(12.0))
-                            .text_color(rgb(RED))
-                            .child(SharedString::from(input_line)),
+                            .text_size(px(9.0))
+                            .text_color(rgb(RED_FAINT))
+                            .child(SharedString::from("⏎ enviar · f2 mic · f3 wake · esc interromper")),
                     ),
             )
     }
+}
+
+fn format_reasoning(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_code = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            in_code = !in_code;
+            continue;
+        }
+        if in_code {
+            out.push_str(trimmed);
+            out.push('\n');
+            continue;
+        }
+        let mut clean = trimmed.to_string();
+        if clean.starts_with('#') {
+            clean = clean.trim_start_matches('#').trim().to_string();
+        }
+        if clean.starts_with("- ") || clean.starts_with("* ") || clean.starts_with("+ ") {
+            clean = format!("· {}", clean[2..].trim());
+        }
+        clean = clean.replace("**", "").replace("__", "").replace("`", "");
+        if !clean.trim().is_empty() {
+            out.push_str(&clean);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Reusable HUD panel: thin border, translucent fill, uppercase label.
+fn hud_panel(title: &'static str, accent: u32) -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(10.0))
+        .p(px(14.0))
+        .border_1()
+        .border_color(rgb(RED_FAINT))
+        .bg(rgba(0x090303e6))
+        .child(
+            div()
+                .flex()
+                .justify_between()
+                .items_center()
+                .child(
+                    div()
+                        .text_size(px(9.0))
+                        .text_color(rgb(accent))
+                        .child(SharedString::from(format!("▌ {title}"))),
+                )
+                .child(
+                    div()
+                        .text_size(px(8.0))
+                        .text_color(rgb(RED_FAINT))
+                        .child(SharedString::from("◇")),
+                ),
+        )
+}
+
+fn bars(level: f32, width: usize) -> String {
+    let filled = (level.clamp(0.0, 1.0) * width as f32).round() as usize;
+    (0..width)
+        .map(|index| if index < filled { '▮' } else { '·' })
+        .collect()
+}
+
+fn clock_hhmm() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let rem = secs % 86_400;
+    format!("{:02}:{:02}", rem / 3600, (rem % 3600) / 60)
 }
 
 const TAU: f32 = std::f32::consts::TAU;
