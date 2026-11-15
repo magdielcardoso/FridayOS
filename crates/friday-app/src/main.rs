@@ -92,6 +92,8 @@ struct FridayApp {
     speak_cancel: Option<Arc<AtomicBool>>,
     speech_tx: Option<std::sync::mpsc::Sender<String>>,
     speech_pending: String,
+    speech_batch: String,
+    speech_sent_first: bool,
     speaking_since: Option<std::time::Instant>,
     wake: bool,
     wake_flag: Option<Arc<AtomicBool>>,
@@ -122,6 +124,8 @@ impl FridayApp {
             speak_cancel: None,
             speech_tx: None,
             speech_pending: String::new(),
+            speech_batch: String::new(),
+            speech_sent_first: false,
             speaking_since: None,
             wake: false,
             wake_flag: None,
@@ -292,6 +296,8 @@ impl FridayApp {
         let (tx, rx) = std::sync::mpsc::channel::<String>();
         self.speech_tx = Some(tx);
         self.speech_pending.clear();
+        self.speech_batch.clear();
+        self.speech_sent_first = false;
         self.voice_phase = voice::VoicePhase::Speaking;
         self.speaking_since = Some(std::time::Instant::now());
         log("speech: começa");
@@ -300,16 +306,24 @@ impl FridayApp {
         }
         cx.notify();
 
-        let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let (done_tx, mut done_rx) =
+            tokio::sync::mpsc::unbounded_channel::<Result<(), String>>();
         std::thread::spawn(move || {
-            let _ = voice::speak_stream(rx, &cancel);
-            let _ = done_tx.send(());
+            let result = voice::speak_stream(rx, &cancel);
+            let _ = done_tx.send(result);
         });
 
         cx.spawn(async move |this, cx| {
-            if done_rx.recv().await.is_some() {
+            if let Some(result) = done_rx.recv().await {
                 let _ = this.update(cx, |app, cx| {
                     log("speech: termina");
+                    if let Err(error) = result {
+                        log(format!("voz: {error}"));
+                        app.messages.push(Line {
+                            role: Role::System,
+                            text: format!("voz indisponível: {error}"),
+                        });
+                    }
                     app.speaking_since = None;
                     if let Some(mic) = app.mic.as_ref() {
                         mic.set_speaking(false);
@@ -337,7 +351,15 @@ impl FridayApp {
         let sentences = take_sentences(&mut self.speech_pending);
         if let Some(tx) = self.speech_tx.as_ref() {
             for sentence in sentences {
-                let _ = tx.send(sentence);
+                // One request starts the voice immediately; everything else is
+                // batched to respect ChatGPT's hourly TTS request limit.
+                if !self.speech_sent_first {
+                    self.speech_sent_first = true;
+                    let _ = tx.send(sentence);
+                } else {
+                    self.speech_batch.push_str(&sentence);
+                    self.speech_batch.push(' ');
+                }
             }
         }
     }
@@ -345,10 +367,22 @@ impl FridayApp {
     fn end_speech(&mut self, cx: &mut Context<Self>) {
         let rest = self.speech_pending.trim().to_string();
         if !rest.is_empty() {
-            if let Some(tx) = self.speech_tx.as_ref() {
-                let _ = tx.send(rest);
+            if !self.speech_sent_first {
+                self.speech_sent_first = true;
+                if let Some(tx) = self.speech_tx.as_ref() {
+                    let _ = tx.send(rest);
+                }
+            } else {
+                self.speech_batch.push_str(&rest);
             }
         }
+        let batch = self.speech_batch.trim().to_string();
+        if !batch.is_empty() {
+            if let Some(tx) = self.speech_tx.as_ref() {
+                let _ = tx.send(batch);
+            }
+        }
+        self.speech_batch.clear();
         self.speech_pending.clear();
         self.speech_tx = None; // closes the channel once queued audio is done
         cx.notify();
@@ -361,6 +395,8 @@ impl FridayApp {
         }
         self.speech_tx = None;
         self.speech_pending.clear();
+        self.speech_batch.clear();
+        self.speech_sent_first = false;
         voice::stop_speaking();
         if let Some(mic) = self.mic.as_ref() {
             mic.set_speaking(false);
@@ -1050,6 +1086,20 @@ fn main() {
     }
     if std::env::args().any(|arg| arg == "--persona") {
         println!("{}", persona());
+        return;
+    }
+    if let Some(index) = std::env::args().position(|arg| arg == "--say-stream") {
+        let text = std::env::args().nth(index + 1).unwrap_or_else(|| "Teste. Um, dois, três.".into());
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        for part in text.split_inclusive(['.', '!', '?']) {
+            let _ = tx.send(part.trim().to_string());
+        }
+        drop(tx);
+        let cancel = Arc::new(AtomicBool::new(false));
+        match voice::speak_stream(rx, &cancel) {
+            Ok(()) => println!("stream: ok"),
+            Err(error) => eprintln!("stream: {error}"),
+        }
         return;
     }
     if let Some(index) = std::env::args().position(|arg| arg == "--say") {

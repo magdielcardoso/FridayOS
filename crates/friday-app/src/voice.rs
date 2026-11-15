@@ -224,6 +224,50 @@ pub fn stop_speaking() {
 
 static PLAYBACK: Mutex<Option<Child>> = Mutex::new(None);
 
+/// After a 429, stop hammering ChatGPT TTS for a minute and use the local voice.
+static TTS_COOLDOWN: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+fn tts_blocked() -> bool {
+    TTS_COOLDOWN
+        .lock()
+        .ok()
+        .and_then(|slot| *slot)
+        .map(|until| std::time::Instant::now() < until)
+        .unwrap_or(false)
+}
+
+fn block_tts(seconds: u64) {
+    if let Ok(mut slot) = TTS_COOLDOWN.lock() {
+        *slot = Some(std::time::Instant::now() + std::time::Duration::from_secs(seconds));
+    }
+}
+
+/// Photos of already synthesized sentences, so repeats (greetings, confirmations)
+/// cost nothing.
+static TTS_CACHE: Mutex<Option<std::collections::HashMap<String, PathBuf>>> = Mutex::new(None);
+
+fn cache_lookup(text: &str) -> Option<PathBuf> {
+    let mut guard = TTS_CACHE.lock().ok()?;
+    let cache = guard.get_or_insert_with(std::collections::HashMap::new);
+    let path = cache.get(text)?.clone();
+    if path.is_file() {
+        Some(path)
+    } else {
+        cache.remove(text);
+        None
+    }
+}
+
+fn cache_store(text: &str, path: &Path) {
+    if let Ok(mut guard) = TTS_CACHE.lock() {
+        let cache = guard.get_or_insert_with(std::collections::HashMap::new);
+        if cache.len() >= 24 {
+            cache.clear();
+        }
+        cache.insert(text.to_string(), path.to_path_buf());
+    }
+}
+
 fn playback() -> &'static Mutex<Option<Child>> {
     &PLAYBACK
 }
@@ -260,16 +304,16 @@ fn speak_sentences(sentences: &[String], cancel: &Arc<AtomicBool>) -> Result<(),
                 let bytes = encode_pcm16_wav(&samples, pcm.sample_rate.max(8_000));
                 let path = temp_audio_path();
                 if std::fs::write(&path, &bytes).is_err() {
-                    say_fallback(text, cancel)?;
                     continue;
                 }
                 let result = play_file(&path, cancel);
                 let _ = std::fs::remove_file(&path);
                 result?;
             }
-            Err(_) => {
-                // Sem ChatGPT TTS (offline, plano, sessão): o `say` garante voz.
-                say_fallback(text, cancel)?;
+            Err(error) => {
+                // Only the ChatGPT voice is acceptable; never substitute a
+                // local macOS voice.
+                return Err(error.to_string());
             }
         }
     }
@@ -280,12 +324,6 @@ fn speak_sentences(sentences: &[String], cancel: &Arc<AtomicBool>) -> Result<(),
 fn play_file(path: &Path, cancel: &AtomicBool) -> Result<(), String> {
     let mut command = Command::new("/usr/bin/afplay");
     command.arg(path);
-    run_playback(&mut command, cancel)
-}
-
-fn say_fallback(text: &str, cancel: &AtomicBool) -> Result<(), String> {
-    let mut command = Command::new("/usr/bin/say");
-    command.arg(text);
     run_playback(&mut command, cancel)
 }
 
@@ -776,6 +814,23 @@ mod tests {
 /// model is still writing, and each one is synthesized *while the previous one
 /// plays*. That removes the dead air between sentences that a naive
 /// synthesize-then-play loop leaves behind.
+/// Same log file as the UI, so a silent Friday is easy to diagnose.
+fn vlog(message: impl AsRef<str>) {
+    use std::io::Write;
+    let home = std::env::var_os("HOME").unwrap_or_default();
+    let path = std::path::PathBuf::from(home).join("Library/Logs/FridayOS.log");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = writeln!(file, "[{secs}] tts: {}", message.as_ref());
+    }
+}
+
 pub fn speak_stream(
     sentences: std::sync::mpsc::Receiver<String>,
     cancel: &Arc<AtomicBool>,
@@ -804,6 +859,8 @@ fn stream_sentences(
     // speaker, so network jitter does not become audible silence.
     let (path_tx, path_rx) = std::sync::mpsc::sync_channel::<PathBuf>(3);
     let synth_cancel = Arc::clone(cancel);
+    let first_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let error_slot = Arc::clone(&first_error);
     let synthesizer = thread::Builder::new()
         .name("friday-tts-synth".to_string())
         .spawn(move || {
@@ -817,12 +874,40 @@ fn stream_sentences(
                 if text.is_empty() {
                     continue;
                 }
-                let path = match synthesize_file(&rt, &auth, text) {
-                    Ok(path) => path,
-                    Err(_) => match say_to_file(text) {
-                        Ok(path) => path,
-                        Err(_) => continue,
-                    },
+                if let Some(cached) = cache_lookup(text) {
+                    vlog(format!("cache: {}", &text.chars().take(40).collect::<String>()));
+                    if path_tx.send(cached).is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                let path = if tts_blocked() {
+                    vlog("TTS em cooldown (429 recente); pulando áudio");
+                    continue;
+                } else {
+                    match synthesize_file(&rt, &auth, text) {
+                        Ok(path) => {
+                            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                            vlog(format!(
+                                "sintetizado {size} bytes: {}",
+                                &text.chars().take(40).collect::<String>()
+                            ));
+                            cache_store(text, &path);
+                            path
+                        }
+                        Err(error) => {
+                            if error.contains("limite") {
+                                block_tts(120);
+                            }
+                            vlog(format!("síntese falhou: {error}"));
+                            if let Ok(mut slot) = error_slot.lock() {
+                                if slot.is_none() {
+                                    *slot = Some(error);
+                                }
+                            }
+                            continue;
+                        }
+                    }
                 };
                 if path_tx.send(path).is_err() {
                     break;
@@ -832,6 +917,7 @@ fn stream_sentences(
         .map_err(|e| format!("não foi possível iniciar a síntese: {e}"))?;
 
     for path in path_rx {
+        vlog(format!("tocando {}", path.display()));
         if cancel.load(Ordering::Relaxed) {
             let _ = std::fs::remove_file(&path);
             break;
@@ -844,7 +930,10 @@ fn stream_sentences(
     }
 
     let _ = synthesizer.join();
-    Ok(())
+    match first_error.lock().ok().and_then(|mut slot| slot.take()) {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 fn synthesize_file(
@@ -869,28 +958,3 @@ fn synthesize_file(
     Ok(path)
 }
 
-/// Offline fallback: `say` writes an AIFF, `afconvert` normalizes it to WAV.
-fn say_to_file(text: &str) -> Result<PathBuf, String> {
-    let aiff = temp_audio_path().with_extension("aiff");
-    let status = Command::new("/usr/bin/say")
-        .arg("-o")
-        .arg(&aiff)
-        .arg(text)
-        .status()
-        .map_err(|e| format!("fallback say: {e}"))?;
-    if !status.success() {
-        return Err("fallback say falhou".into());
-    }
-    let wav = temp_audio_path();
-    let status = Command::new("/usr/bin/afconvert")
-        .args(["-f", "WAVE", "-d", "LEI16", "-c", "1"])
-        .arg(&aiff)
-        .arg(&wav)
-        .status()
-        .map_err(|e| format!("afconvert: {e}"))?;
-    let _ = std::fs::remove_file(&aiff);
-    if !status.success() {
-        return Err("afconvert falhou".into());
-    }
-    Ok(wav)
-}
