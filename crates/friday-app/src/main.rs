@@ -1547,13 +1547,21 @@ impl Render for FridayApp {
         };
 
         // Connections only light up while Friday is actually working the graph.
-        let show_connections = self.activity.iter().rev().take(6).any(|activity| {
+        // Only while a graph/memory step is actually running; completed steps
+        // must not keep the data packets alive.
+        let show_connections = self.activity.iter().rev().take(8).any(|activity| {
+            if activity.state != StepState::Started {
+                return false;
+            }
             let label = activity.label.to_lowercase();
             label.contains("knowledge")
                 || label.contains("grafo")
                 || label.contains("graph")
                 || label.contains("relaç")
                 || label.contains("relac")
+                || label.contains("memory")
+                || label.contains("memória")
+                || label.contains("memoria")
         });
         let graph_points_snapshot = self.graph_points.clone();
         let graph_edges_snapshot = self.graph_edges.clone();
