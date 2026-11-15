@@ -441,6 +441,8 @@ impl FridayApp {
             log(format!("mobile: código de pareamento {code}"));
         }
         app.connect(cx);
+        // Voice-first: open the microphone as soon as the HUD is up.
+        app.start_listen(cx);
         app
     }
 
