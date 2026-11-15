@@ -371,6 +371,7 @@ struct FridayApp {
     graph_edges: Vec<(u32, u32)>,
     warming: bool,
     prewarmed: bool,
+    last_activity: std::time::Instant,
     tts_stream: bool,
     speaking_since: Option<std::time::Instant>,
     wake: bool,
@@ -420,6 +421,7 @@ impl FridayApp {
             graph_edges: Vec::new(),
             warming: false,
             prewarmed: false,
+            last_activity: std::time::Instant::now(),
             tts_stream: std::env::var("FRIDAY_TTS_MODE")
                 .map(|mode| mode != "single")
                 .unwrap_or(true),
@@ -451,6 +453,17 @@ impl FridayApp {
     }
 
     fn start_listen(&mut self, cx: &mut Context<Self>) {
+        // Speaking soon: if the thread has gone cold, warm it while the
+        // microphone opens so the first token is not penalised.
+        if !self.warming
+            && self.status == Status::Online
+            && self.last_activity.elapsed() > Duration::from_secs(45)
+        {
+            self.warming = true;
+            if let Some(codex) = self.codex.as_ref() {
+                codex.prompt("Aquecimento. Responda apenas: ok.");
+            }
+        }
         if self.voice_phase == voice::VoicePhase::Speaking {
             self.interrupt(cx);
         }
@@ -899,6 +912,17 @@ impl FridayApp {
                 if app.tick % 50 == 0 {
                     app.assistants = load_assistants();
                 }
+                // Keep the Codex thread warm: a cold thread costs ~3x more.
+                if app.tick % 400 == 0
+                    && !app.warming
+                    && app.status == Status::Online
+                    && app.last_activity.elapsed() > Duration::from_secs(300)
+                {
+                    app.warming = true;
+                    if let Some(codex) = app.codex.as_ref() {
+                        codex.prompt("Aquecimento. Responda apenas: ok.");
+                    }
+                }
                 let messages = {
                     let mut inbox = match overlay_inbox().lock() {
                         Ok(inbox) => inbox,
@@ -1115,6 +1139,7 @@ impl FridayApp {
         .detach();
         }
 
+        self.prewarmed = false;
         self.status = Status::Connecting;
     }
 
@@ -1183,6 +1208,7 @@ impl FridayApp {
                 } else {
                     Status::Online
                 };
+                self.last_activity = std::time::Instant::now();
                 self.dispatch_pending(cx);
                 self.scroll.scroll_to_bottom();
                 if status == "interrupted" {
@@ -1289,6 +1315,7 @@ impl FridayApp {
         self.input.clear();
         self.stream.clear();
         self.status = Status::Thinking;
+        self.last_activity = std::time::Instant::now();
         self.reasoning.clear();
         self.notify_on_done = false;
         mobile::user_message(&text);
