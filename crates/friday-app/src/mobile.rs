@@ -781,11 +781,26 @@ async fn test_guard(
 }
 
 /// Starts the server. Returns the pairing code so the UI can show it.
+fn mlog(message: &str) {
+    use std::io::Write;
+    let home = std::env::var_os("HOME").unwrap_or_default();
+    let path = std::path::PathBuf::from(home).join("Library/Logs/FridayOS.log");
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = writeln!(file, "[{secs}] mobile: {message}");
+    }
+}
+
 pub fn start(port: u16) -> String {
     let (pair_code, session_token) = load_config();
     let Some((vapid_public, vapid_private)) = ensure_vapid() else {
+        mlog("VAPID indisponível");
         return pair_code;
     };
+    mlog("VAPID pronto");
     let state = Arc::new(MobileState {
         pair_code: pair_code.clone(),
         session_token,
@@ -825,9 +840,23 @@ pub fn start(port: u16) -> String {
                     .and_then(|value| value.parse().ok())
                     .unwrap_or(IpAddr::from([127, 0, 0, 1]));
                 let address = SocketAddr::new(ip, port);
-                let listener = match tokio::net::TcpListener::bind(address).await {
-                    Ok(listener) => listener,
-                    Err(_) => return,
+                let mut listener = match tokio::net::TcpListener::bind(address).await {
+                    Ok(listener) => {
+                        mlog(&format!("escutando em {address}"));
+                        listener
+                    }
+                    Err(error) => {
+                        // Tailscale may be stopped; never leave mobile offline
+                        // on localhost because of that.
+                        mlog(&format!("bind {address} falhou ({error}); tentando 127.0.0.1"));
+                        match tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port))).await {
+                            Ok(listener) => listener,
+                            Err(error) => {
+                                mlog(&format!("bind local falhou: {error}"));
+                                return;
+                            }
+                        }
+                    }
                 };
                 let app = router(state).into_make_service_with_connect_info::<SocketAddr>();
                 let _ = axum::serve(listener, app).await;
