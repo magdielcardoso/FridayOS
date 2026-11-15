@@ -529,7 +529,6 @@ impl FridayApp {
         app.connect(cx);
         // Voice-first: open the microphone as soon as the HUD is up.
         app.start_listen(cx);
-        std::thread::spawn(voice::prewarm_ack);
         app
     }
 
@@ -578,7 +577,6 @@ impl FridayApp {
     }
 
     fn stop_listening(&mut self, cx: &mut Context<Self>) {
-        voice::stop_ack();
         self.stop_speech_now();
         if let Some(mut mic) = self.mic.take() {
             mic.stop();
@@ -707,22 +705,6 @@ impl FridayApp {
                                     app.first_audio_ms = None;
                                     app.last_tools = 0;
                                     trace(json!({ "event": "turn_start", "source": "voice" }));
-                                    let turn = app.turn_started;
-                                    cx.spawn(async move |this, cx| {
-                                        cx.background_executor()
-                                            .timer(Duration::from_millis(650))
-                                            .await;
-                                        let _ = this.update(cx, |app, _| {
-                                            if app.turn_started == turn
-                                                && app.first_token_ms.is_none()
-                                                && app.voice_phase
-                                                    != voice::VoicePhase::Speaking
-                                            {
-                                                voice::play_ack_cached();
-                                            }
-                                        });
-                                    })
-                                    .detach();
                                     if let Some(codex) = app.codex.as_ref() {
                                         codex.prompt(text);
                                     }
@@ -747,7 +729,6 @@ impl FridayApp {
             voice::MicEvent::BargeIn => {
                 // Stop the audio, but keep the turn alive: what the user says
                 // next is guidance for it, not a cancellation.
-                voice::stop_ack();
                 self.stop_speech_now();
                 self.voice_phase = voice::VoicePhase::Listening;
                 self.push_activity("barge-in · capturando orientação", StepState::Started);
@@ -1398,7 +1379,6 @@ impl FridayApp {
                     return;
                 }
                 let mut spoken = None;
-                voice::stop_ack();
                 log(format!(
                     "done: status={status} stream={} chars",
                     self.stream.chars().count()
