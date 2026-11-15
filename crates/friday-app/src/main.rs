@@ -328,6 +328,7 @@ struct FridayApp {
     wake: bool,
     wake_flag: Option<Arc<AtomicBool>>,
     account: Option<String>,
+    assistants: Vec<(String, String)>,
     tasks_started: bool,
     blink: bool,
     tick: u64,
@@ -368,6 +369,7 @@ impl FridayApp {
             wake: false,
             wake_flag: None,
             account: friday_core::auth::active_account(),
+            assistants: load_assistants(),
             tasks_started: false,
             blink: true,
             tick: 0,
@@ -807,6 +809,9 @@ impl FridayApp {
             let _ = this.update(cx, |app, cx| {
                 app.tick = app.tick.wrapping_add(1);
                 app.blink = (app.tick / 12) % 2 == 0;
+                if app.tick % 50 == 0 {
+                    app.assistants = load_assistants();
+                }
                 let messages = {
                     let mut inbox = match overlay_inbox().lock() {
                         Ok(inbox) => inbox,
@@ -1484,6 +1489,38 @@ fn paint_line(
     if let Ok(path) = builder.build() {
         window.paint_path(path, rgb(color));
     }
+}
+
+/// Permanent assistants created through the MCP tools, shown in the HUD.
+fn load_assistants() -> Vec<(String, String)> {
+    let home = std::env::var_os("HOME").unwrap_or_default();
+    let dir = std::path::PathBuf::from(home)
+        .join("Library/Application Support/FridayOS/assistants");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut list = Vec::new();
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        let Ok(raw) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        let name = value
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("assistente")
+            .to_string();
+        let role = value
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        list.push((name, role));
+    }
+    list.sort_by(|a, b| a.0.cmp(&b.0));
+    list
 }
 
 /// Builds the capability manifesto from the live tool registry, so Friday knows
