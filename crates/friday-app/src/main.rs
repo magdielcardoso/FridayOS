@@ -11,7 +11,7 @@ use friday_core::codex::{Codex, CodexConfig, CodexEvent, StepState};
 use gpui::prelude::*;
 use gpui::{
     canvas, div, point, px, rgb, rgba, size, App, Application, Bounds, Context, FocusHandle,
-    AnyWindowHandle, KeyDownEvent, PathBuilder, Render, ScrollHandle, SharedString, Window,
+    KeyDownEvent, PathBuilder, Render, ScrollHandle, SharedString, Window,
     WindowBounds, WindowHandle, WindowKind, WindowOptions,
 };
 
@@ -119,23 +119,83 @@ enum OverlayMsg {
 }
 
 static OVERLAY_INBOX: OnceLock<Mutex<Vec<OverlayMsg>>> = OnceLock::new();
-static OVERLAY_WINDOWS: OnceLock<Mutex<Vec<AnyWindowHandle>>> = OnceLock::new();
+static OVERLAY_WINDOWS: OnceLock<Mutex<Vec<WindowHandle<OverlayView>>>> = OnceLock::new();
 
 fn overlay_inbox() -> &'static Mutex<Vec<OverlayMsg>> {
     OVERLAY_INBOX.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-fn overlay_windows() -> &'static Mutex<Vec<AnyWindowHandle>> {
+fn overlay_windows() -> &'static Mutex<Vec<WindowHandle<OverlayView>>> {
     OVERLAY_WINDOWS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 struct OverlayView {
     title: String,
     body: String,
+    tick: u64,
+    closing: bool,
 }
+
+impl OverlayView {
+    fn new(title: String, body: String, cx: &mut Context<Self>) -> Self {
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(45))
+                .await;
+            let keep = this
+                .update(cx, |view, cx| {
+                    view.tick = view.tick.wrapping_add(1);
+                    let glitching = view.tick < 12 || view.closing;
+                    if glitching {
+                        cx.notify();
+                    }
+                    view.closing || view.tick < 12
+                })
+                .unwrap_or(false);
+            if !keep && this.update(cx, |_, _| ()).is_err() {
+                break;
+            }
+        })
+        .detach();
+        Self {
+            title,
+            body,
+            tick: 0,
+            closing: false,
+        }
+    }
+}
+
+/// Corrupts a few characters, like a CRT losing sync.
+fn glitch(text: &str, seed: u64) -> String {
+    const NOISE: [char; 6] = ['▓', '▒', '░', '#', '¦', '≡'];
+    text.chars()
+        .enumerate()
+        .map(|(index, ch)| {
+            let hash = (seed.wrapping_mul(31).wrapping_add(index as u64 * 17)) % 23;
+            if ch != ' ' && hash == 0 {
+                NOISE[(seed as usize + index) % NOISE.len()]
+            } else {
+                ch
+            }
+        })
+        .collect()
+}
+
 
 impl Render for OverlayView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let glitching = self.tick < 12 || self.closing;
+        let title = if glitching {
+            glitch(&self.title.to_uppercase(), self.tick)
+        } else {
+            self.title.to_uppercase()
+        };
+        let jitter = if glitching {
+            ((self.tick as i64 % 5) - 2) as f32
+        } else {
+            0.0
+        };
         let bracket = |top: bool, left: bool| {
             let mut b = div().absolute().w(px(16.0)).h(px(16.0)).border_color(rgb(RED));
             b = if top { b.top(px(0.0)).border_t_1() } else { b.bottom(px(0.0)).border_b_1() };
@@ -147,7 +207,8 @@ impl Render for OverlayView {
             .flex()
             .flex_col()
             .size_full()
-            .p(px(10.0))
+            .p(px(0.0))
+            .ml(px(jitter))
             .font_family("Menlo")
             .child(
                 div()
@@ -185,9 +246,7 @@ impl Render for OverlayView {
                                         div()
                                             .text_size(px(12.0))
                                             .text_color(rgb(RED))
-                                            .child(SharedString::from(
-                                                self.title.to_uppercase(),
-                                            )),
+                                            .child(SharedString::from(title.clone())),
                                     ),
                             )
                             .child(
@@ -1784,8 +1843,32 @@ fn close_overlays(cx: &mut App) {
         }
     };
     for handle in handles {
-        let _ = handle.update(cx, |_, window, _| window.remove_window());
+        // Glitch out, then remove.
+        let _ = handle.update(cx, |view, _, cx| {
+            view.closing = true;
+            cx.notify();
+        });
+        cx.spawn(async move |cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(260))
+                .await;
+            let _ = handle.update(cx, |_, window, _| window.remove_window());
+        })
+        .detach();
     }
+}
+
+/// Rough pixel height for a body, so the panel hugs its content.
+fn estimate_height(body: &str, width: f32) -> f32 {
+    let chars_per_line = ((width - 40.0) / 6.9).max(20.0);
+    let mut lines = 0usize;
+    for line in body.lines() {
+        let count = line.chars().count() as f32;
+        lines += (count / chars_per_line).ceil().max(1.0) as usize;
+    }
+    let lines = lines.max(1);
+    // panel padding + header + rule + body + footer
+    40.0 + 26.0 + 14.0 + (lines as f32 * 17.0) + 12.0 + 30.0
 }
 
 fn open_overlay(cx: &mut App, request: OverlayRequest) {
@@ -1803,7 +1886,7 @@ fn open_overlay(cx: &mut App, request: OverlayRequest) {
     };
 
     let width = request.width.clamp(280.0, screen_w - 40.0);
-    let height = request.height.clamp(160.0, screen_h - 40.0);
+    let height = estimate_height(&request.body, width).clamp(120.0, screen_h - 40.0);
     let margin = 28.0;
     let (mut x, mut y) = match request.anchor.to_lowercase().as_str() {
         "top" | "top-center" => ((screen_w - width) / 2.0, margin),
@@ -1842,16 +1925,13 @@ fn open_overlay(cx: &mut App, request: OverlayRequest) {
             ..Default::default()
         },
         |_, cx| {
-            cx.new(|_| OverlayView {
-                title: title.clone(),
-                body: body.clone(),
-            })
+            cx.new(|cx| OverlayView::new(title.clone(), body.clone(), cx))
         },
     );
 
     let Ok(handle) = opened else { return };
     if let Ok(mut windows) = overlay_windows().lock() {
-        windows.push(handle.into());
+        windows.push(handle);
     }
 
     if request.seconds > 0 {
