@@ -858,8 +858,21 @@ fn step_label(item: &Value) -> Option<(String, String)> {
                 .or_else(|| item.get("name"))
                 .and_then(Value::as_str)
                 .unwrap_or("ferramenta");
+            // Compact MCP routes everything through `exec`; the real action is
+            // in the arguments, so surface it instead of the meta-tool.
+            let inner = item
+                .get("arguments")
+                .and_then(|args| args.get("name").or_else(|| args.get("tool")))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty());
+            let tool = inner.unwrap_or(tool);
+            let tool = tool
+                .strip_prefix("friday__")
+                .or_else(|| tool.strip_prefix("friday."))
+                .unwrap_or(tool);
             let server = item.get("server").and_then(Value::as_str).unwrap_or("");
-            if server.is_empty() {
+            if server.is_empty() || server == "friday" {
                 format!("ferramenta · {tool}")
             } else {
                 format!("{server} · {tool}")

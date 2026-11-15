@@ -1227,6 +1227,7 @@ impl FridayApp {
                 }
             }
             CodexEvent::Step { id, label, state } => {
+                log(format!("step: {label} · {state:?}"));
                 mobile::step(&label);
                 if let Some(existing) = self.activity.iter_mut().find(|item| item.id == id) {
                     existing.label = label;
@@ -1680,8 +1681,8 @@ impl Render for FridayApp {
                 .iter()
                 .rev()
                 .find(|activity| activity.state == StepState::Started)
-                .map(|activity| activity.label.clone())
-                .unwrap_or_else(|| "Analisando o contexto…".into())
+                .map(|activity| friendly_step(&activity.label))
+                .unwrap_or_else(|| "Pensando no seu pedido…".into())
         } else if speaking {
             "Respondendo em voz".to_string()
         } else if listening {
@@ -1689,6 +1690,23 @@ impl Render for FridayApp {
         } else {
             "Aguardando comando".to_string()
         };
+
+        // Human-readable steps for the current turn, newest last.
+        let mut steps: Vec<(String, StepState)> = Vec::new();
+        for activity in self.activity.iter().rev() {
+            let text = friendly_step(&activity.label);
+            if text == "pensando no seu pedido" || text == "entendendo seu pedido" {
+                continue;
+            }
+            if steps.last().map(|(label, _)| label == &text).unwrap_or(false) {
+                continue;
+            }
+            steps.push((text, activity.state));
+            if steps.len() >= 6 {
+                break;
+            }
+        }
+        steps.reverse();
 
         // Connections only light up while Friday is actually working the graph.
         // Only while a graph/memory step is actually running; completed steps
@@ -2333,7 +2351,48 @@ impl Render for FridayApp {
                             .text_size(sx(13.0))
                             .text_color(rgb(0x85848c))
                             .child(SharedString::from(state_sub)),
-                    ),
+                    )
+                    .when(busy && !steps.is_empty(), |panel| {
+                        let blink = self.blink;
+                        let mut list = div()
+                            .flex()
+                            .flex_col()
+                            .gap(sx(3.0))
+                            .mt(sx(4.0))
+                            .pl(sx(36.0));
+                        for (text, state) in steps {
+                            let (mark, mark_color, text_color) = match state {
+                                StepState::Started => (
+                                    if blink { "▸" } else { "▹" },
+                                    0xff8a32u32,
+                                    0xd08a5a,
+                                ),
+                                StepState::Completed => ("✓", 0x6a1414, 0x7a4a4a),
+                                StepState::Failed => ("✕", 0xff1738, 0xff5566),
+                            };
+                            list = list.child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(sx(8.0))
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .w(sx(10.0))
+                                            .text_size(sx(11.0))
+                                            .text_color(rgb(mark_color))
+                                            .child(SharedString::from(mark)),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(sx(11.0))
+                                            .text_color(rgb(text_color))
+                                            .child(SharedString::from(text)),
+                                    ),
+                            );
+                        }
+                        panel.child(list)
+                    }),
             )
             .child(
                 div()
@@ -2748,6 +2807,98 @@ fn take_sentences(buffer: &mut String) -> Vec<String> {
         }
     }
     out
+}
+
+/// Turns raw tool labels from the Codex stream into short, human wording.
+fn friendly_step(label: &str) -> String {
+    let label = label.trim();
+    let lower = label.to_lowercase();
+    let stripped = lower
+        .strip_prefix("ferramenta · ")
+        .or_else(|| lower.strip_prefix("friday · "))
+        .unwrap_or(&lower)
+        .trim()
+        .to_string();
+    let tool = stripped
+        .split(|ch: char| ch.is_whitespace() || ch == '(')
+        .next()
+        .unwrap_or("")
+        .trim();
+
+    let mapped = match tool {
+        "knowledge_search" => Some("consultando o grafo de conhecimento"),
+        "knowledge_neighbors" => Some("ligando memórias relacionadas"),
+        "knowledge_graph" => Some("destacando conexões no grafo"),
+        "knowledge_ingest" | "knowledge_index" => Some("indexando conhecimento"),
+        "memory_add" | "memory_save" => Some("guardando na memória"),
+        "memory_search" | "memory_list" | "memory_get" => Some("consultando a memória"),
+        "assistant_task" => Some("delegando a um subagente"),
+        "assistant_create" => Some("criando um subagente"),
+        "assistant_list" => Some("verificando subagentes"),
+        "assistant_delete" => Some("removendo um subagente"),
+        "screen_capture" | "screen_ocr" | "screen_read" => Some("olhando a tela"),
+        "voice_speak" | "voice_config" => Some("ajustando a voz"),
+        "diagnose" | "diagnose_run" => Some("verificando o sistema"),
+        "exec" | "search" | "schema" => Some("escolhendo a ferramenta certa"),
+        "web_search" => Some("pesquisando na internet"),
+        "web_fetch" | "fetch" => Some("lendo uma página"),
+        "calendar_list" | "calendar_events" => Some("consultando a agenda"),
+        "file_read" | "read_file" => Some("lendo arquivos"),
+        "file_write" | "write_file" | "file_edit" => Some("escrevendo arquivos"),
+        _ => None,
+    };
+    if let Some(text) = mapped {
+        return text.to_string();
+    }
+
+    if lower.starts_with("executando · ") {
+        let command = label.splitn(2, '·').nth(1).unwrap_or("").trim();
+        return if command.is_empty() {
+            "executando um comando".into()
+        } else {
+            format!("executando: {}", shorten(command, 44))
+        };
+    }
+    if lower.starts_with("pesquisando · ") {
+        let query = label.splitn(2, '·').nth(1).unwrap_or("").trim();
+        return if query.is_empty() {
+            "pesquisando na internet".into()
+        } else {
+            format!("pesquisando: {}", shorten(query, 44))
+        };
+    }
+    if lower.starts_with("lendo · ") {
+        let url = label.splitn(2, '·').nth(1).unwrap_or("").trim();
+        return if url.is_empty() {
+            "lendo uma página".into()
+        } else {
+            format!("lendo: {}", shorten(url, 44))
+        };
+    }
+    if lower.starts_with("alterando arquivos") {
+        return "alterando arquivos".into();
+    }
+    if lower == "processando" {
+        return "pensando no seu pedido".into();
+    }
+    if lower == "enviado ao código" {
+        return "entendendo seu pedido".into();
+    }
+    if lower.starts_with("evento · ") {
+        let source = label.splitn(2, '·').nth(1).unwrap_or("").trim();
+        return format!("recebendo evento de {source}");
+    }
+    if lower.starts_with("barge-in") {
+        return "ouvindo sua interrupção".into();
+    }
+    if !tool.is_empty()
+        && tool
+            .chars()
+            .all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '-' || ch == '.')
+    {
+        return format!("usando {}", tool.replace(['_', '-'], " "));
+    }
+    shorten(label, 60)
 }
 
 fn shorten(value: &str, max: usize) -> String {
