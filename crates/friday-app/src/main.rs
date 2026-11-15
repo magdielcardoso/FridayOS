@@ -2067,10 +2067,11 @@ fn main() {
     start_overlay_daemon();
     Application::new().run(|cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1100.0), px(880.0)), cx);
-        cx.open_window(
+        let handle = cx
+            .open_window(
             WindowOptions {
-                window_bounds: Some(WindowBounds::Fullscreen(bounds)),
-                is_resizable: false,
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                is_resizable: true,
                 is_minimizable: false,
                 window_min_size: Some(size(px(1100.0), px(880.0))),
                 titlebar: Some(gpui::TitlebarOptions {
@@ -2084,13 +2085,20 @@ fn main() {
                 window.focus(&view.read(cx).focus);
                 view
             },
-        )
-        .expect("open FridayOS window");
-        // `WindowBounds::Fullscreen` only keeps the restore size on macOS; the
-        // actual transition has to be requested after the window exists.
-        if let Some(handle) = cx.active_window() {
-            let _ = handle.update(cx, |_, window, _| window.toggle_fullscreen());
-        }
+            )
+            .expect("open FridayOS window");
+        // macOS ignores WindowBounds::Fullscreen at creation time, so request
+        // the transition just after the first frame.
+        cx.spawn(async move |cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(120))
+                .await;
+            match handle.update(cx, |_, window, _| window.toggle_fullscreen()) {
+                Ok(()) => log("fullscreen: pedido enviado"),
+                Err(error) => log(format!("fullscreen: {error}")),
+            }
+        })
+        .detach();
         cx.activate(true);
     });
 }
