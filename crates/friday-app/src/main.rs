@@ -429,6 +429,10 @@ struct FridayApp {
     tick: u64,
     activity: Vec<Activity>,
     turn_started: Option<std::time::Instant>,
+    last_prompt_at: Option<std::time::Instant>,
+    speech_started_at: Option<std::time::Instant>,
+    stt_started_at: Option<std::time::Instant>,
+    first_audio_ms: Option<u128>,
     first_token_ms: Option<u128>,
     last_turn_ms: Option<u128>,
     last_first_ms: Option<u128>,
@@ -501,6 +505,10 @@ impl FridayApp {
             tick: 0,
             activity: Vec::new(),
             turn_started: None,
+            last_prompt_at: None,
+            speech_started_at: None,
+            stt_started_at: None,
+            first_audio_ms: None,
             first_token_ms: None,
             last_turn_ms: None,
             last_first_ms: None,
@@ -521,6 +529,7 @@ impl FridayApp {
         app.connect(cx);
         // Voice-first: open the microphone as soon as the HUD is up.
         app.start_listen(cx);
+        std::thread::spawn(voice::prewarm_ack);
         app
     }
 
@@ -569,6 +578,7 @@ impl FridayApp {
     }
 
     fn stop_listening(&mut self, cx: &mut Context<Self>) {
+        voice::stop_ack();
         self.stop_speech_now();
         if let Some(mut mic) = self.mic.take() {
             mic.stop();
@@ -616,6 +626,9 @@ impl FridayApp {
         match event {
             voice::MicEvent::SpeechStarted => {
                 log("mic: fala detectada");
+                self.speech_started_at = Some(std::time::Instant::now());
+                self.first_audio_ms = None;
+                trace(json!({ "event": "voice_stage", "stage": "speech_start" }));
                 self.voice_phase = voice::VoicePhase::Listening;
                 cx.notify();
             }
@@ -625,6 +638,15 @@ impl FridayApp {
             }
             voice::MicEvent::Utterance { path } => {
                 log(format!("mic: utterance {}", path.display()));
+                let speech_ms = self
+                    .speech_started_at
+                    .map(|started| started.elapsed().as_millis());
+                trace(json!({
+                    "event": "voice_stage",
+                    "stage": "speech_end",
+                    "speech_ms": speech_ms,
+                }));
+                self.stt_started_at = Some(std::time::Instant::now());
                 self.level = 0.0;
                 self.voice_phase = voice::VoicePhase::Transcribing;
                 cx.notify();
@@ -633,6 +655,12 @@ impl FridayApp {
                     move || voice::transcribe_wav(&path),
                     |app, result, cx| {
                         log(format!("stt: {:?}", result.as_ref().map(|t| t.chars().take(80).collect::<String>())));
+                        trace(json!({
+                            "event": "voice_stage",
+                            "stage": "stt_done",
+                            "ms": app.stt_started_at.map(|started| started.elapsed().as_millis()),
+                        }));
+                        app.stt_started_at = None;
                         match result {
                             Ok(text) if !text.trim().is_empty() => {
                                 app.transcript = text.clone();
@@ -673,6 +701,28 @@ impl FridayApp {
                                     app.stream.clear();
                                     app.status = Status::Thinking;
                                     app.voice_phase = voice::VoicePhase::Idle;
+                                    app.turn_started = Some(std::time::Instant::now());
+                                    app.last_prompt_at = app.turn_started;
+                                    app.first_token_ms = None;
+                                    app.first_audio_ms = None;
+                                    app.last_tools = 0;
+                                    trace(json!({ "event": "turn_start", "source": "voice" }));
+                                    let turn = app.turn_started;
+                                    cx.spawn(async move |this, cx| {
+                                        cx.background_executor()
+                                            .timer(Duration::from_millis(650))
+                                            .await;
+                                        let _ = this.update(cx, |app, _| {
+                                            if app.turn_started == turn
+                                                && app.first_token_ms.is_none()
+                                                && app.voice_phase
+                                                    != voice::VoicePhase::Speaking
+                                            {
+                                                voice::play_ack_cached();
+                                            }
+                                        });
+                                    })
+                                    .detach();
                                     if let Some(codex) = app.codex.as_ref() {
                                         codex.prompt(text);
                                     }
@@ -697,6 +747,7 @@ impl FridayApp {
             voice::MicEvent::BargeIn => {
                 // Stop the audio, but keep the turn alive: what the user says
                 // next is guidance for it, not a cancellation.
+                voice::stop_ack();
                 self.stop_speech_now();
                 self.voice_phase = voice::VoicePhase::Listening;
                 self.push_activity("barge-in · capturando orientação", StepState::Started);
@@ -725,7 +776,13 @@ impl FridayApp {
         self.speech_sent_first = false;
         self.voice_phase = voice::VoicePhase::Speaking;
         self.speaking_since = Some(std::time::Instant::now());
+        self.first_audio_ms = None;
         log("speech: começa");
+        trace(json!({
+            "event": "voice_stage",
+            "stage": "tts_begin",
+            "since_prompt_ms": self.last_prompt_at.map(|started| started.elapsed().as_millis()),
+        }));
         if let Some(mic) = self.mic.as_ref() {
             mic.set_speaking(true);
         }
@@ -778,7 +835,8 @@ impl FridayApp {
         if self.speech_tx.is_none() {
             self.begin_speech(cx);
         }
-        let sentences = take_sentences(&mut self.speech_pending);
+        let earliest = if self.speech_sent_first { 24 } else { 16 };
+        let sentences = take_sentences_with(&mut self.speech_pending, earliest);
         if let Some(tx) = self.speech_tx.as_ref() {
             for sentence in sentences {
                 // One request starts the voice immediately; everything else is
@@ -1004,6 +1062,16 @@ impl FridayApp {
                 }
                 if app.agent_view.is_some() && app.tick % 4 == 0 {
                     app.poll_agent_log();
+                }
+                if app.first_audio_ms.is_none()
+                    && app.voice_phase == voice::VoicePhase::Speaking
+                    && voice::speech_level() > 0.01
+                {
+                    if let Some(started) = app.last_prompt_at {
+                        let ms = started.elapsed().as_millis();
+                        app.first_audio_ms = Some(ms);
+                        trace(json!({ "event": "voice_stage", "stage": "first_audio", "ms": ms }));
+                    }
                 }
                 if app
                     .highlight_until
@@ -1330,6 +1398,7 @@ impl FridayApp {
                     return;
                 }
                 let mut spoken = None;
+                voice::stop_ack();
                 log(format!(
                     "done: status={status} stream={} chars",
                     self.stream.chars().count()
@@ -1467,6 +1536,8 @@ impl FridayApp {
         });
         adaptive_effort(&prompt);
         self.turn_started = Some(std::time::Instant::now());
+        self.last_prompt_at = self.turn_started;
+        self.first_audio_ms = None;
         self.first_token_ms = None;
         self.last_tools = 0;
         trace(json!({ "event": "turn_start", "source": source, "chars": prompt.chars().count() }));
@@ -1638,7 +1709,9 @@ impl FridayApp {
         adaptive_effort(&text);
         self.activity.clear();
         self.turn_started = Some(std::time::Instant::now());
+        self.last_prompt_at = self.turn_started;
         self.first_token_ms = None;
+        self.first_audio_ms = None;
         self.last_tools = 0;
         trace(json!({ "event": "turn_start", "chars": text.chars().count() }));
         // A new turn starts clean: previous graph highlights must not linger.
@@ -3011,6 +3084,11 @@ fn persona() -> String {
 /// Pulls complete sentences out of a growing stream buffer, with an early
 /// clause flush so the voice can start before the answer is finished.
 fn take_sentences(buffer: &mut String) -> Vec<String> {
+    take_sentences_with(buffer, 24)
+}
+
+/// `earliest` lets the very first clause be shorter so audio starts sooner.
+fn take_sentences_with(buffer: &mut String, earliest: usize) -> Vec<String> {
     let mut out = Vec::new();
     loop {
         let mut cut = None;
@@ -3036,7 +3114,7 @@ fn take_sentences(buffer: &mut String) -> Vec<String> {
                 }
                 chars += 1;
             }
-            if chars >= 24 {
+            if chars >= earliest {
                 if let Some(at) = boundary {
                     cut = Some(at);
                 }

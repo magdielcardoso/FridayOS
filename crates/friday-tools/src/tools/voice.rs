@@ -396,13 +396,14 @@ impl VadState {
         }
 
         if !self.in_speech {
-            // Two voiced frames in a row (~0.5 s) before we believe it is speech.
+            // Two voiced frames in a row (~0.5 s) before we believe it is speech:
+            // fast enough for a natural reply, long enough to reject a click.
             if voiced {
                 self.voiced_run += 1;
             } else {
                 self.voiced_run = 0;
             }
-            if self.voiced_run >= 3 {
+            if self.voiced_run >= 2 {
                 self.in_speech = true;
                 self.silence_frames = 0;
                 self.frames_captured = self.pre_roll.len();
@@ -435,7 +436,7 @@ impl VadState {
             self.barge_sent = false;
             self.barge_capturing = false;
             // Utterances shorter than ~0.75 s are clicks, not speech.
-            if frames >= 4 {
+            if frames >= 3 {
                 let _ = tx.send(VoiceEvent::SpeechEnd {
                     captured,
                     sample_rate: TARGET_SAMPLE_RATE,

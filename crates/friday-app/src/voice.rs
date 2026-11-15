@@ -208,6 +208,50 @@ pub fn speak(text: &str, cancel: &Arc<AtomicBool>) -> Result<(), String> {
     speak_sentences(&sentences, &cancel)
 }
 
+/// Synthesizes the acknowledgment once and leaves it in the TTS cache.
+pub fn prewarm_ack() {
+    const ACK: &str = "Certo.";
+    if cache_lookup(ACK).is_some() || tts_blocked() {
+        return;
+    }
+    let Ok(rt) = runtime() else { return };
+    let auth = CodexAuth::discover();
+    match synthesize_file(&rt, &auth, ACK) {
+        Ok(path) => {
+            cache_store(ACK, &path);
+            let _ = std::fs::remove_file(path);
+            vlog("ack: pronto no cache");
+        }
+        Err(error) => vlog(format!("ack: não foi possível pré-sintetizar ({error})")),
+    }
+}
+
+/// Plays the cached acknowledgment immediately, if it exists. Never synthesizes
+/// on the hot path, so a missing cache simply means silence.
+pub fn play_ack_cached() {
+    let Some(path) = cache_lookup("Certo.") else {
+        vlog("ack: cache ausente");
+        return;
+    };
+    vlog("ack: tocando");
+    stop_ack();
+    let Ok(mut child) = Command::new("/usr/bin/afplay").arg(&path).spawn() else {
+        return;
+    };
+    if let Ok(mut slot) = ACK_PLAYBACK.lock() {
+        *slot = Some(child);
+    }
+}
+
+pub fn stop_ack() {
+    if let Ok(mut slot) = ACK_PLAYBACK.lock() {
+        if let Some(mut child) = slot.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 /// Mata qualquer `afplay` (ou `say`) em curso deste processo.
 pub fn stop_speaking() {
     if let Ok(mut slot) = playback().lock() {
@@ -223,6 +267,9 @@ pub fn stop_speaking() {
 // ---------------------------------------------------------------------------
 
 static PLAYBACK: Mutex<Option<Child>> = Mutex::new(None);
+/// Short "Certo." played while the model is still thinking. Kept separate from
+/// the real speech so stopping the answer never kills the acknowledgment.
+static ACK_PLAYBACK: Mutex<Option<Child>> = Mutex::new(None);
 
 /// Current TTS amplitude (0..1), updated while afplay runs so the orb can
 /// pulse with the actual voice instead of a fixed sine.
@@ -343,6 +390,8 @@ fn speak_sentences(sentences: &[String], cancel: &Arc<AtomicBool>) -> Result<(),
 }
 
 fn play_file(path: &Path, cancel: &AtomicBool) -> Result<(), String> {
+    // Real speech always wins over the acknowledgment.
+    stop_ack();
     // Drive the orb from the synthesized envelope, window by window.
     let stop = Arc::new(AtomicBool::new(false));
     if let Ok(bytes) = std::fs::read(path) {
@@ -932,11 +981,13 @@ fn stream_sentences(
                     vlog("TTS em cooldown (429 recente); pulando áudio");
                     continue;
                 } else {
+                    let synth_started = std::time::Instant::now();
                     match synthesize_file(&rt, &auth, text) {
                         Ok(path) => {
                             let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                             vlog(format!(
-                                "sintetizado {size} bytes: {}",
+                                "sintetizado {size} bytes em {}ms: {}",
+                                synth_started.elapsed().as_millis(),
                                 &text.chars().take(40).collect::<String>()
                             ));
                             cache_store(text, &path);
