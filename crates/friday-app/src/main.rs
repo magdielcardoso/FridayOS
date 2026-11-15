@@ -743,7 +743,6 @@ impl FridayApp {
                         text: format!("turno encerrado: {status}"),
                     });
                 }
-                self.reasoning.clear();
                 self.status = if status == "interrupted" {
                     Status::Interrupted
                 } else {
@@ -795,6 +794,7 @@ impl FridayApp {
         self.reasoning.clear();
         self.status = Status::Thinking;
         self.activity.clear();
+        self.reasoning.clear();
         self.push_activity("enviado ao código", StepState::Completed);
 
         match self.codex.as_ref() {
@@ -1005,6 +1005,36 @@ impl Render for FridayApp {
         };
 
         let mut answer_block = div().flex().flex_col().gap(px(6.0)).w(px(270.0));
+        if !self.reasoning.trim().is_empty() {
+            let trace: String = self
+                .reasoning
+                .chars()
+                .rev()
+                .take(700)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            answer_block = answer_block.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(3.0))
+                    .child(
+                        div()
+                            .text_size(px(9.0))
+                            .text_color(rgb(RED_DIM))
+                            .child(SharedString::from("▌ raciocínio")),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(9.5))
+                            .line_height(px(13.0))
+                            .text_color(rgb(RED_FAINT))
+                            .child(SharedString::from(trace)),
+                    ),
+            );
+        }
         if !answer.is_empty() {
             answer_block = answer_block.child(
                 div()

@@ -676,9 +676,9 @@ pub fn prepare_isolated_home(mcp_command: Option<&std::path::Path>) -> std::io::
     let mut config = format!(
         "model = \"{model}\"\n\
          model_reasoning_effort = \"low\"\n\
-         model_reasoning_summary = \"none\"\n\
+         model_reasoning_summary = \"auto\"\n\
          model_verbosity = \"low\"\n\
-         hide_agent_reasoning = true\n\
+         hide_agent_reasoning = false\n\
          approval_policy = \"on-request\"\n\
          sandbox_mode = \"workspace-write\"\n\
          \n"
