@@ -1010,7 +1010,7 @@ fn synthesize_file(
     check_budget()?;
     let pcm = rt.block_on(tts::synthesize(auth, text)).map_err(|e| {
         if e.to_string().contains("limite") {
-            mark_blocked(3600);
+            mark_blocked(900);
         }
         e.to_string()
     })?;
