@@ -15,5 +15,5 @@ pub mod swift;
 pub mod tools;
 
 pub use audit::AuditLog;
-pub use policy::Risk;
+pub use policy::{Autonomy, Risk};
 pub use registry::{Registry, Tool, ToolCtx, ToolError, ToolResult, ToolSpec};

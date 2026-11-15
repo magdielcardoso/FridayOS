@@ -76,9 +76,9 @@ pub trait Tool: Send + Sync {
     /// touch the system when `ctx.dry_run` is set.
     fn call(&self, args: &Value, ctx: &ToolCtx) -> ToolResult;
 
-    /// Called by the registry before `call`. Default: standard risk policy.
+    /// Called by the registry before `call`. Default: autonomy policy.
     fn authorize(&self, ctx: &ToolCtx) -> ToolResult {
-        policy::authorize(self.spec().risk, ctx)
+        policy::authorize_tool(self.spec().name, self.spec().risk, ctx)
     }
 }
 

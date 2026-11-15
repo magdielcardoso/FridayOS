@@ -1,6 +1,7 @@
 //! Tool modules, grouped by the macOS surface they touch.
 
 pub mod apps;
+pub mod autonomy;
 pub mod codex_accounts;
 pub mod audio;
 pub mod ax;
@@ -19,6 +20,7 @@ pub fn register_all(registry: &mut Registry) {
     ax::register(registry);
     input::register(registry);
     apps::register(registry);
+    autonomy::register(registry);
     codex_accounts::register(registry);
     audio::register(registry);
     shell::register(registry);
