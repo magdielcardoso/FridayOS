@@ -446,7 +446,24 @@ async fn pair(
     if body.code.trim().to_uppercase() != state.pair_code {
         return (StatusCode::UNAUTHORIZED, "código inválido").into_response();
     }
-    let secure = if state.secure_cookie { "; Secure" } else { "" };
+    // Secure cookies are dropped by browsers over plain HTTP. Tailscale Serve
+    // terminates TLS and forwards X-Forwarded-Proto; use that signal, and fall
+    // back to the Origin scheme.
+    let forwarded_https = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.eq_ignore_ascii_case("https"))
+        .unwrap_or(false);
+    let origin_https = headers
+        .get("origin")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.starts_with("https://"))
+        .unwrap_or(false);
+    let secure = if state.secure_cookie && (forwarded_https || origin_https) {
+        "; Secure"
+    } else {
+        ""
+    };
     let cookie = format!(
         "{COOKIE}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000{secure}",
         state.session_token
