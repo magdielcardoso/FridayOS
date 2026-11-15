@@ -2314,24 +2314,36 @@ fn matrix_background(clock: f32) -> impl IntoElement {
             let height = f32::from(bounds.size.height);
             let origin_x = f32::from(bounds.origin.x);
             let origin_y = f32::from(bounds.origin.y);
-            let column_width = 26.0;
+            let column_width = 24.0;
             let columns = (width / column_width) as usize;
-            for column in 0..columns.min(26) {
+            let trail = 13usize;
+            for column in 0..columns.min(64) {
                 let seed = ((column * 73) % 97) as f32;
-                let speed = 14.0 + seed % 26.0;
-                let span = height + 240.0;
-                let offset = (clock * speed + seed * 19.0) % span;
+                let speed = 22.0 + seed % 28.0;
+                let span = height + 320.0;
+                let offset = (clock * speed + seed * 23.0) % span;
                 let x = origin_x + column as f32 * column_width + 6.0;
-                for row in 0..7 {
-                    let y = origin_y + offset - row as f32 * 18.0;
-                    if y < origin_y - 12.0 || y > origin_y + height {
+                for row in 0..trail {
+                    let y = origin_y + offset - row as f32 * 19.0;
+                    if y < origin_y - 14.0 || y > origin_y + height {
                         continue;
                     }
-                    let fade = (1.0 - row as f32 / 13.0).max(0.03);
-                    let level = (fade * (if row == 0 { 0.55 } else { 0.22 })) as f32;
-                    let red = (0x5e as f32 * level) as u32;
-                    let color = (red << 16) | ((0x14 as f32 * level) as u32) << 8 | 0x0a;
-                    paint_line(window, x, y, 0.0, 4.0, std::f32::consts::FRAC_PI_2, 2.0, color);
+                    let fade = (1.0 - row as f32 / (trail as f32 + 1.0)).max(0.0);
+                    // Head brighter, tail fading into the dark; 50% opacity.
+                    let level = fade * 0.5;
+                    let red = (0xff as f32 * level) as u32;
+                    let green = (0x24 as f32 * level) as u32;
+                    let color = (red << 16) | (green << 8) | ((0x14 as f32 * level) as u32);
+                    let dash = 7.0 + ((column * 7 + row * 5) % 6) as f32;
+                    paint_segment(
+                        window,
+                        x,
+                        y,
+                        x,
+                        y + dash,
+                        1.5,
+                        color,
+                    );
                 }
             }
         },
