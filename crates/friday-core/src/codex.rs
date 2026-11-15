@@ -233,6 +233,7 @@ struct Session {
     turn_effort: Option<String>,
     turn_finished: bool,
     seen_deltas: std::collections::HashSet<String>,
+    commentary_items: std::collections::HashSet<String>,
     events: mpsc::UnboundedSender<CodexEvent>,
 }
 
@@ -254,6 +255,7 @@ impl Session {
             turn_effort: config.effort.clone(),
             turn_finished: false,
             seen_deltas: std::collections::HashSet::new(),
+            commentary_items: std::collections::HashSet::new(),
             events: events.clone(),
         };
 
@@ -363,6 +365,16 @@ impl Session {
             }
 
             match method {
+                "item/started" => {
+                    let item = params.get("item").cloned().unwrap_or(Value::Null);
+                    if item.get("type").and_then(Value::as_str) == Some("agentMessage")
+                        && item.get("phase").and_then(Value::as_str) == Some("commentary")
+                    {
+                        if let Some(id) = item.get("id").and_then(Value::as_str) {
+                            self.commentary_items.insert(id.to_string());
+                        }
+                    }
+                }
                 "item/agentMessage/delta" => {
                     if let Some(delta) = params.get("delta").and_then(Value::as_str) {
                         let item = params
@@ -370,8 +382,16 @@ impl Session {
                             .and_then(Value::as_str)
                             .unwrap_or("default")
                             .to_string();
+                        let commentary = params.get("phase").and_then(Value::as_str)
+                            == Some("commentary")
+                            || self.commentary_items.contains(&item);
                         self.seen_deltas.insert(item);
-                        let _ = self.events.send(CodexEvent::Delta(delta.to_string()));
+                        let event = if commentary {
+                            CodexEvent::Reasoning(delta.to_string())
+                        } else {
+                            CodexEvent::Delta(delta.to_string())
+                        };
+                        let _ = self.events.send(event);
                     }
                 }
                 "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => {

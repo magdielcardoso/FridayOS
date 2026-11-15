@@ -301,6 +301,8 @@ struct VadState {
     noise: f32,
     /// Frames used to learn the room before we accept any speech.
     calibrated: u32,
+    /// Frames elapsed since Friday started speaking (echo guard).
+    speaking_frames: u32,
 }
 
 impl VadState {
@@ -314,6 +316,7 @@ impl VadState {
             barge_sent: false,
             noise: 0.02,
             calibrated: 0,
+            speaking_frames: 0,
         }
     }
 
@@ -341,18 +344,29 @@ impl VadState {
             self.noise += (target - self.noise) * 0.04;
         }
         let gate = (self.noise * 2.5).max(SPEECH_THRESHOLD).min(0.16);
-        let barge_gate = (self.noise * 3.5).max(BARGE_THRESHOLD).min(0.2);
+
+        // While Friday speaks, the microphone also hears her. Never treat that
+        // as an utterance: only a much louder voice after a short grace period
+        // counts as barge-in, so she never transcribes her own tail.
+        if speaking {
+            self.speaking_frames += 1;
+            self.in_speech = false;
+            self.silence_frames = 0;
+            self.frames_captured = 0;
+            let barge_gate = (self.noise * 6.0).max(0.12);
+            if self.speaking_frames > 6 && rms >= barge_gate {
+                if !self.barge_sent {
+                    self.barge_sent = true;
+                    let _ = tx.send(VoiceEvent::BargeIn);
+                }
+            } else if rms < barge_gate {
+                self.barge_sent = false;
+            }
+            return;
+        }
+        self.speaking_frames = 0;
 
         let voiced = rms >= gate;
-
-        if speaking && rms >= barge_gate {
-            if !self.barge_sent {
-                self.barge_sent = true;
-                let _ = tx.send(VoiceEvent::BargeIn);
-            }
-        } else if rms < barge_gate {
-            self.barge_sent = false;
-        }
 
         if !self.in_speech {
             if voiced {

@@ -202,6 +202,15 @@ impl FridayApp {
                 cx.notify();
             }
             voice::MicEvent::Utterance { path } => {
+                // Never start a second turn on top of the running one: drop the
+                // capture and keep the current answer going.
+                if self.status == Status::Thinking
+                    || self.voice_phase == voice::VoicePhase::Speaking
+                {
+                    self.voice_phase = voice::VoicePhase::Listening;
+                    cx.notify();
+                    return;
+                }
                 self.level = 0.0;
                 self.voice_phase = voice::VoicePhase::Transcribing;
                 cx.notify();
@@ -837,7 +846,7 @@ fn persona() -> String {
     for spec in registry.specs() {
         total += 1;
         manifest.push_str(&format!(
-            "- {} [{}]: {}\n",
+            "- friday__{} [{}]: {}\n",
             spec.name,
             spec.risk.label(),
             spec.summary
