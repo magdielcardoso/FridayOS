@@ -1392,7 +1392,87 @@ fn voice_label(phase: voice::VoicePhase, level: f32) -> String {
     }
 }
 
+/// Screen capture daemon: TCC's Screen Recording grant belongs to this app, so
+/// tools running in other processes ask us to take the shot.
+fn start_screen_daemon() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+
+    let home = std::env::var_os("HOME").unwrap_or_default();
+    let dir = std::path::PathBuf::from(home).join("Library/Application Support/FridayOS");
+    let _ = std::fs::create_dir_all(&dir);
+    let socket = dir.join("screen.sock");
+    let _ = std::fs::remove_file(&socket);
+    let Ok(listener) = UnixListener::bind(&socket) else {
+        log("screen: não consegui abrir o daemon de captura");
+        return;
+    };
+    let _ = std::fs::set_permissions(
+        &socket,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    );
+    log("screen: daemon de captura ativo");
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut reader = BufReader::new(stream.try_clone().expect("clone socket"));
+            let mut line = String::new();
+            if reader.read_line(&mut line).is_err() {
+                continue;
+            }
+            let value: serde_json::Value =
+                serde_json::from_str(line.trim()).unwrap_or(serde_json::Value::Null);
+            let path = value
+                .get("path")
+                .and_then(|path| path.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let mut command = std::process::Command::new("/usr/sbin/screencapture");
+            command.arg("-x");
+            if let Some(region) = value.get("region").and_then(|region| region.as_str()) {
+                command.args(["-R", region]);
+            } else if let Some(display) = value.get("display").and_then(|display| display.as_u64()) {
+                command.args(["-D", &display.to_string()]);
+            }
+            command.arg(&path);
+            let response = match command.output() {
+                Ok(output) if output.status.success() => {
+                    match std::fs::metadata(&path) {
+                        Ok(meta) if meta.len() > 0 => serde_json::json!({ "ok": true }),
+                        _ => serde_json::json!({ "ok": false, "error": "captura vazia: verifique a permissão de Gravação da Tela" }),
+                    }
+                }
+                Ok(output) => serde_json::json!({
+                    "ok": false,
+                    "error": format!(
+                        "screencapture falhou: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    )
+                }),
+                Err(error) => serde_json::json!({ "ok": false, "error": error.to_string() }),
+            };
+            let mut stream = stream;
+            let mut payload = response.to_string();
+            payload.push('\n');
+            let _ = stream.write_all(payload.as_bytes());
+        }
+    });
+}
+
 fn main() {
+    if std::env::args().any(|arg| arg == "--capture-test") {
+        let result = friday_tools::Registry::with_defaults().call(
+            "screen_capture",
+            &serde_json::json!({}),
+            &friday_tools::ToolCtx::new(friday_tools::AuditLog::discover()),
+        );
+        let text = match result {
+            Ok(value) => format!("ok {value}"),
+            Err(error) => format!("erro {error}"),
+        };
+        let _ = std::fs::write("/tmp/friday-capture.txt", text);
+        return;
+    }
     if std::env::args().any(|arg| arg == "--codex-path") {
         match friday_core::codex::codex_path() {
             Some(path) => println!("{}", path.display()),
@@ -1455,6 +1535,7 @@ fn main() {
         }
         return;
     }
+    start_screen_daemon();
     Application::new().run(|cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1100.0), px(880.0)), cx);
         cx.open_window(

@@ -202,6 +202,54 @@ struct Shot {
     temporary: bool,
 }
 
+fn capture_via_app(
+    path: &Path,
+    region: Option<Rect>,
+    display: Option<u32>,
+) -> Option<Result<(), ToolError>> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+
+    let home = std::env::var_os("HOME")?;
+    let socket = std::path::PathBuf::from(home)
+        .join("Library/Application Support/FridayOS/screen.sock");
+    if !socket.exists() {
+        return None;
+    }
+    let mut stream = match UnixStream::connect(&socket) {
+        Ok(stream) => stream,
+        Err(_) => return None,
+    };
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+    let request = serde_json::json!({
+        "cmd": "capture",
+        "path": path.display().to_string(),
+        "region": region.map(|rect| rect.clips().as_str().to_string()),
+        "display": display,
+    });
+    let mut payload = request.to_string();
+    payload.push('\n');
+    if stream.write_all(payload.as_bytes()).is_err() {
+        return None;
+    }
+    let mut line = String::new();
+    if BufReader::new(stream).read_line(&mut line).is_err() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    if value.get("ok").and_then(|ok| ok.as_bool()).unwrap_or(false) {
+        Some(Ok(()))
+    } else {
+        Some(Err(ToolError::failed(
+            value
+                .get("error")
+                .and_then(|error| error.as_str())
+                .unwrap_or("a Friday não conseguiu capturar a tela")
+                .to_string(),
+        )))
+    }
+}
+
 fn capture_command(region: Option<Rect>, display: Option<u32>, path: &Path) -> Vec<String> {
     let mut parts = vec!["/usr/sbin/screencapture".to_string(), "-x".to_string()];
     if let Some(rect) = region {
@@ -225,6 +273,27 @@ fn take_shot(region: Option<Rect>, display: Option<u32>, tag: &str) -> Result<Sh
     })?;
 
     let path = planned_shot_path(tag);
+
+    // The app owns the Screen Recording grant. The MCP server is a separate
+    // process spawned by codex, so ask the app to take the shot over a local
+    // socket; fall back to direct capture for CLI/dev runs.
+    if let Some(result) = capture_via_app(&path, region, display) {
+        result?;
+        let bytes = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        if bytes == 0 {
+            let _ = fs::remove_file(&path);
+            return Err(ToolError::failed(format!(
+                "a captura saiu vazia. {PERMISSION_HINT}"
+            )));
+        }
+        return Ok(Shot {
+            pixels: png_dims(&path),
+            path,
+            region,
+            temporary: true,
+        });
+    }
+
     let mut command = Command::new("/usr/sbin/screencapture");
     command.arg("-x");
     if let Some(rect) = region {
