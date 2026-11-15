@@ -22,6 +22,8 @@ const RED_DIM: u32 = 0x991f1f;
 const RED_FAINT: u32 = 0x3b0d0d;
 const BONE: u32 = 0xd9caca;
 
+const PORTRAIT: &str = include_str!("../assets/friday.txt");
+
 const BANNER: [&str; 5] = [
     " ██████  ██████  ██  ██████   █████  ██   ██",
     " ██      ██   ██ ██  ██   ██ ██   ██  ██ ██ ",
@@ -581,7 +583,7 @@ impl FridayApp {
         // Caret / presence blink.
         cx.spawn(async move |this, cx| loop {
             cx.background_executor()
-                .timer(Duration::from_millis(80))
+                .timer(Duration::from_millis(120))
                 .await;
             let _ = this.update(cx, |app, cx| {
                 app.tick = app.tick.wrapping_add(1);
@@ -916,81 +918,87 @@ impl Render for FridayApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let (status, status_color) = self.status_line();
         let clock = self.booted_at.elapsed().as_secs_f32();
-
         let speaking = self.voice_phase == voice::VoicePhase::Speaking;
         let busy = matches!(self.status, Status::Thinking);
-        let energy = if speaking {
-            0.55 + 0.45 * (clock * 11.0).sin().abs()
-        } else if busy {
-            0.35 + 0.15 * (clock * 3.0).sin()
-        } else {
-            0.15 + 0.05 * (clock * 0.7).sin()
-        };
-        let frame = eye_art(clock, energy, busy, speaking);
 
-        // The eye floats: slow vertical drift plus a tiny horizontal sway.
-        let float_y = (clock * 0.9).sin() * 10.0;
-        let float_x = (clock * 0.55).sin() * 7.0;
+        // Subtle breathing: a couple of pixels of drift and a slow colour pulse.
+        // The ASCII illustration itself never changes, so it cannot "break".
+        let breathe = (clock * 0.7).sin();
+        let float_y = breathe * 3.0;
+        let float_x = (clock * 0.45).sin() * 1.5;
+        let pulse = 0.72 + 0.28 * ((clock * (if speaking { 6.5 } else { 1.1 })).sin() * 0.5 + 0.5);
+        let art_color = rgb(scale_red(pulse));
 
-        let mut eye = div()
+        let mut portrait = div()
             .flex()
             .flex_col()
             .items_center()
-            .gap(px(0.0))
-            .mt(px(26.0 + float_y))
+            .mt(px(float_y))
             .ml(px(float_x));
-        for line in frame {
-            eye = eye.child(
+        for line in PORTRAIT.lines() {
+            portrait = portrait.child(
                 div()
-                    .text_size(px(11.5))
-                    .line_height(px(12.0))
-                    .text_color(rgb(RED))
-                    .child(SharedString::from(line)),
+                    .text_size(px(7.2))
+                    .line_height(px(7.4))
+                    .text_color(art_color)
+                    .child(SharedString::from(line.to_string())),
             );
         }
 
-        let mut steps = div().flex().flex_col().gap(px(4.0)).items_center();
-        for activity in self.activity.iter().rev().take(5).rev() {
+        let answer = if !self.stream.is_empty() {
+            self.stream.clone()
+        } else {
+            self.messages
+                .iter()
+                .rev()
+                .find(|line| line.role == Role::Friday)
+                .map(|line| line.text.clone())
+                .unwrap_or_default()
+        };
+
+        let mut answer_block = div()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .w(px(300.0));
+        if !answer.is_empty() {
+            answer_block = answer_block.child(
+                div()
+                    .text_size(px(11.5))
+                    .line_height(px(16.0))
+                    .text_color(rgb(RED_SOFT))
+                    .child(SharedString::from(answer)),
+            );
+        }
+
+        let mut steps = div().flex().flex_col().gap(px(3.0));
+        for activity in self.activity.iter().rev().take(4).rev() {
             let (mark, color) = match activity.state {
-                StepState::Started => ("▸", RED_SOFT),
-                StepState::Completed => ("✓", RED_DIM),
+                StepState::Started => ("▸", RED_DIM),
+                StepState::Completed => ("✓", RED_FAINT),
                 StepState::Failed => ("✗", RED),
             };
             steps = steps.child(
                 div()
-                    .flex()
-                    .gap(px(8.0))
-                    .text_size(px(10.0))
+                    .text_size(px(9.0))
                     .text_color(rgb(color))
                     .child(SharedString::from(format!("{mark} {}", activity.label))),
             );
         }
 
+        let input_line = format!("› {}{}", self.input, if self.blink { "█" } else { " " });
         let phase_line = match self.voice_phase {
             voice::VoicePhase::Idle => "em repouso",
             voice::VoicePhase::Listening => "ouvindo",
             voice::VoicePhase::Transcribing => "transcrevendo",
             voice::VoicePhase::Speaking => "falando",
         };
-        let meter: String = (0..22)
-            .map(|i| {
-                let wave = ((i as f32 * 0.7) - clock * 9.0).sin() * 0.5 + 0.5;
-                if speaking && wave > 0.45 {
-                    '▮'
-                } else if busy && (i + (clock * 6.0) as usize) % 4 == 0 {
-                    '·'
-                } else {
-                    ' '
-                }
-            })
-            .collect();
-
-        let input_line = format!("› {}{}", self.input, if self.blink { "█" } else { " " });
 
         div()
             .flex()
             .flex_col()
             .size_full()
+            .relative()
             .bg(rgb(BG))
             .text_color(rgb(RED))
             .font_family("Menlo")
@@ -1003,69 +1011,55 @@ impl Render for FridayApp {
                     .flex()
                     .justify_between()
                     .items_center()
-                    .px(px(24.0))
+                    .px(px(26.0))
                     .pt(px(18.0))
                     .child(
                         div()
-                            .text_size(px(11.0))
-                            .text_color(rgb(RED_DIM))
-                            .child(SharedString::from("F R I D A Y · O S")),
+                            .text_size(px(12.0))
+                            .text_color(rgb(RED))
+                            .child(SharedString::from("F R I D A Y")),
                     )
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .gap(px(8.0))
-                            .text_size(px(11.0))
+                            .text_size(px(10.0))
                             .text_color(rgb(status_color))
                             .child(SharedString::from(if busy { "◉" } else { "○" }))
                             .child(SharedString::from(status)),
                     ),
             )
+            // Overlay: Friday's words, top-left, right under her name.
+            .child(
+                div()
+                    .absolute()
+                    .top(px(46.0))
+                    .left(px(26.0))
+                    .child(answer_block),
+            )
+            // The portrait owns the centre.
             .child(
                 div()
                     .flex()
-                    .flex_col()
                     .flex_1()
                     .items_center()
                     .justify_center()
-                    .child(eye),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap(px(6.0))
-                    .px(px(24.0))
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .text_color(rgb(if speaking { RED } else { RED_DIM }))
-                            .child(SharedString::from(meter)),
-                    )
-                    .child(steps),
+                    .child(portrait),
             )
             .child(
                 div()
                     .flex()
                     .flex_col()
                     .gap(px(6.0))
-                    .px(px(24.0))
-                    .py(px(14.0))
-                    .border_t_1()
-                    .border_color(rgb(RED_FAINT))
-                    .child(
-                        div()
-                            .text_size(px(13.0))
-                            .text_color(rgb(RED))
-                            .child(SharedString::from(input_line)),
-                    )
+                    .px(px(26.0))
+                    .pb(px(10.0))
+                    .child(steps)
                     .child(
                         div()
                             .flex()
                             .justify_between()
-                            .text_size(px(9.5))
+                            .text_size(px(9.0))
                             .text_color(rgb(RED_FAINT))
                             .child(SharedString::from(
                                 "⏎ enviar · f2 ouvir · f3 wake word · esc interromper",
@@ -1074,12 +1068,23 @@ impl Render for FridayApp {
                                 "{} ferramentas · voz: {phase_line}",
                                 self.tools
                             ))),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(rgb(RED))
+                            .child(SharedString::from(input_line)),
                     ),
             )
     }
 }
 
-
+fn scale_red(factor: f32) -> u32 {
+    let red = (0xff as f32 * factor.clamp(0.0, 1.0)) as u32;
+    let green = (0x2f as f32 * factor.clamp(0.0, 1.0)) as u32;
+    let blue = (0x2f as f32 * factor.clamp(0.0, 1.0)) as u32;
+    (red << 16) | (green << 8) | blue
+}
 
 /// Builds the capability manifesto from the live tool registry, so Friday knows
 /// exactly what she can do — no guesswork, no "MCP not connected".
@@ -1302,7 +1307,7 @@ fn main() {
         return;
     }
     Application::new().run(|cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(900.0), px(680.0)), cx);
+        let bounds = Bounds::centered(None, size(px(1100.0), px(880.0)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
