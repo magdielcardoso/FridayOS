@@ -2,6 +2,8 @@
 //!
 //! Black substrate, red phosphor, monospace grid. No light theme.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use friday_core::codex::{Codex, CodexConfig, CodexEvent};
@@ -10,6 +12,8 @@ use gpui::{
     div, px, rgb, App, Application, Bounds, Context, FocusHandle, KeyDownEvent, Render,
     ScrollHandle, SharedString, Window, WindowBounds, WindowOptions, size,
 };
+
+mod voice;
 
 const BG: u32 = 0x050505;
 const RED: u32 = 0xff2f2f;
@@ -80,6 +84,12 @@ struct FridayApp {
     status: Status,
     thread: Option<String>,
     tools: usize,
+    mic: Option<voice::Mic>,
+    voice_phase: voice::VoicePhase,
+    level: f32,
+    speak_cancel: Option<Arc<AtomicBool>>,
+    wake: bool,
+    wake_flag: Option<Arc<AtomicBool>>,
     blink: bool,
     focus: FocusHandle,
     scroll: ScrollHandle,
@@ -101,6 +111,12 @@ impl FridayApp {
             status: Status::Connecting,
             thread: None,
             tools: friday_tools::Registry::with_defaults().specs().len(),
+            mic: None,
+            voice_phase: voice::VoicePhase::Idle,
+            level: 0.0,
+            speak_cancel: None,
+            wake: false,
+            wake_flag: None,
             blink: true,
             focus,
             scroll: ScrollHandle::new(),
@@ -108,6 +124,268 @@ impl FridayApp {
         };
         app.connect(cx);
         app
+    }
+
+    fn start_listen(&mut self, cx: &mut Context<Self>) {
+        if self.voice_phase == voice::VoicePhase::Speaking {
+            self.interrupt(cx);
+        }
+        if self.mic.is_none() {
+            match voice::Mic::start() {
+                Ok(mic) => {
+                    self.mic = Some(mic);
+                    self.spawn_mic_poll(cx);
+                }
+                Err(error) => {
+                    self.messages.push(Line {
+                        role: Role::System,
+                        text: format!("microfone indisponível: {error}"),
+                    });
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+        if let Some(mic) = self.mic.as_ref() {
+            mic.set_speaking(false);
+        }
+        self.voice_phase = voice::VoicePhase::Listening;
+        self.messages.push(Line {
+            role: Role::System,
+            text: "ouvindo…".into(),
+        });
+        self.scroll.scroll_to_bottom();
+        cx.notify();
+    }
+
+    fn spawn_mic_poll(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(120))
+                .await;
+            let events = this.update(cx, |app, _| {
+                app.mic
+                    .as_mut()
+                    .map(voice::Mic::poll)
+                    .unwrap_or_default()
+            });
+            let Ok(events) = events else { break };
+            let alive = this
+                .update(cx, |app, _| app.mic.is_some())
+                .unwrap_or(false);
+            if !alive {
+                break;
+            }
+            if !events.is_empty() {
+                let _ = this.update(cx, |app, cx| {
+                    for event in events {
+                        app.on_mic(event, cx);
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn on_mic(&mut self, event: voice::MicEvent, cx: &mut Context<Self>) {
+        match event {
+            voice::MicEvent::SpeechStarted => {
+                self.voice_phase = voice::VoicePhase::Listening;
+                cx.notify();
+            }
+            voice::MicEvent::Level(level) => {
+                self.level = level;
+                cx.notify();
+            }
+            voice::MicEvent::Utterance { path } => {
+                self.level = 0.0;
+                self.voice_phase = voice::VoicePhase::Transcribing;
+                cx.notify();
+                Self::blocking(
+                    cx,
+                    move || voice::transcribe_wav(&path),
+                    |app, result, cx| {
+                        match result {
+                            Ok(text) if !text.trim().is_empty() => {
+                                app.messages.push(Line {
+                                    role: Role::User,
+                                    text: text.clone(),
+                                });
+                                app.input.clear();
+                                app.stream.clear();
+                                app.status = Status::Thinking;
+                                app.voice_phase = voice::VoicePhase::Idle;
+                                if let Some(codex) = app.codex.as_ref() {
+                                    codex.prompt(text);
+                                }
+                                app.scroll.scroll_to_bottom();
+                            }
+                            Ok(_) => {
+                                app.voice_phase = voice::VoicePhase::Listening;
+                            }
+                            Err(error) => {
+                                app.voice_phase = voice::VoicePhase::Idle;
+                                app.messages.push(Line {
+                                    role: Role::System,
+                                    text: format!("não entendi: {error}"),
+                                });
+                            }
+                        }
+                        cx.notify();
+                    },
+                );
+            }
+            voice::MicEvent::BargeIn => {
+                if self.voice_phase == voice::VoicePhase::Speaking
+                    || self.status == Status::Thinking
+                {
+                    self.interrupt(cx);
+                    self.voice_phase = voice::VoicePhase::Listening;
+                }
+            }
+            voice::MicEvent::Error(error) => {
+                self.messages.push(Line {
+                    role: Role::System,
+                    text: format!("áudio: {error}"),
+                });
+                self.voice_phase = voice::VoicePhase::Idle;
+                cx.notify();
+            }
+        }
+    }
+
+    fn speak_text(&mut self, text: String, cx: &mut Context<Self>) {
+        voice::stop_speaking();
+        if let Some(previous) = self.speak_cancel.take() {
+            previous.store(true, Ordering::Relaxed);
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.speak_cancel = Some(cancel.clone());
+        self.voice_phase = voice::VoicePhase::Speaking;
+        if let Some(mic) = self.mic.as_ref() {
+            mic.set_speaking(true);
+        }
+        cx.notify();
+
+        Self::blocking(
+            cx,
+            move || voice::speak(&text, &cancel),
+            |app, result, cx| {
+                if let Err(error) = result {
+                    app.messages.push(Line {
+                        role: Role::System,
+                        text: format!("voz: {error}"),
+                    });
+                }
+                if let Some(mic) = app.mic.as_ref() {
+                    mic.set_speaking(false);
+                }
+                app.speak_cancel = None;
+                app.voice_phase = if app.mic.is_some() {
+                    voice::VoicePhase::Listening
+                } else {
+                    voice::VoicePhase::Idle
+                };
+                cx.notify();
+            },
+        );
+    }
+
+    fn toggle_wake(&mut self, cx: &mut Context<Self>) {
+        if self.wake {
+            self.wake = false;
+            if let Some(flag) = self.wake_flag.take() {
+                flag.store(false, Ordering::Relaxed);
+            }
+            self.messages.push(Line {
+                role: Role::System,
+                text: "wake word desligada".into(),
+            });
+            cx.notify();
+            return;
+        }
+
+        self.wake = true;
+        let flag = Arc::new(AtomicBool::new(true));
+        self.wake_flag = Some(flag.clone());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Result<(), String>>();
+        std::thread::spawn(move || {
+            while flag.load(Ordering::Relaxed) {
+                match voice::wake_once("friday", 6) {
+                    Ok(true) => {
+                        let _ = tx.send(Ok(()));
+                        return;
+                    }
+                    Ok(false) => continue,
+                    Err(error) => {
+                        let _ = tx.send(Err(error));
+                        return;
+                    }
+                }
+            }
+        });
+        self.messages.push(Line {
+            role: Role::System,
+            text: "wake word ligada: diga \"Friday\"".into(),
+        });
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            if let Some(result) = rx.recv().await {
+                let _ = this.update(cx, |app, cx| {
+                    app.wake = false;
+                    app.wake_flag = None;
+                    match result {
+                        Ok(()) => app.start_listen(cx),
+                        Err(error) => {
+                            app.messages.push(Line {
+                                role: Role::System,
+                                text: format!("wake word: {error}"),
+                            });
+                            cx.notify();
+                        }
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn interrupt(&mut self, cx: &mut Context<Self>) {
+        if let Some(cancel) = self.speak_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        voice::stop_speaking();
+        if self.status == Status::Thinking {
+            self.cancel_turn(cx);
+        }
+        if let Some(mic) = self.mic.as_ref() {
+            mic.set_speaking(false);
+        }
+        self.voice_phase = if self.mic.is_some() {
+            voice::VoicePhase::Listening
+        } else {
+            voice::VoicePhase::Idle
+        };
+        cx.notify();
+    }
+
+    /// Runs blocking work on a plain thread and folds the result back on GPUI.
+    fn blocking<T: Send + 'static>(
+        cx: &mut Context<Self>,
+        work: impl FnOnce() -> T + Send + 'static,
+        done: impl FnOnce(&mut Self, T, &mut Context<Self>) + 'static,
+    ) {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(work());
+        });
+        cx.spawn(async move |this, cx| {
+            if let Some(value) = rx.recv().await {
+                let _ = this.update(cx, |app, cx| done(app, value, cx));
+            }
+        })
+        .detach();
     }
 
     fn connect(&mut self, cx: &mut Context<Self>) {
@@ -178,8 +456,10 @@ impl FridayApp {
                 self.reasoning.push_str(&delta);
             }
             CodexEvent::Done { status } => {
+                let mut spoken = None;
                 if !self.stream.trim().is_empty() {
                     let text = std::mem::take(&mut self.stream);
+                    spoken = Some(text.clone());
                     self.messages.push(Line {
                         role: Role::Friday,
                         text,
@@ -197,6 +477,11 @@ impl FridayApp {
                     Status::Online
                 };
                 self.scroll.scroll_to_bottom();
+                if status == "completed" {
+                    if let Some(text) = spoken {
+                        self.speak_text(text, cx);
+                    }
+                }
             }
             CodexEvent::Error(error) => {
                 self.messages.push(Line {
@@ -260,7 +545,11 @@ impl FridayApp {
                 self.input.pop();
                 cx.notify();
             }
-            "escape" => self.cancel_turn(cx),
+            "escape" => {
+                self.interrupt(cx);
+            }
+            "f2" => self.start_listen(cx),
+            "f3" => self.toggle_wake(cx),
             "space" => {
                 if !modifiers.control {
                     self.input.push(' ');
@@ -335,7 +624,7 @@ impl FridayApp {
                     .text_size(px(10.0))
                     .text_color(rgb(RED_FAINT))
                     .child(SharedString::from(
-                        "⏎ enviar   ·   esc interromper   ·   f2 falar (em breve)",
+                        "⏎ enviar   ·   f2 falar   ·   f3 wake word ·   esc interromper",
                     )),
             )
     }
