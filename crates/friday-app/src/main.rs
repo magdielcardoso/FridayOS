@@ -990,9 +990,14 @@ impl FridayApp {
                 .await;
             let _ = this.update(cx, |app, cx| {
                 if app.voice_phase == voice::VoicePhase::Speaking {
+                    // Audio still flowing means the voice is fine; only a real
+                    // stall should trigger the watchdog.
+                    if voice::speech_level() > 0.01 {
+                        app.speaking_since = Some(std::time::Instant::now());
+                    }
                     let stale = app
                         .speaking_since
-                        .map(|since| since.elapsed() > Duration::from_secs(12))
+                        .map(|since| since.elapsed() > Duration::from_secs(25))
                         .unwrap_or(true);
                     if stale {
                         log("watchdog: fala travada, resetando");
