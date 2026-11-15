@@ -1616,9 +1616,6 @@ impl Render for FridayApp {
                     ));
                 }
                 for (edge_index, &(a, b)) in links.iter().enumerate() {
-                    if !show_connections {
-                        continue;
-                    }
                     if let (Some(pa), Some(pb)) = (moved.get(a as usize), moved.get(b as usize)) {
                         let pulse = 0.55 + 0.45 * (clock * 2.0 + edge_index as f32 * 0.9).sin().abs();
                         let width = (1.2 + 1.2 * pulse) * scale.max(0.6);
@@ -1632,12 +1629,14 @@ impl Render for FridayApp {
                             width,
                             color,
                         );
-                        // Bright packet travelling along the connection.
-                        let t = (clock * 0.35 + edge_index as f32 * 0.19).fract();
-                        let sx0 = cx0 + (pa.0 + (pb.0 - pa.0) * t) * radius;
-                        let sy0 = cy0 + (pa.1 + (pb.1 - pa.1) * t) * radius;
-                        paint_arc(window, sx0, sy0, 1.7 * scale, 0.0, TAU, 2.0, 0xff5a6e);
-                        paint_arc(window, sx0, sy0, 3.6 * scale, 0.0, TAU, 0.8, 0x5a0a16);
+                        // Bright data packet only while the graph is being researched.
+                        if show_connections {
+                            let t = (clock * 0.35 + edge_index as f32 * 0.19).fract();
+                            let sx0 = cx0 + (pa.0 + (pb.0 - pa.0) * t) * radius;
+                            let sy0 = cy0 + (pa.1 + (pb.1 - pa.1) * t) * radius;
+                            paint_arc(window, sx0, sy0, 1.7 * scale, 0.0, TAU, 2.0, 0xff5a6e);
+                            paint_arc(window, sx0, sy0, 3.6 * scale, 0.0, TAU, 0.8, 0x5a0a16);
+                        }
                     }
                 }
                 if nodes.is_empty() {
