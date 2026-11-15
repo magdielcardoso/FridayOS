@@ -16,6 +16,7 @@ use gpui::{
 };
 
 mod automation;
+mod mobile;
 mod voice;
 
 const BG: u32 = 0x050505;
@@ -78,6 +79,8 @@ without the user typing.
 While a turn is running, anything the user says is transcribed and sent with
 `turn/steer` as guidance for that same turn — treat it as an adjustment, not a
 new task, and fold it into the answer you are already producing.
+Messages may also arrive from the iPhone PWA (source `mobile`), from webhooks
+or from routines; treat them as the same user and keep the shared context.
 You also have: `diagnose` (read logs, list recent errors and environment
 problems), `say` (macOS speech as an explicit fallback), `memory_save` /
 `memory_list` (persistent memories that survive restarts), and the permanent
@@ -342,6 +345,7 @@ struct FridayApp {
     speech_sent_first: bool,
     transcript: String,
     external_pending: VecDeque<(String, String)>,
+    notify_on_done: bool,
     tts_stream: bool,
     speaking_since: Option<std::time::Instant>,
     wake: bool,
@@ -382,6 +386,7 @@ impl FridayApp {
             speech_sent_first: false,
             transcript: String::new(),
             external_pending: VecDeque::new(),
+            notify_on_done: false,
             tts_stream: std::env::var("FRIDAY_TTS_MODE")
                 .map(|mode| mode == "stream")
                 .unwrap_or(false),
@@ -398,6 +403,14 @@ impl FridayApp {
             scroll: ScrollHandle::new(),
             booted_at: std::time::Instant::now(),
         };
+        let code = mobile::pair_code();
+        if !code.is_empty() {
+            app.messages.push(Line {
+                role: Role::System,
+                text: format!("Friday Mobile · código de pareamento: {code}"),
+            });
+            log(format!("mobile: código de pareamento {code}"));
+        }
         app.connect(cx);
         app
     }
@@ -868,6 +881,15 @@ impl FridayApp {
                     };
                     std::mem::take(&mut *inbox)
                 };
+                for text in mobile::take_requests() {
+                    if app.status == Status::Thinking {
+                        app.external_pending
+                            .push_back(("mobile".to_string(), text));
+                    } else {
+                        app.inject_trigger("mobile".to_string(), text, cx);
+                    }
+                }
+
                 for trigger in triggers {
                     if app.status == Status::Thinking {
                         app.push_activity(
@@ -990,6 +1012,7 @@ impl FridayApp {
             CodexEvent::Delta(delta) => {
                 self.status = Status::Thinking;
                 self.stream.push_str(&delta);
+                mobile::assistant_delta(&delta);
                 self.feed_speech(&delta, cx);
                 self.scroll.scroll_to_bottom();
             }
@@ -1000,6 +1023,7 @@ impl FridayApp {
                 }
             }
             CodexEvent::Step { id, label, state } => {
+                mobile::step(&label);
                 if let Some(existing) = self.activity.iter_mut().find(|item| item.id == id) {
                     existing.label = label;
                     existing.state = state;
@@ -1037,9 +1061,15 @@ impl FridayApp {
                 } else {
                     self.end_speech(cx);
                 }
-                let _ = spoken;
+                let finished = spoken
+                    .or_else(|| self.messages.iter().rev().find(|line| line.role == Role::Friday).map(|line| line.text.clone()))
+                    .unwrap_or_default();
+                mobile::assistant_done(&finished, self.notify_on_done);
+                self.notify_on_done = false;
+                let _ = finished;
             }
             CodexEvent::Error(error) => {
+                mobile::assistant_error(&error);
                 self.messages.push(Line {
                     role: Role::System,
                     text: error,
@@ -1053,6 +1083,10 @@ impl FridayApp {
 
     fn inject_trigger(&mut self, source: String, prompt: String, cx: &mut Context<Self>) {
         log(format!("gatilho: {source}"));
+        self.notify_on_done = source == "mobile"
+            || source.starts_with("watcher:")
+            || source.starts_with("rotina:");
+        mobile::user_message(&prompt);
         self.messages.push(Line {
             role: Role::User,
             text: format!("[{source}] {prompt}"),
@@ -1102,6 +1136,8 @@ impl FridayApp {
         self.stream.clear();
         self.reasoning.clear();
         self.status = Status::Thinking;
+        self.notify_on_done = false;
+        mobile::user_message(&text);
         self.activity.clear();
         self.reasoning.clear();
         self.push_activity("enviado ao código", StepState::Completed);
@@ -2147,6 +2183,12 @@ fn main() {
     }
     start_screen_daemon();
     start_overlay_daemon();
+    let mobile_port = std::env::var("FRIDAY_MOBILE_PORT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(3000);
+    let _pairing = mobile::start(mobile_port);
+    log(format!("mobile: servidor em http://127.0.0.1:{mobile_port}"));
     automation::start(
         automation::hook_port(),
         Arc::new(|trigger| {
