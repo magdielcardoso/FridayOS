@@ -417,8 +417,8 @@ impl FridayApp {
             graph_points: Vec::new(),
             graph_edges: Vec::new(),
             tts_stream: std::env::var("FRIDAY_TTS_MODE")
-                .map(|mode| mode == "stream")
-                .unwrap_or(false),
+                .map(|mode| mode != "single")
+                .unwrap_or(true),
             speaking_since: None,
             wake: false,
             wake_flag: None,
@@ -1958,18 +1958,10 @@ fn load_assistants() -> Vec<(String, String)> {
 /// Builds the capability manifesto from the live tool registry, so Friday knows
 /// exactly what she can do — no guesswork, no "MCP not connected".
 fn persona() -> String {
-    let registry = friday_tools::Registry::with_defaults();
-    let mut manifest = String::new();
-    let mut total = 0usize;
-    for spec in registry.specs() {
-        total += 1;
-        manifest.push_str(&format!(
-            "- friday__{} [{}]: {}\n",
-            spec.name,
-            spec.risk.label(),
-            spec.summary
-        ));
-    }
+    // Keep the prompt small: tools are discoverable through the MCP server
+    // (`tools/summary` and `tools/search`) instead of listing all of them here.
+    let manifest = "Ferramentas: use o servidor MCP `friday`; para descobrir o que\n                    existe, chame a ferramenta `tools__summary` ou pesquise com\n                    `tools__search`. Não presuma ausência de ferramenta sem buscar.\n";
+
     // Recent durable memories, so she starts every session already knowing them.
     let mut memories = String::new();
     if let Some(home) = std::env::var_os("HOME") {
@@ -1994,10 +1986,7 @@ fn persona() -> String {
         format!("\nMEMÓRIAS PERSISTENTES:\n{memories}")
     };
 
-    format!(
-        "{PERSONA_BASE}\n\n{} ferramentas conectadas agora (servidor `friday`):\n{manifest}{memories}",
-        total.max(1)
-    )
+    format!("{PERSONA_BASE}\n\n{manifest}{memories}")
 }
 
 /// Pulls complete sentences out of a growing stream buffer, with an early

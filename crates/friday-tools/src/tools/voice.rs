@@ -425,7 +425,7 @@ impl VadState {
 
         // 1 s of silence (4 frames) so natural pauses do not chop a sentence
         // into meaningless fragments that transcribe as gibberish.
-        if self.silence_frames >= 4 || self.frames_captured >= MAX_FRAMES {
+        if self.silence_frames >= 2 || self.frames_captured >= MAX_FRAMES {
             let captured = std::mem::take(&mut self.captured);
             let frames = self.frames_captured;
             self.in_speech = false;
