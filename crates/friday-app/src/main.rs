@@ -16,6 +16,7 @@ use gpui::{
 };
 
 mod automation;
+mod graph_panel;
 mod mobile;
 mod voice;
 
@@ -81,6 +82,9 @@ While a turn is running, anything the user says is transcribed and sent with
 new task, and fold it into the answer you are already producing.
 Messages may also arrive from the iPhone PWA (source `mobile`), from webhooks
 or from routines; treat them as the same user and keep the shared context.
+HUD: `knowledge_graph` now prefers the native GPUI graph window (socket action
+`graph`); `dashboard_open` composes system/storage/power/network/tasks panels
+from real data; `screen_annotate` (when available) draws red reticles on screen.
 Knowledge graph: use `knowledge_index`, `knowledge_search`,
 `knowledge_neighbors` and `knowledge_graph` (interactive panel; pass
 `highlight: [Nome]` to spotlight nodes and paths). Markdown notes live in
@@ -140,6 +144,7 @@ struct OverlayRequest {
 
 enum OverlayMsg {
     Show(OverlayRequest),
+    Graph(Vec<String>),
     Close,
 }
 
@@ -354,6 +359,8 @@ struct FridayApp {
     transcript: String,
     external_pending: VecDeque<(String, String)>,
     notify_on_done: bool,
+    active_app: String,
+    active_category: String,
     tts_stream: bool,
     speaking_since: Option<std::time::Instant>,
     wake: bool,
@@ -394,6 +401,8 @@ impl FridayApp {
             transcript: String::new(),
             external_pending: VecDeque::new(),
             notify_on_done: false,
+            active_app: String::new(),
+            active_category: String::new(),
             tts_stream: std::env::var("FRIDAY_TTS_MODE")
                 .map(|mode| mode == "stream")
                 .unwrap_or(false),
@@ -879,6 +888,9 @@ impl FridayApp {
                 for message in messages {
                     match message {
                         OverlayMsg::Show(request) => open_overlay(cx, request),
+                        OverlayMsg::Graph(highlight) => {
+                            let _ = graph_panel::open(cx, highlight);
+                        }
                         OverlayMsg::Close => close_overlays(cx),
                     }
                 }
@@ -972,6 +984,28 @@ impl FridayApp {
                     }
                 }
             });
+        })
+        .detach();
+
+        // OS context: active app + category, polled off the UI thread.
+        let (ctx_tx, mut ctx_rx) = tokio::sync::mpsc::unbounded_channel();
+        std::thread::Builder::new()
+            .name("friday-context".into())
+            .spawn(move || loop {
+                let _ = ctx_tx.send(current_context());
+                std::thread::sleep(Duration::from_secs(3));
+            })
+            .ok();
+        cx.spawn(async move |this, cx| {
+            while let Some((app, category)) = ctx_rx.recv().await {
+                let _ = this.update(cx, |state, cx| {
+                    if state.active_app != app || state.active_category != category {
+                        state.active_app = app;
+                        state.active_category = category;
+                        cx.notify();
+                    }
+                });
+            }
         })
         .detach();
 
@@ -1095,6 +1129,21 @@ impl FridayApp {
         self.notify_on_done = source == "mobile"
             || source.starts_with("watcher:")
             || source.starts_with("rotina:");
+        if self.notify_on_done && !source.starts_with("mobile") {
+            open_overlay(
+                cx,
+                OverlayRequest {
+                    title: format!("EVENTO · {source}"),
+                    body: prompt.chars().take(420).collect(),
+                    anchor: "top-right".into(),
+                    width: 440.0,
+                    height: 0.0,
+                    offset_x: 0.0,
+                    offset_y: 0.0,
+                    seconds: 12,
+                },
+            );
+        }
         mobile::user_message(&prompt);
         self.messages.push(Line {
             role: Role::User,
@@ -1507,6 +1556,24 @@ impl Render for FridayApp {
                                     .text_size(px(9.0))
                                     .text_color(rgb(RED_FAINT))
                                     .child(SharedString::from("codex · ativo")),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(9.0))
+                                    .text_color(rgb(RED_DIM))
+                                    .child(SharedString::from(if self.active_app.is_empty() {
+                                        "ctx · —".to_string()
+                                    } else {
+                                        format!(
+                                            "ctx · {}{}",
+                                            self.active_app,
+                                            if self.active_category.is_empty() {
+                                                String::new()
+                                            } else {
+                                                format!(" · {}", short_category(&self.active_category))
+                                            }
+                                        )
+                                    })),
                             )
                             .when(busy, |col| {
                                 col.child(
@@ -2111,7 +2178,22 @@ fn start_overlay_daemon() {
                 .get("action")
                 .and_then(|action| action.as_str())
                 .unwrap_or("show");
-            let reply = if action == "close" {
+            let reply = if action == "graph" {
+                let highlight: Vec<String> = value
+                    .get("highlight")
+                    .and_then(|items| items.as_array())
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| item.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if let Ok(mut inbox) = overlay_inbox().lock() {
+                    inbox.push(OverlayMsg::Graph(highlight));
+                }
+                serde_json::json!({ "ok": true, "graph": true })
+            } else if action == "close" {
                 overlay_inbox().lock().map(|mut inbox| inbox.push(OverlayMsg::Close)).ok();
                 serde_json::json!({ "ok": true })
             } else {
@@ -2192,7 +2274,6 @@ fn estimate_height(body: &str, width: f32) -> f32 {
 }
 
 fn open_overlay(cx: &mut App, request: OverlayRequest) {
-    close_overlays(cx);
 
     let display = cx.primary_display().map(|display| display.bounds());
     let (screen_w, screen_h, screen_x, screen_y) = match display {
@@ -2252,6 +2333,10 @@ fn open_overlay(cx: &mut App, request: OverlayRequest) {
     let Ok(handle) = opened else { return };
     if let Ok(mut windows) = overlay_windows().lock() {
         windows.push(handle);
+        while windows.len() > 4 {
+            let oldest = windows.remove(0);
+            let _ = oldest.update(cx, |_, window, _| window.remove_window());
+        }
     }
 
     if request.seconds > 0 {
@@ -2398,4 +2483,87 @@ fn main() {
         .detach();
         cx.activate(true);
     });
+}
+
+fn current_context() -> (String, String) {
+    let front = std::process::Command::new("/usr/bin/lsappinfo")
+        .arg("front")
+        .output()
+        .ok()
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .unwrap_or_default();
+    if front.is_empty() {
+        return (String::new(), String::new());
+    }
+    let info = std::process::Command::new("/usr/bin/lsappinfo")
+        .args(["info", "-only", "bundleID,name", &front])
+        .output()
+        .ok()
+        .map(|output| String::from_utf8_lossy(&output.stdout).to_string())
+        .unwrap_or_default();
+    let extract = |key: &str| -> String {
+        info.split(key)
+            .nth(1)
+            .map(|part| {
+                part.trim()
+                    .trim_start_matches('=')
+                    .trim()
+                    .trim_matches('"')
+                    .split('"')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string()
+            })
+            .unwrap_or_default()
+    };
+    let mut name = extract("\"LSDisplayName\"");
+    if name.is_empty() {
+        name = extract("name=");
+    }
+    let bundle = {
+        let value = extract("\"CFBundleIdentifier\"");
+        if value.is_empty() {
+            extract("bundleID=")
+        } else {
+            value
+        }
+    };
+    let mut category = String::new();
+    if !bundle.is_empty() {
+        let path = std::process::Command::new("/usr/bin/mdfind")
+            .arg(format!("kMDItemCFBundleIdentifier == '{bundle}'"))
+            .output()
+            .ok()
+            .map(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .unwrap_or_default();
+        if !path.is_empty() {
+            if let Ok(output) = std::process::Command::new("/usr/bin/plutil")
+                .args([
+                    "-extract",
+                    "LSApplicationCategoryType",
+                    "raw",
+                    &format!("{path}/Contents/Info.plist"),
+                ])
+                .output()
+            {
+                if output.status.success() {
+                    category = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                }
+            }
+        }
+    }
+    (name, category)
+}
+
+fn short_category(category: &str) -> &str {
+    category
+        .strip_prefix("public.app-category.")
+        .unwrap_or(category)
 }

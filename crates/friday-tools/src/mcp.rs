@@ -11,7 +11,9 @@
 //! | `initialize` | protocol version, `tools` capability, server info |
 //! | `notifications/initialized` | ignored (no response) |
 //! | `ping` | empty result |
-//! | `tools/list` | specs from [`Registry::specs`] |
+//! | `tools/search` | ranked, filtered tool catalog (`query`, `category`, `risk`, `limit`) |
+//! | `tools/summary` | compact catalog without schemas, for progressive disclosure |
+//! | `tools/list` | specs from [`Registry::specs`], including full input schemas |
 //! | `tools/call` | runs a tool through the registry, with policy + audit |
 //! | `shutdown` / `exit` | flush stdout and exit 0 |
 //!
@@ -28,7 +30,7 @@ use std::panic::AssertUnwindSafe;
 use serde_json::{json, Value};
 
 use crate::audit::AuditLog;
-use crate::registry::{Registry, ToolCtx, ToolError};
+use crate::registry::{Registry, ToolCtx, ToolError, ToolSpec};
 
 /// MCP revision this server speaks.
 pub const PROTOCOL_VERSION: &str = "2024-11-05";
@@ -158,7 +160,8 @@ fn dispatch(registry: &Registry, line: &str) -> Outcome {
         }
         "notifications/initialized" | "initialized" => Outcome::Silent,
         "ping" => reply(id, json!({})),
-        "tools/search" => reply(id, tools_search(registry, &params)),
+        "tools/search" => reply(id, search_tools(registry, &params)),
+        "tools/summary" => reply(id, summary_tools(registry, &params)),
         "tools/list" => reply(id, tools_list(registry)),
         "tools/call" => tools_call(registry, id, &params),
         "shutdown" => match id {
@@ -189,35 +192,203 @@ fn initialize_result() -> Value {
     })
 }
 
-fn tools_search(registry: &Registry, params: &Value) -> Value {
-    let query = params
-        .get("query")
+/// Lowercase and strip diacritics so `visão` matches `visao` and `Vóice`
+/// matches `voice`. Only the repertoire used by tool names and Portuguese
+/// summaries is mapped; everything else falls through to Unicode lowercase.
+fn normalize_text(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        let base = match ch {
+            'á' | 'à' | 'â' | 'ã' | 'ä' | 'å' | 'Á' | 'À' | 'Â' | 'Ã' | 'Ä' | 'Å' => {
+                'a'
+            }
+            'é' | 'è' | 'ê' | 'ë' | 'É' | 'È' | 'Ê' | 'Ë' => 'e',
+            'í' | 'ì' | 'î' | 'ï' | 'Í' | 'Ì' | 'Î' | 'Ï' => 'i',
+            'ó' | 'ò' | 'ô' | 'õ' | 'ö' | 'Ó' | 'Ò' | 'Ô' | 'Õ' | 'Ö' => 'o',
+            'ú' | 'ù' | 'û' | 'ü' | 'Ú' | 'Ù' | 'Û' | 'Ü' => 'u',
+            'ç' | 'Ç' => 'c',
+            'ñ' | 'Ñ' => 'n',
+            'ý' | 'ÿ' | 'Ý' | 'Ÿ' => 'y',
+            'ß' => 's',
+            _ => ch,
+        };
+        for lower in base.to_lowercase() {
+            out.push(lower);
+        }
+    }
+    out
+}
+
+/// Coarse category derived from the tool-name prefix. Kept deterministic and
+/// dependency-free: the first `_`-separated segment decides, with the
+/// `codex_account` family handled before its generic `codex` sibling.
+fn category_for(name: &str) -> &'static str {
+    if name.starts_with("codex_account") {
+        return "accounts";
+    }
+
+    let segment = name.split('_').next().unwrap_or(name);
+    match segment {
+        "ax" => "accessibility",
+        "input" => "input",
+        "app" | "apps" | "shortcut" => "apps",
+        "shell" | "process" | "power" | "volume" => "system",
+        "fs" | "spotlight" | "clipboard" | "keychain" => "files",
+        "screen" | "vision" => "vision",
+        "net" | "wifi" | "calendar" | "reminder" | "reminders" | "contact" | "contacts"
+        | "home" => "network",
+        "voice" | "say" => "voice",
+        "knowledge" | "context" => "knowledge",
+        "overlay" => "panels",
+        "webhook" | "routine" | "watcher" | "watchers" => "automation",
+        "assistant" | "assistants" => "agents",
+        "autonomy" => "policy",
+        "memory" => "memory",
+        "codex" => "accounts",
+        "diagnose" | "forensics" => "diagnostics",
+        _ => "other",
+    }
+}
+
+/// Score one tool against the normalized query words. Each word contributes
+/// its best match, so multi-word queries prefer tools covering more words.
+/// Returns `None` when any word is absent (an AND across words).
+fn score_tool(spec: &ToolSpec, words: &[String]) -> Option<u32> {
+    if words.is_empty() {
+        return Some(0);
+    }
+
+    let name = normalize_text(spec.name);
+    let summary = normalize_text(spec.summary);
+    let mut total = 0u32;
+
+    for word in words {
+        let score = if name == *word {
+            100
+        } else if name.starts_with(word.as_str()) {
+            70
+        } else if name.contains(word.as_str()) {
+            50
+        } else if summary.contains(word.as_str()) {
+            20
+        } else {
+            return None;
+        };
+        total += score;
+    }
+
+    Some(total)
+}
+
+fn param_filter(params: &Value, key: &str) -> Option<String> {
+    params
+        .get(key)
         .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_lowercase();
+        .map(normalize_text)
+        .filter(|value| !value.is_empty())
+}
+
+/// Ranked tool discovery. Pure helper shared by the dispatcher and the tests.
+fn search_tools(registry: &Registry, params: &Value) -> Value {
+    let query = params.get("query").and_then(Value::as_str).unwrap_or("");
+    let words: Vec<String> = query
+        .split_whitespace()
+        .map(normalize_text)
+        .filter(|word| !word.is_empty())
+        .collect();
+
+    let category = param_filter(params, "category");
+    let risk = param_filter(params, "risk");
     let limit = params
         .get("limit")
         .and_then(Value::as_u64)
         .unwrap_or(20)
         .min(100) as usize;
-    let tools: Vec<Value> = registry
+
+    let mut matches: Vec<(u32, &ToolSpec)> = registry
         .specs()
         .into_iter()
         .filter(|spec| {
-            query.is_empty()
-                || spec.name.to_lowercase().contains(&query)
-                || spec.summary.to_lowercase().contains(&query)
+            risk.as_ref()
+                .map_or(true, |wanted| normalize_text(spec.risk.label()) == *wanted)
         })
+        .filter(|spec| {
+            category
+                .as_ref()
+                .map_or(true, |wanted| category_for(spec.name) == wanted.as_str())
+        })
+        .filter_map(|spec| score_tool(spec, &words).map(|score| (score, spec)))
+        .collect();
+
+    // Deterministic: score first, then name so equal scores never reorder
+    // between runs or platforms.
+    matches.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.name.cmp(right.1.name))
+    });
+
+    let total = matches.len();
+    let tools: Vec<Value> = matches
+        .into_iter()
+        .take(limit)
+        .map(|(_, spec)| {
+            json!({
+                "name": spec.name,
+                "description": spec.summary,
+                "risk": spec.risk.label(),
+                "category": category_for(spec.name),
+            })
+        })
+        .collect();
+    let count = tools.len();
+
+    json!({ "tools": tools, "count": count, "total": total })
+}
+
+/// First 90 characters of a summary, on a character boundary.
+fn short_summary(summary: &str) -> String {
+    summary.chars().take(90).collect()
+}
+
+/// Compact catalog for progressive disclosure: names, risk, category and a
+/// short sentence, but no input schemas. Pure helper shared by the tests.
+fn summary_tools(registry: &Registry, params: &Value) -> Value {
+    let category = param_filter(params, "category");
+    let limit = params
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(200)
+        .min(500) as usize;
+
+    let mut specs: Vec<&ToolSpec> = registry
+        .specs()
+        .into_iter()
+        .filter(|spec| {
+            category
+                .as_ref()
+                .map_or(true, |wanted| category_for(spec.name) == wanted.as_str())
+        })
+        .collect();
+    specs.sort_by_key(|spec| spec.name);
+
+    let total = specs.len();
+    let tools: Vec<Value> = specs
+        .into_iter()
         .take(limit)
         .map(|spec| {
             json!({
                 "name": spec.name,
-                "description": spec.summary,
-                "risk": spec.risk.label()
+                "risk": spec.risk.label(),
+                "category": category_for(spec.name),
+                "short": short_summary(spec.summary),
             })
         })
         .collect();
-    json!({ "tools": tools })
+    let count = tools.len();
+
+    json!({ "tools": tools, "count": count, "total": total })
 }
 
 fn tools_list(registry: &Registry) -> Value {
@@ -558,5 +729,132 @@ mod tests {
         assert!(snippet.contains("[mcp_servers.friday]"));
         assert!(snippet.contains("command = \""));
         assert!(snippet.contains("friday-mcp"));
+    }
+
+    // ---------------------------------------------------------------------
+    // tools/search + tools/summary
+    // ---------------------------------------------------------------------
+
+    use crate::policy::Risk;
+    use crate::registry::{Tool, ToolResult};
+
+    struct FakeTool {
+        spec: ToolSpec,
+    }
+
+    impl Tool for FakeTool {
+        fn spec(&self) -> &ToolSpec {
+            &self.spec
+        }
+
+        fn call(&self, _args: &Value, _ctx: &ToolCtx) -> ToolResult {
+            Ok(Value::Null)
+        }
+    }
+
+    fn fake(name: &'static str, summary: &'static str, risk: Risk) -> FakeTool {
+        FakeTool {
+            spec: ToolSpec {
+                name,
+                summary,
+                risk,
+                args: json!({ "type": "object", "properties": {} }),
+            },
+        }
+    }
+
+    fn sample_registry() -> Registry {
+        let mut registry = Registry::new();
+        for tool in [
+            fake("voice_say", "Fala um texto usando a voz do sistema.", Risk::ReadOnly),
+            fake("voice_list", "Lista as vozes disponíveis no macOS.", Risk::ReadOnly),
+            fake("voice_config", "Mostra a configuração de voz atual.", Risk::ReadOnly),
+            fake("say", "Fala um texto pela voz padrão.", Risk::Reversible),
+            fake("fs_read", "Lê um arquivo de texto.", Risk::ReadOnly),
+            fake("memory_save", "Guarda uma memória durável.", Risk::Reversible),
+        ] {
+            registry.add(tool);
+        }
+        registry
+    }
+
+    fn names(value: &Value) -> Vec<&str> {
+        value["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn search_ranks_an_exact_name_first() {
+        let result = search_tools(&sample_registry(), &json!({ "query": "voice_list" }));
+
+        assert_eq!(result["tools"][0]["name"], json!("voice_list"));
+        assert_eq!(result["count"], json!(1));
+        assert_eq!(result["total"], json!(1));
+    }
+
+    #[test]
+    fn search_is_accent_insensitive() {
+        let result = search_tools(&sample_registry(), &json!({ "query": "vóice_sáy" }));
+
+        assert_eq!(result["tools"][0]["name"], json!("voice_say"));
+        assert_eq!(result["tools"][0]["category"], json!("voice"));
+    }
+
+    #[test]
+    fn search_filters_by_category_and_risk() {
+        let result = search_tools(
+            &sample_registry(),
+            &json!({ "query": "voice", "category": "vóice", "risk": "read", "limit": 1 }),
+        );
+
+        assert_eq!(result["count"], json!(1));
+        assert_eq!(result["total"], json!(3));
+        assert_eq!(result["tools"][0]["category"], json!("voice"));
+    }
+
+    #[test]
+    fn summary_respects_category_and_limit() {
+        let result = summary_tools(&sample_registry(), &json!({ "category": "voice", "limit": 1 }));
+
+        assert_eq!(result["count"], json!(1));
+        assert_eq!(result["total"], json!(4));
+        let tool = &result["tools"][0];
+        assert_eq!(tool["category"], json!("voice"));
+        assert!(tool.get("inputSchema").is_none());
+        assert!(tool.get("description").is_none());
+        assert!(tool["short"].as_str().unwrap().chars().count() <= 90);
+    }
+
+    #[test]
+    fn tools_summary_is_framed_as_json_rpc() {
+        let response = answered(dispatch(
+            &sample_registry(),
+            r#"{"jsonrpc":"2.0","id":7,"method":"tools/summary","params":{"limit":2}}"#,
+        ));
+
+        assert_eq!(response["jsonrpc"], json!("2.0"));
+        assert_eq!(response["id"], json!(7));
+        assert_eq!(response["result"]["count"], json!(2));
+        assert_eq!(response["result"]["total"], json!(6));
+        assert!(response["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tool| tool.get("inputSchema").is_none()));
+    }
+
+    #[test]
+    fn search_tools_is_framed_as_json_rpc() {
+        let response = answered(dispatch(
+            &sample_registry(),
+            r#"{"jsonrpc":"2.0","id":"s1","method":"tools/search","params":{"query":"fs_read","limit":5}}"#,
+        ));
+
+        assert_eq!(response["id"], json!("s1"));
+        assert_eq!(names(&response["result"]), vec!["fs_read"]);
     }
 }

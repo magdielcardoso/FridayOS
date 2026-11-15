@@ -155,10 +155,36 @@ impl Tool for KnowledgeTool {
                     return Ok(json!({ "dry_run": true, "highlight": highlight }));
                 }
                 let _ = friday_brain::index_all();
+                // Prefer the native GPUI panel; fall back to the browser page.
+                let socket = std::env::var_os("HOME")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_default()
+                    .join("Library/Application Support/FridayOS/overlay.sock");
+                if socket.exists() {
+                    if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&socket) {
+                        use std::io::{BufRead, BufReader, Write};
+                        let payload = json!({ "action": "graph", "highlight": highlight });
+                        let mut line = payload.to_string();
+                        line.push('\n');
+                        if stream.write_all(line.as_bytes()).is_ok() {
+                            let mut reply = String::new();
+                            let _ = BufReader::new(stream).read_line(&mut reply);
+                            if reply.contains("\"ok\":true") {
+                                return Ok(json!({
+                                    "ok": true,
+                                    "native": true,
+                                    "highlighted": highlight,
+                                    "note": "grafo aberto na janela nativa da Friday"
+                                }));
+                            }
+                        }
+                    }
+                }
                 let path = friday_brain::open_panel(&highlight)
                     .map_err(|error| ToolError::failed(error.to_string()))?;
                 Ok(json!({
                     "ok": true,
+                    "native": false,
                     "panel": path.display().to_string(),
                     "highlighted": highlight,
                     "note": "painel aberto no navegador com o grafo interativo"

@@ -163,14 +163,15 @@ fn catalogo_tem_ferramentas_bem_formadas() {
 
 #[test]
 fn politica_de_risco_exige_confirmacao_apenas_quando_sensivel() {
+    std::env::set_var("FRIDAY_AUTONOMY", "standard");
     let path = temp_audit_path("policy");
     let ctx = ctx_at(&path);
 
     // ReadOnly nunca pede confirmacao.
-    assert!(policy::authorize(Risk::ReadOnly, &ctx).is_ok());
+    assert!(policy::authorize_tool("test", Risk::ReadOnly, &ctx).is_ok());
 
     // Sensitive nega sem confirmacao explicita...
-    let denied = policy::authorize(Risk::Sensitive, &ctx);
+    let denied = policy::authorize_tool("test", Risk::Sensitive, &ctx);
     assert!(
         matches!(denied, Err(ToolError::Denied(_))),
         "esperava Denied, veio {denied:?}"
@@ -178,10 +179,10 @@ fn politica_de_risco_exige_confirmacao_apenas_quando_sensivel() {
 
     // ...e libera com `confirmed`.
     let confirmed = ctx_at(&path).confirmed();
-    assert!(policy::authorize(Risk::Sensitive, &confirmed).is_ok());
+    assert!(policy::authorize_tool("test", Risk::Sensitive, &confirmed).is_ok());
 
     // Reversible fica na fronteira: nao pede confirmacao.
-    assert!(policy::authorize(Risk::Reversible, &ctx).is_ok());
+    assert!(policy::authorize_tool("test", Risk::Reversible, &ctx).is_ok());
 
     // Nenhuma dessas chamadas deve gerar auditoria (authorize nao audita).
     assert!(!path.exists(), "authorize nao deveria escrever auditoria");
