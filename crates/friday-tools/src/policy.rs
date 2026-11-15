@@ -41,5 +41,5 @@ pub fn authorize(risk: Risk, ctx: &ToolCtx) -> ToolResult {
             risk.label()
         )));
     }
-    Ok(())
+    Ok(serde_json::Value::Null)
 }
