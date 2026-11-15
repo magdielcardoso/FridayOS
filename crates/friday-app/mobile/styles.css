@@ -20,9 +20,10 @@ body {
   user-select:none; -webkit-user-select:none;
 }
 header {
-  height:var(--header); flex:0 0 var(--header);
+  height:calc(var(--header) + env(safe-area-inset-top));
+  flex:0 0 calc(var(--header) + env(safe-area-inset-top));
   display:flex; align-items:center; justify-content:space-between;
-  padding:0 var(--s2);
+  padding:env(safe-area-inset-top) var(--s2) 0;
   border-bottom:1px solid var(--faint);
 }
 .brand { font-size:12px; line-height:16px; letter-spacing:.35em; }
@@ -82,7 +83,7 @@ button.primary { border-color:var(--red); }
 button.rec { color:var(--bone); border-color:var(--red); background:#1a0505; }
 
 .pair {
-  position:fixed; inset:var(--header) 0 0 0;
+  position:fixed; inset:calc(var(--header) + env(safe-area-inset-top)) 0 0 0;
   background:var(--bg); z-index:10;
   padding:var(--s3);
   display:flex; flex-direction:column; gap:var(--s2);

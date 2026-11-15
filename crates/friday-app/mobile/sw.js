@@ -1,4 +1,4 @@
-const CACHE = 'friday-shell-v1';
+const CACHE = 'friday-shell-v2';
 const SHELL = ['/', '/styles.css', '/app.js', '/manifest.webmanifest', '/icons/icon-192.png'];
 
 self.addEventListener('install', event => {
