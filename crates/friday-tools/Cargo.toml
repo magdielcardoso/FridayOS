@@ -1,0 +1,13 @@
+[package]
+name = "friday-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "FridayOS tool layer: macOS perception/action tools, policy and audit"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+cpal = "0.16"
