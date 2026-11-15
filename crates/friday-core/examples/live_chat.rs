@@ -1,0 +1,52 @@
+//! Smoke test for the Codex subscription chat path:
+//! `cargo run -p friday-core --example live_chat -- "diga ok"`
+
+use std::time::Duration;
+
+use friday_core::codex::{Codex, CodexConfig, CodexEvent};
+
+#[tokio::main]
+async fn main() {
+    let prompt = std::env::args().nth(1).unwrap_or_else(|| "Responda apenas: online.".into());
+    let config = CodexConfig {
+        developer_instructions: Some("Responda em português, em no máximo duas frases.".into()),
+        effort: Some("low".into()),
+        ..CodexConfig::default()
+    };
+    let mut codex = Codex::spawn(config);
+    let mut events = codex.take_events().expect("events");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    codex.prompt(prompt);
+
+    loop {
+        let timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(timeout, events.recv()).await {
+            Ok(Some(CodexEvent::Online { thread_id })) => {
+                println!("[online thread={thread_id}]");
+            }
+            Ok(Some(CodexEvent::Delta(text))) => {
+                print!("{text}");
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+            }
+            Ok(Some(CodexEvent::Reasoning(_))) => {}
+            Ok(Some(CodexEvent::Done { status })) => {
+                println!("\n[done {status}]");
+                break;
+            }
+            Ok(Some(CodexEvent::Error(error))) => {
+                eprintln!("\n[error] {error}");
+                std::process::exit(1);
+            }
+            Ok(None) => {
+                eprintln!("[events closed]");
+                std::process::exit(1);
+            }
+            Err(_) => {
+                eprintln!("[timeout]");
+                std::process::exit(1);
+            }
+        }
+    }
+}
