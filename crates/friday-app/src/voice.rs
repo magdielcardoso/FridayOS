@@ -246,14 +246,23 @@ fn block_tts(seconds: u64) {
 /// cost nothing.
 static TTS_CACHE: Mutex<Option<std::collections::HashMap<String, PathBuf>>> = Mutex::new(None);
 
+fn cache_key(text: &str) -> String {
+    let voice = std::env::var("FRIDAY_VOICE")
+        .ok()
+        .or_else(friday_core::tts::configured_voice)
+        .unwrap_or_else(|| friday_core::tts::DEFAULT_VOICE.to_string());
+    format!("{voice}\u{1}{text}")
+}
+
 fn cache_lookup(text: &str) -> Option<PathBuf> {
     let mut guard = TTS_CACHE.lock().ok()?;
     let cache = guard.get_or_insert_with(std::collections::HashMap::new);
-    let path = cache.get(text)?.clone();
+    let key = cache_key(text);
+    let path = cache.get(&key)?.clone();
     if path.is_file() {
         Some(path)
     } else {
-        cache.remove(text);
+        cache.remove(&key);
         None
     }
 }
@@ -264,7 +273,7 @@ fn cache_store(text: &str, path: &Path) {
         if cache.len() >= 24 {
             cache.clear();
         }
-        cache.insert(text.to_string(), path.to_path_buf());
+        cache.insert(cache_key(text), path.to_path_buf());
     }
 }
 

@@ -10,6 +10,7 @@ pub mod net;
 pub mod screen;
 pub mod shell;
 pub mod voice;
+pub mod voice_prefs;
 
 use crate::registry::Registry;
 
@@ -25,4 +26,5 @@ pub fn register_all(registry: &mut Registry) {
     files::register(registry);
     net::register(registry);
     voice::register(registry);
+    voice_prefs::register(registry);
 }

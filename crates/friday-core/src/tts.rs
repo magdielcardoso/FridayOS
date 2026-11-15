@@ -71,6 +71,7 @@ async fn try_synthesize(
     let voice = voice
         .map(str::to_owned)
         .or_else(|| std::env::var("FRIDAY_VOICE").ok())
+        .or_else(configured_voice)
         .unwrap_or_else(|| DEFAULT_VOICE.to_string());
     let language = language
         .map(str::to_owned)
@@ -138,6 +139,36 @@ async fn try_synthesize(
     }
 
     decode_audio(&bytes, &content_type)
+}
+
+/// Voice chosen by the agent through the `voice_set` tool.
+pub fn configured_voice() -> Option<String> {
+    let home = std::env::var_os("HOME")?;
+    let path = std::path::PathBuf::from(home)
+        .join("Library/Application Support/FridayOS/voice.json");
+    let raw = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    value
+        .get("voice")
+        .and_then(|voice| voice.as_str())
+        .map(str::to_string)
+}
+
+/// Persists the voice for every future synthesis.
+pub fn set_configured_voice(voice: &str, language: Option<&str>) -> std::io::Result<()> {
+    let home = std::env::var_os("HOME").unwrap_or_default();
+    let dir = std::path::PathBuf::from(home).join("Library/Application Support/FridayOS");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("voice.json");
+    let mut value: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    value["voice"] = serde_json::json!(voice);
+    if let Some(language) = language {
+        value["language"] = serde_json::json!(language);
+    }
+    std::fs::write(path, serde_json::to_vec_pretty(&value)?)
 }
 
 fn normalize(text: &str) -> String {

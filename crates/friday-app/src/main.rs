@@ -1393,6 +1393,19 @@ fn main() {
         println!("{}", persona());
         return;
     }
+    if let Some(index) = std::env::args().position(|arg| arg == "--say-voice") {
+        let voice = std::env::args().nth(index + 1).unwrap_or_else(|| "viola".into());
+        let text = std::env::args()
+            .nth(index + 2)
+            .unwrap_or_else(|| "Bom dia, senhor.".into());
+        std::env::set_var("FRIDAY_VOICE", &voice);
+        let cancel = Arc::new(AtomicBool::new(false));
+        match voice::speak(&text, &cancel) {
+            Ok(()) => println!("voz {voice}: ok"),
+            Err(error) => eprintln!("voz {voice}: {error}"),
+        }
+        return;
+    }
     if let Some(index) = std::env::args().position(|arg| arg == "--say-stream") {
         let text = std::env::args().nth(index + 1).unwrap_or_else(|| "Teste. Um, dois, três.".into());
         let (tx, rx) = std::sync::mpsc::channel::<String>();
