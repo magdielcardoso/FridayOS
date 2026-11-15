@@ -1894,7 +1894,9 @@ name = "friday-app"
 version = "0.1.0"
 dependencies = [
  "friday-core",
+ "friday-tools",
  "gpui",
+ "serde_json",
  "tokio",
 ]
 
@@ -1917,6 +1919,7 @@ dependencies = [
 name = "friday-tools"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "cpal",
  "serde",
  "serde_json",

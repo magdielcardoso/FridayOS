@@ -31,9 +31,10 @@ pub enum TtsError {
 
 type Result<T> = std::result::Result<T, TtsError>;
 
-/// Default voice. ChatGPT read-aloud accepts a `voice` name; "viola" is the
-/// Brazilian-Portuguese voice used by Friday.
-pub const DEFAULT_VOICE: &str = "viola";
+/// Empty means "whatever voice the account has selected in ChatGPT". The
+/// read-aloud endpoint ignores unknown names, so sending none is the only
+/// reliable behaviour.
+pub const DEFAULT_VOICE: &str = "";
 pub const DEFAULT_LANGUAGE: &str = "pt-BR";
 
 /// Synthesizes `text` and returns decoded PCM ready for playback.
@@ -78,10 +79,13 @@ async fn try_synthesize(
         .or_else(|| std::env::var("FRIDAY_TTS_LANGUAGE").ok())
         .unwrap_or_else(|| DEFAULT_LANGUAGE.to_string());
 
+    let mut body = serde_json::json!({ "text": text, "language": language });
+    if !voice.is_empty() {
+        body["voice"] = serde_json::json!(voice);
+    }
+
     let request = backend_headers(
-        reqwest::Client::new().post(READ_ALOUD_URL).json(
-            &serde_json::json!({ "text": text, "voice": voice, "language": language }),
-        ),
+        reqwest::Client::new().post(READ_ALOUD_URL).json(&body),
         &session,
     )
     .header("Accept", "audio/*")
@@ -226,4 +230,29 @@ fn extension(content_type: &str) -> &'static str {
     } else {
         "aac"
     }
+}
+
+/// Reads the voices the account can actually use, plus which one is selected.
+pub async fn voices(auth: &CodexAuth) -> Result<serde_json::Value> {
+    let session = auth.session().await?;
+    let response = backend_headers(
+        reqwest::Client::new()
+            .get("https://chatgpt.com/backend-api/settings/voices"),
+        &session,
+    )
+    .header("Accept", "application/json")
+    .timeout(Duration::from_secs(15))
+    .send()
+    .await
+    .map_err(|e| TtsError::Failed(e.to_string()))?;
+    if !response.status().is_success() {
+        return Err(TtsError::Failed(format!(
+            "HTTP {}",
+            response.status().as_u16()
+        )));
+    }
+    response
+        .json()
+        .await
+        .map_err(|e| TtsError::Failed(e.to_string()))
 }

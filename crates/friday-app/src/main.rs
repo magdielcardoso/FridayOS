@@ -1393,6 +1393,21 @@ fn main() {
         println!("{}", persona());
         return;
     }
+    if std::env::args().any(|arg| arg == "--voices") {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let result = runtime.block_on(async {
+            let auth = friday_core::auth::CodexAuth::discover();
+            friday_core::tts::voices(&auth).await
+        });
+        match result {
+            Ok(value) => println!("{}", serde_json::to_string(&value).unwrap_or_default()),
+            Err(error) => eprintln!("{error}"),
+        }
+        return;
+    }
     if let Some(index) = std::env::args().position(|arg| arg == "--say-voice") {
         let voice = std::env::args().nth(index + 1).unwrap_or_else(|| "viola".into());
         let text = std::env::args()
