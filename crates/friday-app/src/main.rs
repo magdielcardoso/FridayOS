@@ -206,7 +206,7 @@ impl FridayApp {
     fn spawn_mic_poll(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| loop {
             cx.background_executor()
-                .timer(Duration::from_millis(120))
+                .timer(Duration::from_millis(40))
                 .await;
             let events = this.update(cx, |app, _| {
                 app.mic
@@ -582,11 +582,11 @@ impl FridayApp {
         // Caret / presence blink.
         cx.spawn(async move |this, cx| loop {
             cx.background_executor()
-                .timer(Duration::from_millis(120))
+                .timer(Duration::from_millis(40))
                 .await;
             let _ = this.update(cx, |app, cx| {
                 app.tick = app.tick.wrapping_add(1);
-                app.blink = (app.tick / 7) % 2 == 0;
+                app.blink = (app.tick / 12) % 2 == 0;
                 cx.notify();
             });
         })
