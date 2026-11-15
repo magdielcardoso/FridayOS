@@ -154,9 +154,19 @@ impl FridayApp {
             mic.set_speaking(false);
         }
         self.voice_phase = voice::VoicePhase::Listening;
+        cx.notify();
+    }
+
+    fn stop_listening(&mut self, cx: &mut Context<Self>) {
+        self.stop_speech_now();
+        if let Some(mut mic) = self.mic.take() {
+            mic.stop();
+        }
+        self.voice_phase = voice::VoicePhase::Idle;
+        self.level = 0.0;
         self.messages.push(Line {
             role: Role::System,
-            text: "ouvindo…".into(),
+            text: "microfone fechado".into(),
         });
         self.scroll.scroll_to_bottom();
         cx.notify();
@@ -605,7 +615,13 @@ impl FridayApp {
             "escape" => {
                 self.interrupt(cx);
             }
-            "f2" => self.start_listen(cx),
+            "f2" => {
+                if self.mic.is_some() && self.voice_phase != voice::VoicePhase::Idle {
+                    self.stop_listening(cx);
+                } else {
+                    self.start_listen(cx);
+                }
+            }
             "f3" => self.toggle_wake(cx),
             "space" => {
                 if !modifiers.control {
