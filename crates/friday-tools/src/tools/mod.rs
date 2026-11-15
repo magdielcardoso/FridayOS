@@ -1,6 +1,7 @@
 //! Tool modules, grouped by the macOS surface they touch.
 
 pub mod apps;
+pub mod audio;
 pub mod ax;
 pub mod files;
 pub mod input;
@@ -16,6 +17,7 @@ pub fn register_all(registry: &mut Registry) {
     ax::register(registry);
     input::register(registry);
     apps::register(registry);
+    audio::register(registry);
     shell::register(registry);
     screen::register(registry);
     files::register(registry);

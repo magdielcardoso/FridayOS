@@ -511,6 +511,38 @@ impl FridayApp {
         })
         .detach();
 
+        // Report (and optionally force) the audio output, so "she does not
+        // speak" is never a mystery again.
+        Self::blocking(
+            cx,
+            || {
+                let current = friday_tools::swift::run("audio", &["current"]).ok();
+                if let Ok(device) = std::env::var("FRIDAY_OUTPUT_DEVICE") {
+                    let _ = friday_tools::swift::run("audio", &["set", &device]);
+                    return friday_tools::swift::run("audio", &["current"]).ok();
+                }
+                current
+            },
+            |app, raw, cx| {
+                let name = raw
+                    .as_deref()
+                    .and_then(|text| serde_json::from_str::<serde_json::Value>(text.trim()).ok())
+                    .and_then(|value| {
+                        value
+                            .get("name")
+                            .and_then(|name| name.as_str())
+                            .map(str::to_owned)
+                    })
+                    .unwrap_or_else(|| "desconhecida".into());
+                log(format!("áudio: saída atual {name}"));
+                app.messages.push(Line {
+                    role: Role::System,
+                    text: format!("saída de áudio: {name}"),
+                });
+                cx.notify();
+            },
+        );
+
         // Watchdog: never stay "speaking" forever because of a stuck TTS.
         cx.spawn(async move |this, cx| loop {
             cx.background_executor()
