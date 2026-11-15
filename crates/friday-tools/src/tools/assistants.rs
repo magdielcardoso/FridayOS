@@ -57,6 +57,126 @@ fn login_path() -> String {
         .unwrap_or_else(|| "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin".into())
 }
 
+/// Public path of the live activity feed the HUD tails while an assistant runs.
+pub fn live_path(name: &str) -> PathBuf {
+    dir().join(format!("{}.live.jsonl", slug(name)))
+}
+
+fn live_append(path: &PathBuf, kind: &str, text: &str) {
+    use std::io::Write;
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        return;
+    };
+    let record = json!({
+        "ts": now_secs(),
+        "kind": kind,
+        "text": text.chars().take(4000).collect::<String>(),
+    });
+    let _ = writeln!(file, "{record}");
+}
+
+/// Turns one `codex exec --json` event into a short human-readable line.
+fn summarize_event(event: &Value) -> Option<(String, String)> {
+    let ty = event.get("type")?.as_str()?;
+    match ty {
+        "thread.started" => Some(("status".into(), "sessão iniciada".into())),
+        "turn.started" => Some(("status".into(), "pensando…".into())),
+        "error" => Some((
+            "error".into(),
+            event
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("erro")
+                .to_string(),
+        )),
+        "item.started" | "item.completed" => {
+            let item = event.get("item")?;
+            let completed = ty == "item.completed";
+            let kind = item.get("type").and_then(Value::as_str)?;
+            match kind {
+                "command_execution" => {
+                    let command = item
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .unwrap_or("comando")
+                        .to_string();
+                    if !completed {
+                        return Some(("command".into(), command));
+                    }
+                    let code = item.get("exit_code").and_then(Value::as_i64);
+                    let output = item
+                        .get("aggregated_output")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    let preview: String = output.chars().take(700).collect();
+                    Some((
+                        if code.unwrap_or(0) == 0 { "output" } else { "error" }.into(),
+                        format!("{command} → saiu {code:?}\n{preview}"),
+                    ))
+                }
+                "file_change" => {
+                    let changes = item
+                        .get("changes")
+                        .and_then(Value::as_array)
+                        .map(|list| {
+                            list.iter()
+                                .filter_map(|change| {
+                                    let path = change.get("path").and_then(Value::as_str)?;
+                                    let kind = change.get("kind").and_then(Value::as_str).unwrap_or("edita");
+                                    Some(format!("{kind} {path}"))
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        })
+                        .unwrap_or_default();
+                    Some((
+                        if completed { "file" } else { "status" }.into(),
+                        if changes.is_empty() {
+                            if completed { "arquivos atualizados".into() } else { "editando arquivos…".into() }
+                        } else {
+                            changes
+                        },
+                    ))
+                }
+                "mcp_tool_call" => {
+                    let server = item.get("server").and_then(Value::as_str).unwrap_or("?");
+                    let tool = item.get("tool").and_then(Value::as_str).unwrap_or("ferramenta");
+                    let status = item.get("status").and_then(Value::as_str).unwrap_or("");
+                    Some((
+                        "tool".into(),
+                        format!("{server}::{tool} {status}").trim().to_string(),
+                    ))
+                }
+                "agent_message" => {
+                    if completed {
+                        let text = item.get("text").and_then(Value::as_str).unwrap_or("");
+                        (!text.trim().is_empty()).then(|| ("message".into(), text.to_string()))
+                    } else {
+                        None
+                    }
+                }
+                "reasoning" => {
+                    let text = item
+                        .get("text")
+                        .or_else(|| item.get("summary").and_then(|s| s.as_array()).and_then(|a| a.first()))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    (!text.trim().is_empty() && completed).then(|| ("think".into(), text.to_string()))
+                }
+                other => completed.then(|| ("status".into(), format!("{other} concluído"))),
+            }
+        }
+        "turn.completed" => Some(("status".into(), "turno concluído".into())),
+        _ => None,
+    }
+}
+
 fn delegate(assistant: &Value, task: &str, timeout_secs: u64) -> Result<String, ToolError> {
     let binary = codex_binary().ok_or_else(|| ToolError::failed("CLI do Codex não encontrado"))?;
     let name = assistant.get("name").and_then(|v| v.as_str()).unwrap_or("assistente");
@@ -70,12 +190,19 @@ fn delegate(assistant: &Value, task: &str, timeout_secs: u64) -> Result<String, 
          Responda de forma objetiva e completa, em português."
     );
 
+    // The HUD watches this file to show what the subagent is doing live.
+    let live = live_path(name);
+    let _ = std::fs::create_dir_all(dir());
+    let _ = std::fs::write(&live, "");
+    live_append(&live, "task", task);
+    live_append(&live, "status", "iniciando o Codex…");
+
     let out = std::env::temp_dir().join(format!("friday-assistant-{}.txt", std::process::id()));
     let _ = std::fs::remove_file(&out);
     let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
     let mut command = Command::new(binary);
     command
-        .args(["exec", "--skip-git-repo-check", "-C", &home, "-o"])
+        .args(["exec", "--json", "--skip-git-repo-check", "-C", &home, "-o"])
         .arg(&out)
         .args([
             "-c",
@@ -86,7 +213,7 @@ fn delegate(assistant: &Value, task: &str, timeout_secs: u64) -> Result<String, 
         .arg(&prompt)
         .env("PATH", login_path())
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null());
     if let Ok(codex_home) = std::env::var("CODEX_HOME") {
         command.env("CODEX_HOME", codex_home);
@@ -94,26 +221,54 @@ fn delegate(assistant: &Value, task: &str, timeout_secs: u64) -> Result<String, 
 
     let mut child = command
         .spawn()
-        .map_err(|error| ToolError::failed(format!("codex exec: {error}")))?;
+        .map_err(|error| {
+            live_append(&live, "error", &format!("codex exec: {error}"));
+            ToolError::failed(format!("codex exec: {error}"))
+        })?;
+
+    let mut reader = child.stdout.take().map(|stdout| {
+        let live = live.clone();
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader};
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                let Ok(event) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                if let Some((kind, text)) = summarize_event(&event) {
+                    live_append(&live, &kind, &text);
+                }
+            }
+        })
+    });
+
     let deadline = Instant::now() + Duration::from_secs(timeout_secs.clamp(30, 600));
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
+                if let Some(handle) = reader.take() {
+                    let _ = handle.join();
+                }
                 let answer = std::fs::read_to_string(&out).unwrap_or_default();
                 let _ = std::fs::remove_file(&out);
                 if answer.trim().is_empty() {
+                    live_append(&live, "error", &format!("terminou sem resposta ({status})"));
                     return Err(ToolError::failed(format!(
                         "o assistente terminou sem resposta ({status})"
                     )));
                 }
+                live_append(&live, "done", "tarefa concluída");
                 return Ok(answer.trim().to_string());
             }
             Ok(None) => {}
-            Err(error) => return Err(ToolError::failed(error.to_string())),
+            Err(error) => {
+                live_append(&live, "error", &error.to_string());
+                return Err(ToolError::failed(error.to_string()));
+            }
         }
         if Instant::now() > deadline {
             let _ = child.kill();
             let _ = child.wait();
+            live_append(&live, "error", "tempo esgotado");
             return Err(ToolError::failed("o assistente demorou demais"));
         }
         std::thread::sleep(Duration::from_millis(250));

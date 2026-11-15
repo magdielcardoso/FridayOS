@@ -397,6 +397,11 @@ struct FridayApp {
     last_answer: String,
     assistant_selected: Option<String>,
     assistant_busy: bool,
+    agent_view: Option<String>,
+    agent_log: Vec<(String, String)>,
+    agent_offset: u64,
+    agent_running: bool,
+    agent_status: Vec<(String, bool)>,
     tasks_hidden: bool,
     agents_hidden: bool,
     warming: bool,
@@ -455,6 +460,11 @@ impl FridayApp {
             last_answer: String::new(),
             assistant_selected: None,
             assistant_busy: false,
+            agent_view: None,
+            agent_log: Vec::new(),
+            agent_offset: 0,
+            agent_running: false,
+            agent_status: Vec::new(),
             tasks_hidden: false,
             agents_hidden: false,
             warming: false,
@@ -947,6 +957,14 @@ impl FridayApp {
                 app.blink = (app.tick / 12) % 2 == 0;
                 if app.tick % 50 == 0 {
                     app.assistants = load_assistants();
+                    app.agent_status = app
+                        .assistants
+                        .iter()
+                        .map(|(name, _)| (name.clone(), assistant_running(name)))
+                        .collect();
+                }
+                if app.agent_view.is_some() && app.tick % 4 == 0 {
+                    app.poll_agent_log();
                 }
                 if app
                     .highlight_until
@@ -1363,6 +1381,69 @@ impl FridayApp {
                 cx.notify();
             },
         );
+    }
+
+    /// Opens the live activity monitor for one subagent.
+    fn open_agent_view(&mut self, name: String, cx: &mut Context<Self>) {
+        log(format!("agents: monitor aberto para {name}"));
+        self.agent_view = Some(name);
+        self.agent_log.clear();
+        self.agent_offset = 0;
+        self.poll_agent_log();
+        cx.notify();
+    }
+
+    /// Reads whatever the running assistant appended since the last poll.
+    fn poll_agent_log(&mut self) {
+        let Some(name) = self.agent_view.clone() else {
+            return;
+        };
+        let path = assistant_live_file(&name);
+        let Ok(mut file) = std::fs::File::open(&path) else {
+            return;
+        };
+        use std::io::{Read, Seek, SeekFrom};
+        if file
+            .metadata()
+            .map(|meta| meta.len() < self.agent_offset)
+            .unwrap_or(false)
+        {
+            self.agent_log.clear();
+            self.agent_offset = 0;
+        }
+        if file.seek(SeekFrom::Start(self.agent_offset)).is_err() {
+            return;
+        }
+        let mut buffer = String::new();
+        if file.read_to_string(&mut buffer).is_err() {
+            return;
+        }
+        self.agent_offset += buffer.len() as u64;
+        for line in buffer.lines() {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let kind = value
+                .get("kind")
+                .and_then(|kind| kind.as_str())
+                .unwrap_or("status")
+                .to_string();
+            let text = value
+                .get("text")
+                .and_then(|text| text.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if text.is_empty() {
+                continue;
+            }
+            self.agent_running = kind != "done" && kind != "error";
+            self.agent_log.push((kind, text));
+        }
+        if self.agent_log.len() > 200 {
+            let excess = self.agent_log.len() - 200;
+            self.agent_log.drain(0..excess);
+        }
     }
 
     fn push_activity(&mut self, label: impl Into<String>, state: StepState) {
@@ -1988,6 +2069,12 @@ impl Render for FridayApp {
                     );
                 for (name, role) in self.assistants.iter().take(6) {
                     let target = name.clone();
+                    let running = self
+                        .agent_status
+                        .iter()
+                        .find(|(assistant, _)| assistant == name)
+                        .map(|(_, running)| *running)
+                        .unwrap_or(false);
                     let role_short: String = if role.chars().count() > 18 {
                         let mut short: String = role.chars().take(17).collect();
                         short.push('…');
@@ -2008,18 +2095,19 @@ impl Render for FridayApp {
                             .hover(|style| style.bg(rgba(0x1a0505ff)))
                             .on_mouse_down(
                                 gpui::MouseButton::Left,
-                                cx.listener(move |this, _, window, cx| {
-                                    this.assistant_selected = Some(target.clone());
-                                    this.input.clear();
-                                    window.focus(&this.focus);
-                                    cx.notify();
+                                cx.listener(move |this, _, _window, cx| {
+                                    this.open_agent_view(target.clone(), cx);
                                 }),
                             )
                             .child(
                                 div()
                                     .text_size(sx(11.0))
-                                    .text_color(rgb(0xff1738))
-                                    .child(SharedString::from(format!("◇ {name}"))),
+                                    .text_color(rgb(if running { 0xff5566 } else { 0xff1738 }))
+                                    .child(SharedString::from(if running {
+                                        format!("● {name}")
+                                    } else {
+                                        format!("◇ {name}")
+                                    })),
                             )
                             .child(
                                 div()
@@ -2032,6 +2120,173 @@ impl Render for FridayApp {
                             ),
                     );
                 }
+                root.child(panel)
+            })
+            // Live subagent monitor: what the assistant is doing right now.
+            .when(self.agent_view.is_some(), |root| {
+                let name = self.agent_view.clone().unwrap_or_default();
+                let running = self.agent_running;
+                let entries: Vec<(String, String)> = self
+                    .agent_log
+                    .iter()
+                    .rev()
+                    .take(24)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+
+                let mut log = div()
+                    .flex()
+                    .flex_col()
+                    .gap(sx(4.0))
+                    .overflow_hidden();
+                if entries.is_empty() {
+                    log = log.child(
+                        div()
+                            .text_size(sx(10.0))
+                            .text_color(rgb(0x6a1414))
+                            .child(SharedString::from(
+                                "nenhuma atividade ainda · delegue uma tarefa a este subagente",
+                            )),
+                    );
+                }
+                for (kind, text) in entries {
+                    let (label, color) = match kind.as_str() {
+                        "task" => ("▶", 0xff3448u32),
+                        "command" => ("$", 0xff6b7c),
+                        "output" => ("»", 0x8a2a2a),
+                        "file" => ("▸", 0xffa0a8),
+                        "tool" => ("⚙", 0xff7788),
+                        "message" => ("◆", 0xffd6d8),
+                        "think" => ("…", 0x7a1a1a),
+                        "error" => ("⚠", 0xff1738),
+                        "done" => ("■", 0xff3448),
+                        _ => ("·", 0x6a1414),
+                    };
+                    let body_color = match kind.as_str() {
+                        "message" => 0xd8a0a4u32,
+                        "error" => 0xff5566,
+                        "done" => 0xff5566,
+                        "think" => 0x7a2424,
+                        _ => 0x9a3a3a,
+                    };
+                    log = log.child(
+                        div()
+                            .flex()
+                            .items_start()
+                            .gap(sx(7.0))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .w(sx(12.0))
+                                    .text_size(sx(9.5))
+                                    .text_color(rgb(color))
+                                    .child(SharedString::from(label)),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_size(sx(10.0))
+                                    .text_color(rgb(body_color))
+                                    .child(SharedString::from(text)),
+                            ),
+                    );
+                }
+
+                let target = name.clone();
+                let panel = div()
+                    .absolute()
+                    .right(lx(24.0))
+                    .bottom(ly(310.0))
+                    .w(sx(470.0))
+                    .max_h(ly(520.0))
+                    .flex()
+                    .flex_col()
+                    .gap(sx(10.0))
+                    .p(sx(14.0))
+                    .overflow_hidden()
+                    .border_1()
+                    .border_color(rgb(if running { 0x6a1018 } else { 0x3b0d0d }))
+                    .rounded(sx(10.0))
+                    .bg(rgba(0x080608f5))
+                    .child(
+                        div()
+                            .flex()
+                            .justify_between()
+                            .items_center()
+                            .gap(sx(10.0))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(sx(7.0))
+                                    .text_size(sx(10.0))
+                                    .text_color(rgb(if running { 0xff5566 } else { 0x8a1c1c }))
+                                    .child(SharedString::from(if running {
+                                        format!("● {name} · AO VIVO")
+                                    } else {
+                                        format!("◇ {name} · parado")
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(sx(10.0))
+                                    .child(
+                                        div()
+                                            .id("agent-delegate")
+                                            .cursor_pointer()
+                                            .px(sx(5.0))
+                                            .rounded(sx(4.0))
+                                            .hover(|style| style.bg(rgba(0x2a0505ff)))
+                                            .text_size(sx(11.0))
+                                            .text_color(rgb(0xff3448))
+                                            .child(SharedString::from("✎"))
+                                            .on_mouse_down(
+                                                gpui::MouseButton::Left,
+                                                cx.listener(move |this, _, window, cx| {
+                                                    this.assistant_selected = Some(target.clone());
+                                                    this.input.clear();
+                                                    window.focus(&this.focus);
+                                                    cx.notify();
+                                                }),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("agent-monitor-close")
+                                            .cursor_pointer()
+                                            .px(sx(5.0))
+                                            .rounded(sx(4.0))
+                                            .hover(|style| style.bg(rgba(0x2a0505ff)))
+                                            .text_size(sx(12.0))
+                                            .text_color(rgb(0xff3448))
+                                            .child(SharedString::from("×"))
+                                            .on_mouse_down(
+                                                gpui::MouseButton::Left,
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.agent_view = None;
+                                                    this.agent_log.clear();
+                                                    this.agent_offset = 0;
+                                                    cx.notify();
+                                                }),
+                                            ),
+                                    ),
+                            ),
+                    )
+                    .child(log)
+                    .child(
+                        div()
+                            .text_size(sx(8.5))
+                            .text_color(rgb(0x5e1414))
+                            .child(SharedString::from(format!(
+                                "{} eventos · ✎ delega tarefa · atualiza em tempo real",
+                                self.agent_log.len()
+                            ))),
+                    );
                 root.child(panel)
             })
             // Orb
@@ -2337,6 +2592,45 @@ fn paint_line(
 }
 
 /// Permanent assistants created through the MCP tools, shown in the HUD.
+fn assistant_slug(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "assistente".into()
+    } else {
+        trimmed
+    }
+}
+
+fn assistant_live_file(name: &str) -> std::path::PathBuf {
+    let home = std::env::var_os("HOME").unwrap_or_default();
+    std::path::PathBuf::from(home)
+        .join("Library/Application Support/FridayOS/assistants")
+        .join(format!("{}.live.jsonl", assistant_slug(name)))
+}
+
+/// True when the assistant's last live record is neither `done` nor `error`.
+fn assistant_running(name: &str) -> bool {
+    let Ok(raw) = std::fs::read_to_string(assistant_live_file(name)) else {
+        return false;
+    };
+    raw.lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find_map(|value| value.get("kind").and_then(|kind| kind.as_str()).map(str::to_string))
+        .map(|kind| kind != "done" && kind != "error")
+        .unwrap_or(false)
+}
+
 fn load_assistants() -> Vec<(String, String)> {
     let home = std::env::var_os("HOME").unwrap_or_default();
     let dir = std::path::PathBuf::from(home)
