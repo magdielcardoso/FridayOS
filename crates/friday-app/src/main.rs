@@ -366,14 +366,14 @@ impl FridayApp {
 
     /// Streams finished sentences to the speaker while the model is still talking.
     fn feed_speech(&mut self, delta: &str, cx: &mut Context<Self>) {
-        if self.speech_tx.is_none() {
-            self.begin_speech(cx);
-        }
         self.speech_pending.push_str(delta);
         if !self.tts_stream {
             // Single-request mode: one TTS call per answer keeps us inside
             // ChatGPT's hourly read-aloud quota.
             return;
+        }
+        if self.speech_tx.is_none() {
+            self.begin_speech(cx);
         }
         let sentences = take_sentences(&mut self.speech_pending);
         if let Some(tx) = self.speech_tx.as_ref() {

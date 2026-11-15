@@ -29,6 +29,56 @@ fn active_name() -> Option<String> {
     }
 }
 
+fn account_identity(path: &Path) -> Option<(String, Option<String>)> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    let token = value.get("tokens")?.get("id_token")?.as_str()?;
+    let payload = token.split('.').nth(1)?;
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let claims: Value = serde_json::from_slice(&bytes).ok()?;
+    let auth = claims.get("https://api.openai.com/auth");
+    let account = auth
+        .and_then(|auth| auth.get("chatgpt_account_id"))
+        .and_then(|id| id.as_str())?
+        .to_string();
+    let plan = auth
+        .and_then(|auth| auth.get("chatgpt_plan_type"))
+        .and_then(|plan| plan.as_str())
+        .map(str::to_string);
+    Some((account, plan))
+}
+
+/// Other profiles (including the original ~/.codex login) that point at the
+/// same ChatGPT account. Two logins of the same account share the voice quota.
+fn duplicate_of(account: &str, exclude: &str) -> Option<String> {
+    let mut profiles: Vec<(String, PathBuf)> = Vec::new();
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    profiles.push(("default".to_string(), home.join(".codex/auth.json")));
+    if let Ok(entries) = std::fs::read_dir(accounts_dir()) {
+        for entry in entries.filter_map(|entry| entry.ok()) {
+            let name = entry.file_name().to_string_lossy().to_string();
+            profiles.push((name, entry.path().join("auth.json")));
+        }
+    }
+    for (name, path) in profiles {
+        if name == exclude || !path.is_file() {
+            continue;
+        }
+        if account_identity(&path).map(|(id, _)| id).as_deref() == Some(account) {
+            return Some(name);
+        }
+    }
+    None
+}
+
+fn reset_voice_budget() {
+    let path = data_dir().join("tts-usage.json");
+    let _ = std::fs::write(&path, "{\"requests\":[],\"blocked_until\":0}");
+}
+
 fn slug(name: &str) -> String {
     let cleaned: String = name
         .chars()
@@ -117,6 +167,8 @@ fn activate(name: &str) -> Result<PathBuf, ToolError> {
     let dir = accounts_dir();
     std::fs::create_dir_all(&dir).map_err(|e| ToolError::failed(e.to_string()))?;
     std::fs::write(dir.join("active"), &slug).map_err(|e| ToolError::failed(e.to_string()))?;
+    // A new account means a new hourly voice quota.
+    reset_voice_budget();
 
     let isolated = data_dir().join("codex/auth.json");
     if let Some(parent) = isolated.parent() {
@@ -236,7 +288,13 @@ impl Tool for CodexAccountTool {
                             .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
                             .map(|duration| duration.as_secs())
                             .unwrap_or(0);
-                        accounts.push(json!({ "name": name, "auth_age_secs": modified }));
+                        let identity = account_identity(&auth);
+                        accounts.push(json!({
+                            "name": name,
+                            "auth_age_secs": modified,
+                            "account": identity.as_ref().map(|(id, _)| id.clone()),
+                            "plan": identity.as_ref().and_then(|(_, plan)| plan.clone()),
+                        }));
                     }
                 }
                 let default_exists = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
@@ -269,7 +327,11 @@ impl Tool for CodexAccountTool {
                         "message": "abriria o navegador para autenticar outra conta Codex"
                     }));
                 }
-                let (url, _auth) = run_login(name, timeout)?;
+                let (url, auth_path) = run_login(name, timeout)?;
+                let identity = account_identity(&auth_path);
+                let duplicate = identity
+                    .as_ref()
+                    .and_then(|(account, _)| duplicate_of(account, &slug(name)));
                 let activate_account = args
                     .get("activate")
                     .and_then(Value::as_bool)
@@ -280,16 +342,24 @@ impl Tool for CodexAccountTool {
                 } else {
                     false
                 };
+                let mut message = if activated {
+                    "conta autenticada e ativada".to_string()
+                } else {
+                    "conta autenticada; use codex_account_switch para ativar".to_string()
+                };
+                if let Some(existing) = &duplicate {
+                    message = format!(
+                        "{message}. ATENÇÃO: é a mesma conta ChatGPT de `{existing}`, então divide a mesma cota de voz"
+                    );
+                }
                 Ok(json!({
                     "ok": true,
                     "account": slug(name),
                     "activated": activated,
                     "url": url,
-                    "message": if activated {
-                        "conta autenticada e ativada"
-                    } else {
-                        "conta autenticada; use codex_account_switch para ativar"
-                    }
+                    "plan": identity.as_ref().and_then(|(_, plan)| plan.clone()),
+                    "duplicate_of": duplicate,
+                    "message": message
                 }))
             }
             "codex_account_switch" => {

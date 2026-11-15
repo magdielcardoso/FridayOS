@@ -1636,7 +1636,8 @@ pub fn register(registry: &mut Registry) {
     registry.add(VoiceDevices::new());
     registry.add(VoiceListenOnce::new());
     registry.add(VoicePlay::new());
-    registry.add(VoiceSay::new());
+    // `voice_say` (macOS say) is intentionally NOT registered: Friday's only
+    // accepted voice is the ChatGPT read-aloud voice.
     registry.add(VoiceWakeListen::new());
     registry.add(VoiceSpeakerProfile::new());
     registry.add(VoiceVerify::new());
