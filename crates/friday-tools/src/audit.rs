@@ -45,6 +45,14 @@ impl AuditLog {
             "dry_run": dry_run,
             "args": args,
         });
+        // Keep the file bounded; older entries stay in audit.1.jsonl.
+        if fs::metadata(&self.path)
+            .map(|meta| meta.len() > 5_000_000)
+            .unwrap_or(false)
+        {
+            let rotated = self.path.with_file_name("audit.1.jsonl");
+            let _ = fs::rename(&self.path, rotated);
+        }
         if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&self.path) {
             let _ = writeln!(file, "{entry}");
         }

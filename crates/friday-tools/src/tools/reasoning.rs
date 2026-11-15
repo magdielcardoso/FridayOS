@@ -65,8 +65,12 @@ impl Tool for ReasoningTool {
                     .parent()
                     .ok_or_else(|| ToolError::failed("caminho de configuração inválido"))?;
                 std::fs::create_dir_all(parent).map_err(|error| ToolError::failed(error.to_string()))?;
+                let adaptive = args
+                    .get("adaptive")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false);
                 let temporary = path.with_extension("json.tmp");
-                let payload = serde_json::to_vec_pretty(&json!({ "effort": effort }))
+                let payload = serde_json::to_vec_pretty(&json!({ "effort": effort, "adaptive": adaptive }))
                     .map_err(|error| ToolError::failed(error.to_string()))?;
                 std::fs::write(&temporary, payload)
                     .map_err(|error| ToolError::failed(error.to_string()))?;
@@ -76,6 +80,7 @@ impl Tool for ReasoningTool {
                 Ok(json!({
                     "ok": true,
                     "effort": effort,
+                    "adaptive": adaptive,
                     "applies": "next user turn",
                     "config_path": path.display().to_string()
                 }))
@@ -100,7 +105,7 @@ pub fn register(registry: &mut Registry) {
     ));
     registry.add(make_tool(
         "reasoning_set",
-        "Configura o esforço de raciocínio do Codex para a próxima solicitação do usuário.",
+        "Configura o esforço de raciocínio do Codex para a próxima solicitação do usuário. Por padrão desliga o ajuste automático; use adaptive=true para deixar a Friday subir de low para medium em tarefas complexas.",
         Risk::Reversible,
         json!({
             "type": "object",
@@ -111,6 +116,11 @@ pub fn register(registry: &mut Registry) {
                     "type": "string",
                     "enum": EFFORTS,
                     "description": "low, medium, high, xhigh ou max"
+                },
+                "adaptive": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Ajustar automaticamente entre low e medium conforme a tarefa"
                 }
             }
         }),

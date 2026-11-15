@@ -535,10 +535,7 @@ fn tools_call(registry: &Registry, id: Option<Value>, params: &Value) -> Outcome
                 return Outcome::Reply(json!({
                     "jsonrpc": "2.0",
                     "id": id,
-                    "result": {
-                        "content": [{ "type": "text", "text": payload.to_string() }],
-                        "isError": false
-                    }
+                    "result": tool_result(&payload, false)
                 }));
             }
             "schema" => {
@@ -558,10 +555,7 @@ fn tools_call(registry: &Registry, id: Option<Value>, params: &Value) -> Outcome
                         Outcome::Reply(json!({
                             "jsonrpc": "2.0",
                             "id": id,
-                            "result": {
-                                "content": [{ "type": "text", "text": payload.to_string() }],
-                                "isError": false
-                            }
+                            "result": tool_result(&payload, false)
                         }))
                     }
                     None => Outcome::Reply(error_response(id, INVALID_PARAMS, format!("ferramenta desconhecida: {wanted}"))),
@@ -658,8 +652,22 @@ fn tools_call(registry: &Registry, id: Option<Value>, params: &Value) -> Outcome
 }
 
 /// MCP `CallToolResult`: a single text content block holding JSON.
+///
+/// Large results are truncated into a valid JSON envelope so a single tool can
+/// never flood the model context; the note tells the model how to narrow it.
 fn tool_result(payload: &Value, is_error: bool) -> Value {
-    let text = serde_json::to_string(payload).unwrap_or_else(|_| "null".to_string());
+    const MAX_CHARS: usize = 24_000;
+    let mut text = serde_json::to_string(payload).unwrap_or_else(|_| "null".to_string());
+    if text.chars().count() > MAX_CHARS {
+        let preview: String = text.chars().take(MAX_CHARS).collect();
+        text = json!({
+            "truncated": true,
+            "content_chars": text.chars().count(),
+            "note": "resultado grande truncado; refine a consulta ou peça menos itens",
+            "preview": preview,
+        })
+        .to_string();
+    }
     json!({
         "content": [{ "type": "text", "text": text }],
         "isError": is_error,

@@ -1,6 +1,7 @@
 //! Tool modules, grouped by the macOS surface they touch.
 
 pub mod annotate;
+pub mod audit_tool;
 pub mod apps;
 pub mod autonomy;
 pub mod codex_accounts;
@@ -33,6 +34,7 @@ pub fn register_all(registry: &mut Registry) {
     input::register(registry);
     knowledge::register(registry);
     annotate::register(registry);
+    audit_tool::register(registry);
     apps::register(registry);
     autonomy::register(registry);
     codex_accounts::register(registry);

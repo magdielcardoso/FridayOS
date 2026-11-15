@@ -14,6 +14,41 @@ fn path() -> PathBuf {
         .join("memory.jsonl")
 }
 
+fn fold(ch: char) -> char {
+    match ch {
+        'á' | 'à' | 'â' | 'ã' | 'ä' => 'a',
+        'é' | 'è' | 'ê' | 'ë' => 'e',
+        'í' | 'ì' | 'î' | 'ï' => 'i',
+        'ó' | 'ò' | 'ô' | 'õ' | 'ö' => 'o',
+        'ú' | 'ù' | 'û' | 'ü' => 'u',
+        'ç' => 'c',
+        other => other,
+    }
+}
+
+fn normalize(content: &str) -> String {
+    content
+        .to_lowercase()
+        .chars()
+        .map(fold)
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_matches(|ch: char| ch.is_ascii_punctuation())
+        .to_string()
+}
+
+fn write_all(memories: &[Value]) -> Result<(), ToolError> {
+    let body = memories
+        .iter()
+        .map(|memory| memory.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(path(), if body.is_empty() { String::new() } else { format!("{body}\n") })
+        .map_err(|error| ToolError::failed(error.to_string()))
+}
+
 fn load() -> Vec<Value> {
     let Ok(text) = std::fs::read_to_string(path()) else {
         return Vec::new();
@@ -53,6 +88,36 @@ impl Tool for MemoryTool {
                     .unwrap_or_default();
                 if ctx.dry_run {
                     return Ok(json!({ "dry_run": true, "would_save": content }));
+                }
+                // Repeating a fact refreshes the existing memory instead of
+                // filling the graph with near-duplicates.
+                let existing = load();
+                if let Some(found) = existing.iter().find(|memory| {
+                    memory
+                        .get("content")
+                        .and_then(|value| value.as_str())
+                        .map(|old| normalize(old) == normalize(content))
+                        .unwrap_or(false)
+                }) {
+                    let id = found.get("id").cloned().unwrap_or(Value::Null);
+                    let mut updated = found.clone();
+                    updated["ts"] = json!(now_secs());
+                    if !tags.is_empty() {
+                        updated["tags"] = json!(tags);
+                    }
+                    let mut memories = existing.clone();
+                    for memory in memories.iter_mut() {
+                        if memory.get("id") == Some(&id) {
+                            *memory = updated.clone();
+                        }
+                    }
+                    write_all(&memories)?;
+                    let _ = friday_brain::index_all();
+                    return Ok(json!({
+                        "ok": true,
+                        "deduped": true,
+                        "memory": updated,
+                    }));
                 }
                 let entry = json!({
                     "id": format!("mem-{}", now_ms()),
@@ -99,6 +164,44 @@ impl Tool for MemoryTool {
                     .take(limit)
                     .collect();
                 Ok(json!({ "ok": true, "count": filtered.len(), "memories": filtered }))
+            }
+            "memory_update" => {
+                let id = args
+                    .get("id")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| ToolError::invalid("informe `id`"))?;
+                let content = args
+                    .get("content")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                let tags = args.get("tags").and_then(|value| value.as_array()).map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                });
+                if ctx.dry_run {
+                    return Ok(json!({ "dry_run": true, "would_update": id }));
+                }
+                let mut memories = load();
+                let Some(memory) = memories
+                    .iter_mut()
+                    .find(|memory| memory.get("id").and_then(|value| value.as_str()) == Some(id))
+                else {
+                    return Err(ToolError::failed(format!("memória `{id}` não existe")));
+                };
+                if let Some(content) = content {
+                    memory["content"] = json!(content);
+                    memory["ts"] = json!(now_secs());
+                }
+                if let Some(tags) = tags {
+                    memory["tags"] = json!(tags);
+                }
+                let updated = memory.clone();
+                write_all(&memories)?;
+                let _ = friday_brain::index_all();
+                Ok(json!({ "ok": true, "memory": updated }))
             }
             "memory_delete" => {
                 let id = args
@@ -174,6 +277,21 @@ pub fn register(registry: &mut Registry) {
             "properties": {
                 "query": { "type": "string" },
                 "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 20 }
+            }
+        }),
+    ));
+    registry.add(tool(
+        "memory_update",
+        "Atualiza o conteúdo ou as tags de uma memória existente (e reindexa o grafo).",
+        crate::policy::Risk::Reversible,
+        json!({
+            "type": "object",
+            "required": ["id"],
+            "additionalProperties": false,
+            "properties": {
+                "id": { "type": "string" },
+                "content": { "type": "string" },
+                "tags": { "type": "array", "items": { "type": "string" } }
             }
         }),
     ));
