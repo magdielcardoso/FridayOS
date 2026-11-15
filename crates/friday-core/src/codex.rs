@@ -165,6 +165,8 @@ pub enum CodexEvent {
         id: String,
         label: String,
         state: StepState,
+        /// Result/output of the step, when available (command output, tool result).
+        detail: Option<String>,
     },
     /// Turn finished (completed, failed, interrupted).
     Done { status: String },
@@ -588,6 +590,7 @@ impl Session {
                             id,
                             label,
                             state: StepState::Started,
+                            detail: step_detail(&item),
                         });
                     }
                 }
@@ -632,6 +635,7 @@ impl Session {
                             } else {
                                 StepState::Completed
                             },
+                            detail: step_detail(&item),
                         });
                     }
                     if item.get("type").and_then(Value::as_str) == Some("agentMessage") {
@@ -887,6 +891,67 @@ fn step_label(item: &Value) -> Option<(String, String)> {
         _ => return None,
     };
     Some((id, label))
+}
+
+/// Extrai um resumo do resultado de um passo, para inspeção no HUD.
+fn step_detail(item: &Value) -> Option<String> {
+    let kind = item.get("type").and_then(Value::as_str)?;
+    let text = match kind {
+        "commandExecution" => {
+            let output = item
+                .get("aggregatedOutput")
+                .or_else(|| item.get("aggregated_output"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let code = item
+                .get("exitCode")
+                .or_else(|| item.get("exit_code"))
+                .and_then(Value::as_i64);
+            if output.trim().is_empty() {
+                code.map(|code| format!("sem saída · código {code}"))
+            } else {
+                Some(match code {
+                    Some(code) => format!("código {code}\n{}", truncate(output, 2000)),
+                    None => truncate(output, 2000),
+                })
+            }
+        }
+        "mcpToolCall" | "dynamicToolCall" => {
+            let result = item
+                .get("result")
+                .or_else(|| item.get("error"))
+                .filter(|value| !value.is_null());
+            result.map(|value| {
+                let raw = value
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| value.to_string());
+                truncate(&raw, 2000)
+            })
+        }
+        "fileChange" | "patchApply" => item
+            .get("changes")
+            .and_then(Value::as_array)
+            .map(|changes| {
+                changes
+                    .iter()
+                    .filter_map(|change| {
+                        let path = change.get("path").and_then(Value::as_str)?;
+                        let kind = change.get("kind").and_then(Value::as_str).unwrap_or("edit");
+                        Some(format!("{kind} {path}"))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .filter(|text| !text.is_empty()),
+        "webSearch" => item
+            .get("results")
+            .or_else(|| item.get("result"))
+            .filter(|value| !value.is_null())
+            .map(|value| truncate(&value.to_string(), 1600)),
+        _ => None,
+    };
+    text.filter(|text| !text.trim().is_empty())
 }
 
 fn truncate(value: &str, max: usize) -> String {

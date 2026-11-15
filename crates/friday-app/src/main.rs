@@ -14,6 +14,7 @@ use gpui::{
     KeyDownEvent, PathBuilder, Render, ScrollHandle, SharedString, Window,
     WindowBounds, WindowHandle, WindowKind, WindowOptions,
 };
+use serde_json::json;
 
 mod automation;
 mod graph_panel;
@@ -358,6 +359,9 @@ struct Activity {
     id: String,
     label: String,
     state: StepState,
+    started: std::time::Instant,
+    duration_ms: Option<u128>,
+    detail: Option<String>,
 }
 
 struct Line {
@@ -375,6 +379,7 @@ struct FridayApp {
     thread: Option<String>,
     tools: usize,
     mic: Option<voice::Mic>,
+    mic_starting: bool,
     voice_phase: voice::VoicePhase,
     level: f32,
     speak_cancel: Option<Arc<AtomicBool>>,
@@ -417,6 +422,11 @@ struct FridayApp {
     blink: bool,
     tick: u64,
     activity: Vec<Activity>,
+    turn_started: Option<std::time::Instant>,
+    first_token_ms: Option<u128>,
+    last_turn_ms: Option<u128>,
+    last_first_ms: Option<u128>,
+    last_tools: usize,
     focus: FocusHandle,
     scroll: ScrollHandle,
     booted_at: std::time::Instant,
@@ -438,6 +448,7 @@ impl FridayApp {
             thread: None,
             tools: friday_tools::Registry::with_defaults().specs().len(),
             mic: None,
+            mic_starting: false,
             voice_phase: voice::VoicePhase::Idle,
             level: 0.0,
             speak_cancel: None,
@@ -482,6 +493,11 @@ impl FridayApp {
             blink: true,
             tick: 0,
             activity: Vec::new(),
+            turn_started: None,
+            first_token_ms: None,
+            last_turn_ms: None,
+            last_first_ms: None,
+            last_tools: 0,
             focus,
             scroll: ScrollHandle::new(),
             booted_at: std::time::Instant::now(),
@@ -505,22 +521,37 @@ impl FridayApp {
             self.interrupt(cx);
         }
         if self.mic.is_none() {
-            match voice::Mic::start() {
-                Ok(mic) => {
-                    self.mic = Some(mic);
-                    self.spawn_mic_poll(cx);
-                }
-                Err(error) => {
-                    log(format!("mic: {error}"));
-                    self.status = Status::Offline;
-                    self.messages.push(Line {
-                        role: Role::System,
-                        text: format!("microfone indisponível: {error}"),
-                    });
-                    cx.notify();
-                    return;
-                }
+            // CoreAudio can block for seconds (or indefinitely) while a device
+            // changes; never hold the HUD's main thread for that.
+            if self.mic_starting {
+                return;
             }
+            self.mic_starting = true;
+            Self::blocking(
+                cx,
+                voice::Mic::start,
+                |app, result, cx| {
+                    app.mic_starting = false;
+                    match result {
+                        Ok(mic) => {
+                            app.mic = Some(mic);
+                            app.spawn_mic_poll(cx);
+                            app.voice_phase = voice::VoicePhase::Listening;
+                            cx.notify();
+                        }
+                        Err(error) => {
+                            log(format!("mic: {error}"));
+                            app.status = Status::Offline;
+                            app.messages.push(Line {
+                                role: Role::System,
+                                text: format!("microfone indisponível: {error}"),
+                            });
+                            cx.notify();
+                        }
+                    }
+                },
+            );
+            return;
         }
         if let Some(mic) = self.mic.as_ref() {
             mic.set_speaking(false);
@@ -1213,6 +1244,15 @@ impl FridayApp {
                     return;
                 }
                 self.status = Status::Thinking;
+                if self.first_token_ms.is_none() {
+                    if let Some(started) = self.turn_started {
+                        self.first_token_ms = Some(started.elapsed().as_millis());
+                        trace(json!({
+                            "event": "first_token",
+                            "ms": self.first_token_ms,
+                        }));
+                    }
+                }
                 self.stream.push_str(&delta);
                 mobile::assistant_delta(&delta);
                 self.feed_speech(&delta, cx);
@@ -1226,15 +1266,41 @@ impl FridayApp {
                     self.push_activity("processando", StepState::Started);
                 }
             }
-            CodexEvent::Step { id, label, state } => {
+            CodexEvent::Step { id, label, state, detail } => {
                 log(format!("step: {label} · {state:?}"));
                 mobile::step(&label);
-                if let Some(existing) = self.activity.iter_mut().find(|item| item.id == id) {
-                    existing.label = label;
-                    existing.state = state;
-                } else {
-                    self.activity.push(Activity { id, label, state });
+                if state == StepState::Started {
+                    self.last_tools += 1;
                 }
+                let now = std::time::Instant::now();
+                let mut duration = None;
+                if let Some(existing) = self.activity.iter_mut().find(|item| item.id == id) {
+                    existing.label = label.clone();
+                    existing.state = state;
+                    if let Some(detail) = detail {
+                        existing.detail = Some(detail);
+                    }
+                    if state != StepState::Started {
+                        duration = Some(now.duration_since(existing.started).as_millis());
+                        existing.duration_ms = duration;
+                    }
+                } else {
+                    self.activity.push(Activity {
+                        id: id.clone(),
+                        label: label.clone(),
+                        state,
+                        started: now,
+                        duration_ms: None,
+                        detail,
+                    });
+                }
+                trace(json!({
+                    "event": "step",
+                    "id": id,
+                    "label": label,
+                    "state": format!("{state:?}"),
+                    "ms": duration,
+                }));
                 if self.activity.len() > 40 {
                     self.activity.remove(0);
                 }
@@ -1253,6 +1319,23 @@ impl FridayApp {
                     "done: status={status} stream={} chars",
                     self.stream.chars().count()
                 ));
+                let total_ms = self
+                    .turn_started
+                    .map(|started| started.elapsed().as_millis());
+                if let Some(total) = total_ms {
+                    self.last_turn_ms = Some(total);
+                    self.last_first_ms = self.first_token_ms;
+                }
+                trace(json!({
+                    "event": "turn_done",
+                    "status": status,
+                    "total_ms": total_ms,
+                    "first_token_ms": self.first_token_ms,
+                    "tools": self.last_tools,
+                    "answer_chars": self.stream.chars().count(),
+                }));
+                self.turn_started = None;
+                self.first_token_ms = None;
                 if !self.stream.trim().is_empty() {
                     let text = std::mem::take(&mut self.stream);
                     spoken = Some(text.clone());
@@ -1331,6 +1414,11 @@ impl FridayApp {
             role: Role::User,
             text: format!("[{source}] {prompt}"),
         });
+        adaptive_effort(&prompt);
+        self.turn_started = Some(std::time::Instant::now());
+        self.first_token_ms = None;
+        self.last_tools = 0;
+        trace(json!({ "event": "turn_start", "source": source, "chars": prompt.chars().count() }));
         self.activity.clear();
         self.push_activity(format!("evento · {source}"), StepState::Completed);
         self.stream.clear();
@@ -1453,6 +1541,9 @@ impl FridayApp {
             id: format!("ui-{}", self.tick),
             label,
             state,
+            started: std::time::Instant::now(),
+            duration_ms: None,
+            detail: None,
         });
         if self.activity.len() > 40 {
             self.activity.remove(0);
@@ -1493,7 +1584,12 @@ impl FridayApp {
         self.reasoning.clear();
         self.notify_on_done = false;
         mobile::user_message(&text);
+        adaptive_effort(&text);
         self.activity.clear();
+        self.turn_started = Some(std::time::Instant::now());
+        self.first_token_ms = None;
+        self.last_tools = 0;
+        trace(json!({ "event": "turn_start", "chars": text.chars().count() }));
         // A new turn starts clean: previous graph highlights must not linger.
         self.graph_highlight.clear();
         self.highlight_until = None;
@@ -1692,16 +1788,22 @@ impl Render for FridayApp {
         };
 
         // Human-readable steps for the current turn, newest last.
-        let mut steps: Vec<(String, StepState)> = Vec::new();
-        for activity in self.activity.iter().rev() {
+        let mut steps: Vec<(usize, String, StepState, Option<u128>, Option<String>)> = Vec::new();
+        for (index, activity) in self.activity.iter().enumerate().rev() {
             let text = friendly_step(&activity.label);
             if text == "pensando no seu pedido" || text == "entendendo seu pedido" {
                 continue;
             }
-            if steps.last().map(|(label, _)| label == &text).unwrap_or(false) {
+            if steps.last().map(|(_, label, ..)| label == &text).unwrap_or(false) {
                 continue;
             }
-            steps.push((text, activity.state));
+            steps.push((
+                index,
+                text,
+                activity.state,
+                activity.duration_ms,
+                activity.detail.clone(),
+            ));
             if steps.len() >= 6 {
                 break;
             }
@@ -2273,6 +2375,57 @@ impl Render for FridayApp {
                                                 }),
                                             ),
                                     )
+                                    .when(running, |actions| {
+                                        let cancel_name = name.clone();
+                                        actions.child(
+                                            div()
+                                                .id("agent-cancel")
+                                                .cursor_pointer()
+                                                .px(sx(5.0))
+                                                .rounded(sx(4.0))
+                                                .hover(|style| style.bg(rgba(0x2a0505ff)))
+                                                .text_size(sx(11.0))
+                                                .text_color(rgb(0xff1738))
+                                                .child(SharedString::from("■"))
+                                                .on_mouse_down(
+                                                    gpui::MouseButton::Left,
+                                                    cx.listener(move |this, _, _, cx| {
+                                                        let target = cancel_name.clone();
+                                                        Self::blocking(
+                                                            cx,
+                                                            move || {
+                                                                let registry = friday_tools::Registry::with_defaults();
+                                                                let ctx = friday_tools::ToolCtx::new(
+                                                                    friday_tools::AuditLog::discover(),
+                                                                )
+                                                                .confirmed();
+                                                                registry.call(
+                                                                    "assistant_cancel",
+                                                                    &json!({ "name": target }),
+                                                                    &ctx,
+                                                                )
+                                                            },
+                                                            |app, result, cx| {
+                                                                match result {
+                                                                    Ok(_) => {
+                                                                        app.last_answer =
+                                                                            "■ tarefa do subagente cancelada".into()
+                                                                    }
+                                                                    Err(error) => {
+                                                                        app.last_answer =
+                                                                            format!("⚠ {error}")
+                                                                    }
+                                                                }
+                                                                app.agent_running = false;
+                                                                cx.notify();
+                                                            },
+                                                        );
+                                                        this.agent_running = false;
+                                                        cx.notify();
+                                                    }),
+                                                ),
+                                        )
+                                    })
                                     .child(
                                         div()
                                             .id("agent-monitor-close")
@@ -2360,7 +2513,7 @@ impl Render for FridayApp {
                             .gap(sx(3.0))
                             .mt(sx(4.0))
                             .pl(sx(36.0));
-                        for (text, state) in steps {
+                        for (index, text, state, duration, detail) in steps {
                             let (mark, mark_color, text_color) = match state {
                                 StepState::Started => (
                                     if blink { "▸" } else { "▹" },
@@ -2370,11 +2523,39 @@ impl Render for FridayApp {
                                 StepState::Completed => ("✓", 0x6a1414, 0x7a4a4a),
                                 StepState::Failed => ("✕", 0xff1738, 0xff5566),
                             };
+                            let timing = duration
+                                .map(|ms| format!("  {:.1}s", ms as f64 / 1000.0))
+                                .unwrap_or_default();
+                            let click_label = text.clone();
+                            let click_detail = detail
+                                .clone()
+                                .unwrap_or_else(|| "(sem detalhe registrado)".into());
                             list = list.child(
                                 div()
+                                    .id(SharedString::from(format!("step-{index}")))
                                     .flex()
                                     .items_center()
                                     .gap(sx(8.0))
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(rgba(0x1a0505ff)))
+                                    .on_mouse_down(
+                                        gpui::MouseButton::Left,
+                                        cx.listener(move |_, _, _, cx| {
+                                            open_overlay(
+                                                cx,
+                                                OverlayRequest {
+                                                    title: format!("ETAPA · {}", click_label),
+                                                    body: click_detail.clone(),
+                                                    anchor: "center".into(),
+                                                    width: 620.0,
+                                                    height: 430.0,
+                                                    offset_x: 0.0,
+                                                    offset_y: 0.0,
+                                                    seconds: 0,
+                                                },
+                                            );
+                                        }),
+                                    )
                                     .child(
                                         div()
                                             .flex_none()
@@ -2387,7 +2568,7 @@ impl Render for FridayApp {
                                         div()
                                             .text_size(sx(11.0))
                                             .text_color(rgb(text_color))
-                                            .child(SharedString::from(text)),
+                                            .child(SharedString::from(format!("{text}{timing}"))),
                                     ),
                             );
                         }
@@ -2403,6 +2584,27 @@ impl Render for FridayApp {
                     .h(px(1.0))
                     .bg(rgb(0x64101d)),
             )
+            // Last turn latency
+            .when(self.last_turn_ms.is_some(), |root| {
+                let total = self.last_turn_ms.unwrap_or(0) as f64 / 1000.0;
+                let first = self
+                    .last_first_ms
+                    .map(|ms| format!(" · 1º token {:.1}s", ms as f64 / 1000.0))
+                    .unwrap_or_default();
+                root.child(
+                    div()
+                        .absolute()
+                        .left(lx(28.0))
+                        .bottom(ly(64.0))
+                        .font_family("SF Mono")
+                        .text_size(sx(9.0))
+                        .text_color(rgb(0x5e1414))
+                        .child(SharedString::from(format!(
+                            "último turno {total:.1}s{first} · {} passos",
+                            self.last_tools
+                        ))),
+                )
+            })
             // Speech capsule
             .child(
                 div()
@@ -2908,6 +3110,85 @@ fn shorten(value: &str, max: usize) -> String {
         let mut out: String = value.chars().take(max).collect();
         out.push('…');
         out
+    }
+}
+
+/// Codex effort is `low` by default; complex work escalates to `medium`.
+/// An explicit `reasoning_set` disables this by writing `adaptive: false`.
+fn adaptive_effort(text: &str) -> Option<&'static str> {
+    let home = std::env::var_os("HOME")?;
+    let path = std::path::PathBuf::from(home)
+        .join("Library/Application Support/FridayOS")
+        .join("reasoning.json");
+    let current = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .unwrap_or_else(|| json!({}));
+    let adaptive = current
+        .get("adaptive")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(true);
+    if !adaptive {
+        return None;
+    }
+    let lower = text.to_lowercase();
+    let complex = text.chars().count() > 240
+        || [
+            "codigo",
+            "código",
+            "implement",
+            "refator",
+            "debug",
+            "arquitetura",
+            "teste",
+            "compil",
+            "corrig",
+            "script",
+            "bug",
+            "stack trace",
+            "banco de dados",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle));
+    let effort = if complex { "medium" } else { "low" };
+    let already = current.get("effort").and_then(|value| value.as_str()) == Some(effort);
+    if already {
+        return Some(effort);
+    }
+    let payload = json!({ "effort": effort, "adaptive": true });
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, serde_json::to_vec_pretty(&payload).unwrap_or_default());
+    log(format!("effort: adaptativo → {effort}"));
+    trace(json!({ "event": "effort", "effort": effort }));
+    Some(effort)
+}
+
+/// Appends one JSON line to trace.jsonl for per-turn latency analysis.
+fn trace(record: serde_json::Value) {
+    use std::io::Write;
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let path = std::path::PathBuf::from(home)
+        .join("Library/Application Support/FridayOS")
+        .join("trace.jsonl");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    let mut line = record;
+    line["ts_ms"] = serde_json::json!(now);
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(file, "{line}");
     }
 }
 
