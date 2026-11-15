@@ -26,21 +26,29 @@ const BANNER: [&str; 5] = [
     " ██      ██   ██ ██  ██████   ██   ██ ██   ██",
 ];
 
-const PERSONA: &str = "\
-You are Friday — the assistant of a private macOS system called FridayOS.
-Speak Brazilian Portuguese by default, briefly and naturally, like a calm
-voice in a dark control room. You may be dry and slightly amused, never
-theatrical. Address the user as 'senhor' only when it fits; do not overdo it.
-You are running as a native app and do not have tools enabled yet: never claim
-to have executed commands, read files, or accessed the network. If asked for
-something that would need tools, say it is not wired yet.
-You have hands: a tool server called `friday` exposes native macOS tools.
-Before using one, consider the risk: read-only tools are free; actions that
-change things can be done directly; sensitive actions (shell commands, deleting
-files, sending messages, running AppleScript) require you to ask the user out
-loud and only then retry with `\"__confirm\": true` in the arguments.
-Never say something worked before seeing the tool result. Never invent results.
-Never use markdown tables. Keep answers short unless asked to expand.";
+const PERSONA_BASE: &str = "\
+You are Friday — the private assistant of this macOS machine, built in FridayOS.
+Speak Brazilian Portuguese by default. You are Jarvis: composed, precise, a
+little dry, never theatrical. Address the user as 'senhor' when it fits.
+You ARE the system: you see the screen, control apps, type, click, run shell
+commands, manage files, network, calendar and voice. Never say you lack tools
+or that something is not wired. If an action fails, report the real error and
+the next step.
+Your answers are spoken out loud by the app: 1 to 3 short sentences, no lists,
+no markdown, no tables, no emoji. Expand only when asked.
+
+TOOLS
+A tool server named `friday` is connected and exposes the tools below. Call
+them through the MCP server; the tool names are exactly as listed.
+Risk policy, non-negotiable:
+- read: use freely.
+- reversible: act, then mention it in one sentence.
+- sensitive: ask the user out loud for permission, wait for the next turn, and
+  only then retry the same call with \"__confirm\": true.
+- critical: same as sensitive, and say clearly what will be touched.
+Never claim a result before seeing the tool output. Never invent paths, files
+or command output. If the user asks for something possible, do it instead of
+explaining how they could do it.";
 
 #[derive(Clone, Copy, PartialEq)]
 enum Status {
@@ -71,6 +79,7 @@ struct FridayApp {
     reasoning: String,
     status: Status,
     thread: Option<String>,
+    tools: usize,
     blink: bool,
     focus: FocusHandle,
     scroll: ScrollHandle,
@@ -84,13 +93,14 @@ impl FridayApp {
             codex: None,
             messages: vec![Line {
                 role: Role::System,
-                text: "núcleo em espera · subsistema de voz ainda não montado".into(),
+                text: "núcleo em espera · voz em montagem".into(),
             }],
             input: String::new(),
             stream: String::new(),
             reasoning: String::new(),
             status: Status::Connecting,
             thread: None,
+            tools: friday_tools::Registry::with_defaults().specs().len(),
             blink: true,
             focus,
             scroll: ScrollHandle::new(),
@@ -121,7 +131,7 @@ impl FridayApp {
                 .unwrap_or_else(|_| ".".into()),
             model: None,
             effort: Some("low".into()),
-            developer_instructions: Some(PERSONA.into()),
+            developer_instructions: Some(persona()),
             extra_args,
         };
 
@@ -325,7 +335,7 @@ impl FridayApp {
                     .text_size(px(10.0))
                     .text_color(rgb(RED_FAINT))
                     .child(SharedString::from(
-                        "⏎ enviar   ·   esc interromper   ·   voz: em construção",
+                        "⏎ enviar   ·   esc interromper   ·   f2 falar (em breve)",
                     )),
             )
     }
@@ -446,7 +456,8 @@ impl Render for FridayApp {
             .text_size(px(9.5))
             .text_color(rgb(RED_DIM))
             .child(SharedString::from(format!(
-                "uptime {:>3}s",
+                "{} ferramentas · uptime {:>3}s",
+                self.tools,
                 self.booted_at.elapsed().as_secs()
             )))
             .child(SharedString::from("friday·os // black terminal // no light mode"));
@@ -468,6 +479,28 @@ impl Render for FridayApp {
             .child(self.input_block())
             .child(footer)
     }
+}
+
+/// Builds the capability manifesto from the live tool registry, so Friday knows
+/// exactly what she can do — no guesswork, no "MCP not connected".
+fn persona() -> String {
+    let registry = friday_tools::Registry::with_defaults();
+    let mut manifest = String::new();
+    let mut total = 0usize;
+    for spec in registry.specs() {
+        total += 1;
+        manifest.push_str(&format!(
+            "- {} [{}]: {}\n",
+            spec.name,
+            spec.risk.label(),
+            spec.summary
+        ));
+    }
+    format!(
+        "{PERSONA_BASE}\n\n{} ferramentas conectadas agora (servidor `friday`):\n{}",
+        total.max(1),
+        manifest
+    )
 }
 
 fn shorten(value: &str, max: usize) -> String {
