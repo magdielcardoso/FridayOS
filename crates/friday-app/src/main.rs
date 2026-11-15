@@ -938,8 +938,8 @@ impl Render for FridayApp {
         for line in PORTRAIT.lines() {
             portrait = portrait.child(
                 div()
-                    .text_size(px(7.2))
-                    .line_height(px(7.4))
+                    .text_size(px(8.0))
+                    .line_height(px(8.2))
                     .text_color(art_color)
                     .child(SharedString::from(line.to_string())),
             );
@@ -960,7 +960,7 @@ impl Render for FridayApp {
             .flex()
             .flex_col()
             .gap(px(6.0))
-            .w(px(300.0));
+            .w(px(270.0));
         if !answer.is_empty() {
             answer_block = answer_block.child(
                 div()
