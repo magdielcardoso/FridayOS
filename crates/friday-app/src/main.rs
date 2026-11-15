@@ -94,6 +94,9 @@ Forensics: `forensics_log`, `forensics_power`, `forensics_changes`,
 facts from hypotheses and say when logs are missing.
 Context: `context_now` reports the active app and its declared category.
 Tool routing: `tools/search` finds tools by name/description when needed.
+Voice: the app speaks your answers automatically with the ChatGPT voice. NEVER
+call the `say` tool unless ChatGPT voice is blocked by the hourly limit; calling
+it duplicates speech in Siri's voice.
 You also have: `diagnose` (read logs, list recent errors and environment
 problems), `say` (macOS speech as an explicit fallback), `memory_save` /
 `memory_list` (persistent memories that survive restarts), and the permanent

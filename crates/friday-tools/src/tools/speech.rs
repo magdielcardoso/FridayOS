@@ -1,6 +1,8 @@
 //! Terminal speech: `/usr/bin/say`, as an explicit fallback the agent can call.
 
+use std::path::PathBuf;
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
@@ -31,6 +33,14 @@ impl Tool for SayTool {
                 if ctx.dry_run {
                     return Ok(json!({ "dry_run": true, "would_say": text, "voice": voice }));
                 }
+                // Local voice is a last resort: only when the ChatGPT
+                // read-aloud quota is exhausted.
+                if !chatgpt_voice_blocked() {
+                    return Err(ToolError::Denied(
+                        "a voz do ChatGPT está disponível; não use `say` (o app fala sozinho)"
+                            .to_string(),
+                    ));
+                }
                 let status = Command::new("/usr/bin/say")
                     .arg("-v")
                     .arg(voice)
@@ -57,6 +67,24 @@ impl Tool for SayTool {
     }
 }
 
+fn chatgpt_voice_blocked() -> bool {
+    let home = std::env::var_os("HOME").unwrap_or_default();
+    let path = PathBuf::from(home)
+        .join("Library/Application Support/FridayOS/tts-usage.json");
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+        return false;
+    };
+    let blocked_until = value.get("blocked_until").and_then(|v| v.as_u64()).unwrap_or(0);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    blocked_until > now
+}
+
 fn tool(name: &'static str, summary: &'static str, risk: crate::policy::Risk, args: Value) -> SayTool {
     SayTool {
         spec: ToolSpec { name, summary, risk, args },
@@ -66,7 +94,7 @@ fn tool(name: &'static str, summary: &'static str, risk: crate::policy::Risk, ar
 pub fn register(registry: &mut Registry) {
     registry.add(tool(
         "say",
-        "Fala um texto pelo comando `say` do macOS (voz local, ex.: Luciana em pt-BR).",
+        "Fala pelo `say` do macOS APENAS quando a voz do ChatGPT estiver bloqueada por limite de requisições.",
         crate::policy::Risk::Reversible,
         json!({
             "type": "object",
