@@ -1646,8 +1646,9 @@ impl Render for FridayApp {
                     let px0 = cx0 + x * radius;
                     let py0 = cy0 + y * radius;
                     let dot = (2.6 + 1.6 * ((clock * 1.5).sin() * 0.5 + 0.5)) * scale;
-                    paint_arc(window, px0, py0, dot + 2.5 * scale, 0.0, TAU, 1.0, 0x3a0810);
-                    paint_arc(window, px0, py0, dot, 0.0, TAU, 2.0, bright);
+                    paint_arc(window, px0, py0, dot + 3.0 * scale, 0.0, TAU, 1.0, 0x3a0810);
+                    paint_filled_circle(window, px0, py0, dot, bright);
+                    paint_arc(window, px0, py0, dot, 0.0, TAU, 0.8, 0xff6b7c);
                 }
             },
         )
@@ -2094,6 +2095,26 @@ fn civil(days_since_epoch: i64) -> (i64, u32, u32) {
 }
 
 const TAU: f32 = std::f32::consts::TAU;
+
+fn paint_filled_circle(window: &mut Window, cx: f32, cy: f32, radius: f32, color: u32) {
+    if radius <= 0.2 {
+        return;
+    }
+    let mut builder = gpui::PathBuilder::fill();
+    let steps = 20usize;
+    for index in 0..=steps {
+        let t = index as f32 / steps as f32 * TAU;
+        let point = point(px(cx + radius * t.cos()), px(cy + radius * t.sin()));
+        if index == 0 {
+            builder.move_to(point);
+        } else {
+            builder.line_to(point);
+        }
+    }
+    if let Ok(path) = builder.build() {
+        window.paint_path(path, rgb(color));
+    }
+}
 
 fn paint_segment(
     window: &mut Window,
