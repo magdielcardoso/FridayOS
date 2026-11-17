@@ -3477,7 +3477,41 @@ fn persona() -> String {
         format!("\nMEMÓRIAS PERSISTENTES:\n{memories}")
     };
 
-    format!("{PERSONA_BASE}\n\n{manifest}{memories}")
+    // Metacognition: she starts every session knowing who she is and who the
+    // user is. These files are local, private and updated by self_update /
+    // user_update when the user states a durable fact or corrects her.
+    let mut identity = String::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        let dir = std::path::PathBuf::from(home).join("Library/Application Support/FridayOS");
+        for (label, file) in [("QUEM VOCÊ É", "self.json"), ("QUEM É O USUÁRIO", "user.json")] {
+            if let Some(value) = std::fs::read_to_string(dir.join(file))
+                .ok()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            {
+                let mut block = format!("\n{label}:\n");
+                if let Some(name) = value.get("name").and_then(|v| v.as_str()) {
+                    block.push_str(&format!("Nome: {name}\n"));
+                }
+                if let Some(role) = value.get("role").and_then(|v| v.as_str()).filter(|r| !r.is_empty()) {
+                    block.push_str(&format!("Papel: {role}\n"));
+                }
+                if let Some(facts) = value.get("facts").and_then(|v| v.as_array()) {
+                    for fact in facts.iter().rev().take(12) {
+                        if let Some(text) = fact.get("text").and_then(|v| v.as_str()) {
+                            block.push_str(&format!("- {text}\n"));
+                        }
+                    }
+                }
+                identity.push_str(&block);
+            }
+        }
+    }
+
+    let learning = "\nQuando o usuário disser quem é, o que faz ou uma preferência durável, \
+                   registre com `user_update`. Se ele corrigir algo sobre você, use `self_update`. \
+                   Use `metacognition` para recuperar esse contexto antes de responder sobre vocês dois.\n";
+
+    format!("{PERSONA_BASE}\n\n{manifest}{identity}{learning}{memories}")
 }
 
 fn approval_path() -> std::path::PathBuf {

@@ -29,6 +29,7 @@ pub mod webhooks;
 pub mod voice_prefs;
 pub mod reasoning;
 pub mod reason;
+pub mod self_knowledge;
 
 use crate::registry::Registry;
 
@@ -62,5 +63,6 @@ pub fn register_all(registry: &mut Registry) {
     voice_prefs::register(registry);
     reasoning::register(registry);
     reason::register(registry);
+    self_knowledge::register(registry);
     undo::register(registry);
 }
