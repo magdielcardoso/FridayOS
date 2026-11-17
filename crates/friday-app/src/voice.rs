@@ -25,7 +25,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use friday_core::auth::CodexAuth;
 use friday_core::wav::{encode_pcm16_wav, parse_wav};
-use friday_core::{stt, tts};
+use friday_core::tts;
 use friday_tools::tools::voice::{start as start_capture, write_wav, VoiceEvent, VoiceHandle};
 
 // ---------------------------------------------------------------------------
@@ -184,36 +184,25 @@ fn siri_transcribe_file(path: &Path) -> Result<String, String> {
 }
 
 pub fn transcribe_wav(path: &Path) -> Result<String, String> {
+    // Transcrição apenas no Mac (SFSpeechRecognizer on-device).
     let bytes = std::fs::read(path)
         .map_err(|e| format!("não foi possível ler {}: {e}", path.display()))?;
     let wav = normalize_for_stt(&bytes)?;
-
-    let (tx, rx) = std::sync::mpsc::channel();
-    thread::Builder::new()
-        .name("friday-stt".to_string())
-        .spawn(move || {
-            let result = runtime().and_then(|rt| {
-                rt.block_on(async move {
-                    let auth = CodexAuth::discover();
-                    stt::transcribe(&auth, wav)
-                        .await
-                        .map_err(|e| e.to_string())
-                })
-            });
-            let _ = tx.send(result);
-        })
-        .map_err(|e| format!("não foi possível iniciar a transcrição: {e}"))?;
-
-    let text = rx
-        .recv()
-        .map_err(|_| "a transcrição encerrou inesperadamente".to_string())??;
-    Ok(text.trim().to_string())
+    let local_path = temp_dir().join(format!(
+        "stt-input-{}-{}.wav",
+        std::process::id(),
+        stamp()
+    ));
+    let _ = std::fs::create_dir_all(temp_dir());
+    let _ = std::fs::write(&local_path, &wav);
+    let result = siri_transcribe_file(&local_path);
+    let _ = std::fs::remove_file(&local_path);
+    result
 }
 
 /// Fala o texto em voz alta (bloqueante), com cancelamento cooperativo.
-///
-/// Usa o read-aloud do ChatGPT; se falhar, cai para `/usr/bin/say` — a Friday
-/// nunca fica muda. Retorna cedo (`Ok(())`) quando `cancel` é acionado.
+/// Usa exclusivamente o read-aloud do ChatGPT. Nunca usa `say`, AV Foundation
+/// ou Piper. Retorna cedo (`Ok(())`) quando `cancel` é acionado.
 pub fn speak(text: &str, cancel: &Arc<AtomicBool>) -> Result<(), String> {
     let sentences = split_sentences(text);
     if sentences.is_empty() {
@@ -284,77 +273,8 @@ pub fn speak_quick_async(text: impl Into<String>) {
     });
 }
 
-/// Piper (local neural voice) paths. The venv and model live under the app's
-/// data dir; nothing is installed system-wide and no network is used at runtime.
-fn piper_dir() -> PathBuf {
-    let home = std::env::var_os("HOME").unwrap_or_default();
-    PathBuf::from(home)
-        .join("Library/Application Support/FridayOS/piper")
-}
-
-fn piper_python() -> PathBuf {
-    piper_dir().join("venv/bin/python")
-}
-
-fn piper_model() -> PathBuf {
-    piper_dir()
-        .join("models")
-        .join(std::env::var("FRIDAY_PIPER_MODEL").unwrap_or_else(|_| "dii_pt-BR.onnx".into()))
-}
-
-pub fn piper_ready() -> bool {
-    piper_python().is_file() && piper_model().is_file()
-}
-
-/// Synthesizes WAV with Piper. `rate` is a multiplier around 1.0; Piper's
-/// `length_scale` is inverse (higher = slower), so it is inverted here.
-fn synthesize_piper(text: &str, rate: f32) -> Result<PathBuf, String> {
-    let started = std::time::Instant::now();
-    let python = piper_python();
-    let model = piper_model();
-    let rate = rate.clamp(0.7, 1.4);
-    let out = temp_dir().join(format!(
-        "piper-{}-{}.wav",
-        std::process::id(),
-        stamp()
-    ));
-    let input = temp_dir().join(format!(
-        "piper-input-{}-{}.txt",
-        std::process::id(),
-        stamp()
-    ));
-    std::fs::write(&input, text).map_err(|error| format!("piper: {error}"))?;
-    let status = Command::new(python)
-        .arg("-m")
-        .arg("piper")
-        .arg("-m")
-        .arg(model)
-        .arg("-f")
-        .arg(&out)
-        .arg("-i")
-        .arg(&input)
-        .arg("--length-scale")
-        .arg((1.0 / rate).to_string())
-        .arg("--sentence-silence")
-        .arg("0.15")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|error| format!("piper: {error}"))?;
-    let _ = std::fs::remove_file(&input);
-    if !status.success() || !out.is_file() {
-        return Err("piper falhou ao sintetizar".to_string());
-    }
-    vlog(format!(
-        "piper: sintetizado {}ms · {}",
-        started.elapsed().as_millis(),
-        &text.chars().take(40).collect::<String>()
-    ));
-    Ok(out)
-}
-
-/// Speaks text locally. Piper is the default; the macOS voice is the fallback.
+/// Speaks text with the ChatGPT voice — the only voice Friday uses.
+/// Local STT stays on-device; synthesis is never replaced by `say`/Piper/AV.
 fn play_text(text: &str, cancel: &AtomicBool) -> Result<(), String> {
     stop_speaking();
     let text = text.trim();
@@ -362,97 +282,40 @@ fn play_text(text: &str, cancel: &AtomicBool) -> Result<(), String> {
         return Ok(());
     }
     friday_tools::tools::voice::mark_audible_playback();
-    let rate = f32::from_bits(PROSODY_RATE.load(Ordering::Relaxed));
-    let use_piper = std::env::var("FRIDAY_TTS_ENGINE")
-        .map(|value| value != "siri")
-        .unwrap_or(true);
-    if use_piper && piper_ready() {
-        if let Ok(wav) = synthesize_piper(text, rate) {
-            let result = play_wav(&wav, cancel);
-            let _ = std::fs::remove_file(&wav);
+
+    if let Some(path) = cache_lookup(text) {
+        let result = play_wav(&path, cancel);
+        set_speech_level(0.0);
+        return result;
+    }
+    if tts_blocked() {
+        vlog("voz do Codex em cooldown; permanecendo em silêncio");
+        return Ok(());
+    }
+
+    let rt = runtime()?;
+    let auth = CodexAuth::discover();
+    let started = std::time::Instant::now();
+    match synthesize_file(&rt, &auth, text) {
+        Ok(path) => {
+            vlog(format!(
+                "codex: sintetizado {}ms · {}",
+                started.elapsed().as_millis(),
+                &text.chars().take(40).collect::<String>()
+            ));
+            cache_store(text, &path);
+            let result = play_wav(&path, cancel);
+            let _ = std::fs::remove_file(&path);
             set_speech_level(0.0);
-            return result;
+            result
         }
-        vlog("piper indisponível; usando voz do sistema");
-    }
-    let helper = friday_tools::swift::helper("speech").map_err(|error| error.to_string())?;
-    let rate = f32::from_bits(PROSODY_RATE.load(Ordering::Relaxed));
-    let pitch = f32::from_bits(PROSODY_PITCH.load(Ordering::Relaxed));
-    let mut command = Command::new(helper);
-    let expressive = (rate - 1.0).abs() > 0.01 || (pitch - 1.0).abs() > 0.01;
-    if expressive {
-        command
-            .arg("speak-prosody")
-            .arg(rate.to_string())
-            .arg(pitch.to_string());
-    } else {
-        command.arg("speak");
-    }
-    let mut child = command
-        .arg(text)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("voz nativa: {error}"))?;
-
-    let stop_level = Arc::new(AtomicBool::new(false));
-    if let Some(pipe) = child.stdout.take() {
-        let flag = Arc::clone(&stop_level);
-        std::thread::spawn(move || {
-            use std::io::BufRead;
-            for line in std::io::BufReader::new(pipe).lines().flatten() {
-                if flag.load(Ordering::Relaxed) {
-                    break;
-                }
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
-                    if let Some(progress) = value.get("progress").and_then(|v| v.as_f64()) {
-                        set_speech_level((progress.clamp(0.0, 1.0) * 0.75) as f32);
-                    }
-                }
+        Err(error) => {
+            if error.contains("limite") {
+                block_tts(120);
             }
-        });
-    }
-    {
-        let mut slot = siri_playback()
-            .lock()
-            .map_err(|_| "estado de voz indisponível".to_string())?;
-        *slot = Some(child);
-    }
-
-    let result = loop {
-        if cancel.load(Ordering::Relaxed) {
-            stop_speaking();
-            break Ok(());
+            Err(error)
         }
-        let mut slot = match siri_playback().lock() {
-            Ok(slot) => slot,
-            Err(_) => break Ok(()),
-        };
-        match slot.as_mut() {
-            None => break Ok(()),
-            Some(child) => match child.try_wait() {
-                Ok(Some(status)) => {
-                    *slot = None;
-                    break if status.success() {
-                        Ok(())
-                    } else {
-                        Err("síntese nativa falhou".to_string())
-                    };
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    *slot = None;
-                    break Err(format!("voz nativa: {error}"));
-                }
-            },
-        }
-        drop(slot);
-        thread::sleep(Duration::from_millis(25));
-    };
-    stop_level.store(true, Ordering::Relaxed);
-    set_speech_level(0.0);
-    result
+    }
 }
 
 /// Current TTS amplitude (0..1), updated while afplay runs so the orb can
@@ -1180,7 +1043,7 @@ fn stream_sentences(
         if text.is_empty() {
             continue;
         }
-        vlog(format!("voz nativa: {}", &text.chars().take(60).collect::<String>()));
+        vlog(format!("voz codex: {}", &text.chars().take(60).collect::<String>()));
         play_text(text, cancel)?;
     }
     set_speech_level(0.0);

@@ -614,13 +614,12 @@ async fn transcribe(
         }
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "conversão falhou").into_response(),
     };
-    // On-device recognition first; the subscription backend is only a fallback.
-    let backend_bytes = bytes.clone();
-    let local = tokio::task::spawn_blocking(move || transcribe_local(bytes)).await;
-    let text = if let Ok(Ok(text)) = local {
-        Ok(text)
-    } else {
-        friday_core::stt::transcribe(&friday_core::auth::CodexAuth::discover(), backend_bytes).await
+    // Transcrição apenas no Mac (SFSpeechRecognizer on-device).
+    let text = tokio::task::spawn_blocking(move || transcribe_local(bytes)).await;
+    let text = match text {
+        Ok(Ok(text)) => Ok(text),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err("transcrição local falhou".to_string()),
     };
     match text {
         Ok(text) => Json(json!({ "ok": true, "text": text })).into_response(),
