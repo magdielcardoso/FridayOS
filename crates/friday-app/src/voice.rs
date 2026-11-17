@@ -25,7 +25,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use friday_core::auth::CodexAuth;
 use friday_core::wav::{encode_pcm16_wav, parse_wav};
-use friday_core::tts;
+use friday_core::{stt, tts};
 use friday_tools::tools::voice::{
     start as start_capture, start_aec, write_wav, VoiceEvent, VoiceHandle,
 };
@@ -262,20 +262,30 @@ fn siri_transcribe_file(path: &Path) -> Result<String, String> {
 }
 
 pub fn transcribe_wav(path: &Path) -> Result<String, String> {
-    // Transcrição apenas no Mac (SFSpeechRecognizer on-device).
+    // ChatGPT/Codex transcription is the source of truth: it is what the model
+    // actually receives, so the HUD transcript matches the prompt exactly.
     let bytes = std::fs::read(path)
         .map_err(|e| format!("não foi possível ler {}: {e}", path.display()))?;
     let wav = normalize_for_stt(&bytes)?;
-    let local_path = temp_dir().join(format!(
-        "stt-input-{}-{}.wav",
-        std::process::id(),
-        stamp()
-    ));
-    let _ = std::fs::create_dir_all(temp_dir());
-    let _ = std::fs::write(&local_path, &wav);
-    let result = siri_transcribe_file(&local_path);
-    let _ = std::fs::remove_file(&local_path);
-    result
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::Builder::new()
+        .name("friday-stt".to_string())
+        .spawn(move || {
+            let result = runtime().and_then(|rt| {
+                rt.block_on(async move {
+                    let auth = CodexAuth::discover();
+                    stt::transcribe(&auth, wav)
+                        .await
+                        .map_err(|e| e.to_string())
+                })
+            });
+            let _ = tx.send(result);
+        })
+        .map_err(|e| format!("não foi possível iniciar a transcrição: {e}"))?;
+    let text = rx
+        .recv()
+        .map_err(|_| "a transcrição encerrou inesperadamente".to_string())??;
+    Ok(text.trim().to_string())
 }
 
 /// Fala o texto em voz alta (bloqueante), com cancelamento cooperativo.
