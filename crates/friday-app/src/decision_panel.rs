@@ -1,4 +1,4 @@
-//! Painel seguro do "Sistema de decisão" para o caso sem token conectado.
+//! Painel seguro do "Sistema de decisão" (TypeSafe Jev) quando não há chave.
 //!
 //! O token pode ser digitado (campo sempre mascarado) ou colado direto da
 //! área de transferência via `pbpaste`, SEM exibir o conteúdo. Em ambos os
@@ -249,7 +249,7 @@ impl Render for DecisionPanel {
                                 div()
                                     .text_size(px(12.0))
                                     .text_color(rgb(0xff2f2f))
-                                    .child(SharedString::from("SISTEMA DE DECISÃO · TOKEN")),
+                                    .child(SharedString::from("SISTEMA DE DECISÃO · JEV (TYPESAFE)")),
                             ),
                     )
                     // Regra decorativa

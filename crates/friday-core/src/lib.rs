@@ -10,5 +10,6 @@ pub mod codex;
 pub mod stt;
 pub mod tts;
 pub mod wav;
+pub mod jev;
 
 pub use auth::{AuthError, CodexAuth, Session};

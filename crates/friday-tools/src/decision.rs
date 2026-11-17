@@ -6,7 +6,10 @@
 //! determinística e a função [`DecisionEngine::evaluate`] é total — nunca
 //! faz `panic!`.
 //!
-//! O módulo depende apenas de `std` e `serde_json`. Nenhum token é gravado em
+//! Fallback local, tipado e determinístico para o Sistema de decisão (Jev da
+//! TypeSafe). Quando há token, `friday_core::jev` faz a decisão remOTA; quando
+//! não há, este motor decide localmente sem custo. O módulo depende apenas de
+//! `std` e `serde_json`. Nenhum token é gravado em
 //! log, impresso ou devolvido em mensagens de erro.
 
 use std::collections::HashMap;
@@ -684,7 +687,7 @@ impl DecisionEngine {
 const MAX_TOKEN_CHARS: usize = 4096;
 static TOKEN_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Caminho do token: `~/Library/Application Support/FridayOS/decision-token.json`.
+/// Caminho da chave TypeSafe Jev: `~/Library/Application Support/FridayOS/decision-token.json`.
 pub fn token_path() -> PathBuf {
     let home = std::env::var_os("HOME").unwrap_or_default();
     PathBuf::from(home)

@@ -127,7 +127,7 @@ Never claim a result before seeing the tool output. Never invent paths, files
 or command output. If the user asks for something possible, do it instead of
 explaining how they could do it.";
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum Status {
     Connecting,
     Online,
@@ -1235,54 +1235,63 @@ impl FridayApp {
                     Err(_) => std::collections::VecDeque::new(),
                 };
                 for trigger in triggers {
-                    let critical = trigger.prompt.contains("urgente")
-                        || trigger.prompt.contains("[urgente]")
-                        || trigger.prompt.contains("erro")
-                        || trigger.prompt.contains("autoheal");
-                    let secs = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs() % 86_400)
-                        .unwrap_or(0);
-                    let fact = friday_tools::decision::Fact {
-                        source: trigger.source.clone(),
-                        text: trigger.prompt.clone(),
-                        app: app.active_app.clone(),
-                        mode: app.presence.mode().to_string(),
-                        hour: (((secs / 3_600) + 21) % 24) as u32,
-                        minute: ((secs / 60) % 60) as u32,
-                        urgency: if critical { 3 } else { 1 },
-                        mission_status: String::new(),
-                        clipboard_preview: String::new(),
-                    };
-                    let now_secs = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    let result = app.decision_engine.evaluate(&fact, now_secs);
-                    trace(json!({
-                        "event": "decision",
-                        "source": trigger.source,
-                        "decision": format!("{:?}", result.decision),
-                        "rule": result.rule,
-                        "reason": result.reason,
-                    }));
-                    match result.decision {
-                        friday_tools::decision::Decision::Hold => {
-                            app.external_pending
-                                .push_back((trigger.source, trigger.prompt));
-                        }
-                        friday_tools::decision::Decision::Drop => {}
-                        friday_tools::decision::Decision::NotifyPush => {
-                            mobile::notify_push(&trigger.source, &trigger.prompt);
-                        }
-                        _ => {
-                            if app.status == Status::Thinking {
-                                app.external_pending
-                                    .push_back((trigger.source, trigger.prompt));
-                            } else {
-                                app.inject_trigger(trigger.source, trigger.prompt, cx);
+                    let source = trigger.source;
+                    let prompt = trigger.prompt;
+                    if let Ok(token) = friday_tools::decision::read_token() {
+                        // Sistema de decisão (TypeSafe Jev): decisão tipada e
+                        // rápida, sem acionar o modelo principal.
+                        let state = json!({
+                            "source": source,
+                            "text": prompt,
+                            "active_app": app.active_app,
+                            "mode": app.presence.mode(),
+                            "status": format!("{:?}", app.status),
+                        });
+                        let routed_source = source.clone();
+                        let routed_prompt = prompt.clone();
+                        cx.spawn(async move |this, cx| {
+                            match friday_core::jev::decide(&token, state).await {
+                                Ok(result) => {
+                                    trace(json!({
+                                        "event": "decision",
+                                        "engine": "jev",
+                                        "model": result.model,
+                                        "source": routed_source,
+                                        "channel": result.channel,
+                                        "urgency": result.urgency,
+                                        "needs_decision": result.needs_decision,
+                                        "confidence": result.confidence,
+                                        "input_tokens": result.input_tokens,
+                                    }));
+                                    let decision = match result.channel.as_str() {
+                                        "ignore" => friday_tools::decision::Decision::Drop,
+                                        "hold" => friday_tools::decision::Decision::Hold,
+                                        "overlay" => friday_tools::decision::Decision::NotifyOverlay,
+                                        "push" => friday_tools::decision::Decision::NotifyPush,
+                                        "voice" => friday_tools::decision::Decision::Speak,
+                                        _ => friday_tools::decision::Decision::Hold,
+                                    };
+                                    let _ = this.update(cx, |app, cx| {
+                                        app.route_trigger(routed_source, routed_prompt, decision, cx);
+                                    });
+                                }
+                                Err(error) => {
+                                    trace(json!({
+                                        "event": "decision",
+                                        "engine": "jev-error",
+                                        "error": error.to_string(),
+                                    }));
+                                    let _ = this.update(cx, |app, cx| {
+                                        let decision = app.local_decision(&routed_source, &routed_prompt).decision;
+                                        app.route_trigger(routed_source, routed_prompt, decision, cx);
+                                    });
+                                }
                             }
-                        }
+                        })
+                        .detach();
+                    } else {
+                        let decision = app.local_decision(&source, &prompt).decision;
+                        app.route_trigger(source, prompt, decision, cx);
                     }
                 }
                 cx.notify();
@@ -1985,6 +1994,85 @@ impl FridayApp {
         }
         self.scroll.scroll_to_bottom();
         cx.notify();
+    }
+
+    /// Local typed-rule fallback used when Jev is not connected or fails.
+    fn local_decision(
+        &mut self,
+        source: &str,
+        prompt: &str,
+    ) -> friday_tools::decision::DecisionResult {
+        let critical = prompt.contains("urgente")
+            || prompt.contains("[urgente]")
+            || prompt.contains("erro")
+            || prompt.contains("autoheal");
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() % 86_400)
+            .unwrap_or(0);
+        let fact = friday_tools::decision::Fact {
+            source: source.to_string(),
+            text: prompt.to_string(),
+            app: self.active_app.clone(),
+            mode: self.presence.mode().to_string(),
+            hour: (((secs / 3_600) + 21) % 24) as u32,
+            minute: ((secs / 60) % 60) as u32,
+            urgency: if critical { 3 } else { 1 },
+            mission_status: String::new(),
+            clipboard_preview: String::new(),
+        };
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let result = self.decision_engine.evaluate(&fact, now_secs);
+        trace(json!({
+            "event": "decision",
+            "engine": "local",
+            "source": source,
+            "decision": format!("{:?}", result.decision),
+            "rule": result.rule,
+            "reason": result.reason,
+        }));
+        result
+    }
+
+    /// Applies a decision from Jev or from the local engine.
+    fn route_trigger(
+        &mut self,
+        source: String,
+        prompt: String,
+        decision: friday_tools::decision::Decision,
+        cx: &mut Context<Self>,
+    ) {
+        use friday_tools::decision::Decision;
+        match decision {
+            Decision::Hold => self.external_pending.push_back((source, prompt)),
+            Decision::Drop => {}
+            Decision::NotifyPush => mobile::notify_push(&source, &prompt),
+            Decision::NotifyOverlay => {
+                open_overlay(
+                    cx,
+                    OverlayRequest {
+                        title: source,
+                        body: prompt.chars().take(420).collect(),
+                        anchor: "top-right".into(),
+                        width: 440.0,
+                        height: 0.0,
+                        offset_x: 0.0,
+                        offset_y: 0.0,
+                        seconds: 20,
+                    },
+                );
+            }
+            _ => {
+                if self.status == Status::Thinking {
+                    self.external_pending.push_back((source, prompt));
+                } else {
+                    self.inject_trigger(source, prompt, cx);
+                }
+            }
+        }
     }
 
     /// No turn may hang forever: if no completion arrives, the UI returns to a
