@@ -376,7 +376,7 @@ impl Drop for VoiceHandle {
 /// Drops leading and trailing frames below `threshold`, keeping a 120 ms
 /// margin on each side so consonants are not clipped. Trimming before STT is
 /// what turns a 30 s noisy capture into a usable clip.
-fn trim_edges(samples: &[f32], gate: f32) -> Vec<f32> {
+fn trim_edges(samples: &[f32], _gate: f32) -> Vec<f32> {
     let frame = FRAME_SIZE / 4;
     if samples.len() <= frame * 2 {
         return samples.to_vec();
@@ -386,7 +386,7 @@ fn trim_edges(samples: &[f32], gate: f32) -> Vec<f32> {
     let peak = samples
         .iter()
         .fold(0.0f32, |acc, sample| acc.max(sample.abs()));
-    let threshold = (peak * 0.1).clamp(0.005, (gate * 0.6).max(0.02));
+    let threshold = (peak * 0.06).max(0.004);
     let energy = |chunk: &[f32]| {
         (chunk.iter().map(|s| s * s).sum::<f32>() / chunk.len().max(1) as f32).sqrt()
     };
@@ -443,14 +443,10 @@ impl Agc {
         } else {
             self.floor += (rms - self.floor) * 0.005;
         }
-        // Aim for ~0.34 RMS on speech. The old ceiling kept noise under 0.10,
-        // which capped gain at ~2.5x in a normal room and left quiet speech
-        // inaudible. Quiet speech is the important signal here: allow more
-        // gain, but clamp noise so a loud room never runs away.
-        let wanted = (0.34 / self.peak.max(0.001)).clamp(1.0, 12.0);
-        let ceiling = (0.035 / self.floor.max(0.0005)).clamp(1.5, 12.0);
-        let target = wanted.min(ceiling);
-        self.gain += (target - self.gain) * 0.12;
+        // No noise-driven gain reduction: user asked for the raw, boosted mic.
+        // AEC already removes playback echo; the VAD uses a low absolute gate.
+        let target = (0.45 / self.peak.max(0.001)).clamp(1.0, 16.0);
+        self.gain += (target - self.gain) * 0.18;
         if (self.gain - 1.0).abs() > 0.01 {
             for sample in samples.iter_mut() {
                 *sample = (*sample * self.gain).clamp(-1.0, 1.0);
@@ -530,18 +526,9 @@ impl VadState {
 
         // Learn the room for ~1.5 s before trusting the gate: mics differ a lot
         // and a noisy fan would otherwise look like non-stop speech.
-        if self.calibrated < 10 {
-            self.noise = self.noise.max(rms).min(0.2);
-            self.calibrated += 1;
-            return;
-        }
-        if !self.in_speech {
-            let target = rms.clamp(0.002, 0.08);
-            self.noise += (target - self.noise) * 0.04;
-        }
-        // Relative to the measured room: absolute thresholds broke completely
-        // when the input volume was lowered.
-        let gate = (self.noise * 2.2).max(SPEECH_THRESHOLD).min(0.22);
+        // Absolute, low gate. No room-noise estimate: it was raising the
+        // threshold exactly when the user spoke quietly.
+        let gate = SPEECH_THRESHOLD;
 
         // While Friday speaks, the microphone also hears her. Never treat that
         // as an utterance: only a much louder voice after a short grace period
@@ -565,7 +552,7 @@ impl VadState {
             // Her own voice through the speakers sets the reference. A real
             // interruption has to be clearly louder than the echo we measured.
             let echo_bar = (self.echo_ref * 1.3).min(0.95);
-            let barge_gate = (self.noise * 4.0).max(BARGE_THRESHOLD).max(echo_bar);
+            let barge_gate = BARGE_THRESHOLD.max(echo_bar);
             if rms >= barge_gate {
                 self.barge_run += 1;
             } else {
@@ -602,7 +589,7 @@ impl VadState {
         // still count as speech. The sustain threshold must stay above the room
         // noise, otherwise a loud room (mic at 100%) keeps the utterance open
         // until the 30 s cap and sends noise to STT.
-        let sustain = (gate * 0.65).max(self.noise * 1.3).min(0.45);
+        let sustain = (gate * 0.70).min(0.45);
         let voiced = rms >= if self.in_speech { sustain } else { gate };
 
         self.pre_roll.push_back(frame.to_vec());
@@ -639,10 +626,6 @@ impl VadState {
             self.silence_frames = 0;
         } else {
             self.silence_frames += 1;
-            // Adapt the floor during silence inside a sentence, so a slowly
-            // rising fan/AC cannot hold the utterance open forever.
-            let target = rms.clamp(0.002, 0.1);
-            self.noise += (target - self.noise) * 0.02;
         }
 
         // Short commands close quickly; longer thoughts get room for a natural
