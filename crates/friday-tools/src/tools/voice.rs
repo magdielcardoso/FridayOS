@@ -443,11 +443,14 @@ impl Agc {
         } else {
             self.floor += (rms - self.floor) * 0.005;
         }
-        // Aim for ~0.30 RMS on speech, but never amplify noise above ~0.10.
-        let wanted = (0.30 / self.peak.max(0.001)).clamp(1.0, 8.0);
-        let ceiling = (0.10 / self.floor.max(0.001)).clamp(1.0, 8.0);
+        // Aim for ~0.34 RMS on speech. The old ceiling kept noise under 0.10,
+        // which capped gain at ~2.5x in a normal room and left quiet speech
+        // inaudible. Quiet speech is the important signal here: allow more
+        // gain, but clamp noise so a loud room never runs away.
+        let wanted = (0.34 / self.peak.max(0.001)).clamp(1.0, 12.0);
+        let ceiling = (0.035 / self.floor.max(0.0005)).clamp(1.5, 12.0);
         let target = wanted.min(ceiling);
-        self.gain += (target - self.gain) * 0.08;
+        self.gain += (target - self.gain) * 0.12;
         if (self.gain - 1.0).abs() > 0.01 {
             for sample in samples.iter_mut() {
                 *sample = (*sample * self.gain).clamp(-1.0, 1.0);
@@ -615,7 +618,9 @@ impl VadState {
             } else {
                 self.voiced_run = 0;
             }
-            if self.voiced_run >= 2 {
+            // One frame (~0.25 s) is enough for quiet speech; a click does not
+            // survive `trim_edges` and the minimum length check below.
+            if self.voiced_run >= 1 {
                 self.in_speech = true;
                 self.silence_frames = 0;
                 self.frames_captured = self.pre_roll.len();
