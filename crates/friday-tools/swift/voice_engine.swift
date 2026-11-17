@@ -86,8 +86,8 @@ final class LinearResampler {
 // MARK: - Engine host
 
 final class VoiceEngineHost {
-    let engine = AVAudioEngine()
-    let player = AVAudioPlayerNode()
+    var engine = AVAudioEngine()
+    var player = AVAudioPlayerNode()
     /// Guards the capture state (tap callback runs on an audio thread).
     let lock = NSLock()
     let resampler = LinearResampler()
@@ -111,6 +111,15 @@ final class VoiceEngineHost {
 
     func prepare() throws {
         if !started {
+            // AVAudioEngine voice processing (-66784) fails intermittently when
+            // the default output device changes (headphones <-> speakers).
+            // Rebuild the engine so the AEC graph matches the current device.
+            if engine.isRunning { engine.stop() }
+            engine = AVAudioEngine()
+            player = AVAudioPlayerNode()
+            engine.attach(player)
+            engine.connect(player, to: engine.mainMixerNode, format: nil)
+            tapInstalled = false
             if #available(macOS 10.15, *) {
                 do {
                     try engine.inputNode.setVoiceProcessingEnabled(true)

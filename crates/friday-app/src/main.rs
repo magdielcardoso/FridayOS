@@ -1198,27 +1198,49 @@ impl FridayApp {
                     std::thread::spawn(voice::prune_utterances);
                 }
                 if app.tick % 11 == 0 {
-                    for event in friday_tools::watcher_events::take_native_events(8) {
-                        let source = event
-                            .get("event")
-                            .and_then(|value| value.as_str())
-                            .unwrap_or("change");
-                        let text = event.to_string();
-                        let fact = friday_tools::decision::facts_from_context(
-                            &format!("native:{source}"),
-                            &text,
-                        );
-                        let now_secs = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        let result = app.decision_engine.evaluate(&fact, now_secs);
-                        app.route_trigger(
-                            format!("native:{source}"),
-                            text,
-                            result.decision,
-                            cx,
-                        );
+                    let events = friday_tools::watcher_events::take_native_events(8);
+                    // App focus changes are CONTEXT, not events to narrate.
+                    // Only act on explicit action-worthy sources; routine
+                    // clipboard/file churn stays in the ring for snapshot_now().
+                    let actionable = matches!(
+                        events.iter().find_map(|event| {
+                            event.get("event").and_then(|value| value.as_str())
+                        }),
+                        Some("imessage") | Some("mail") | Some("change")
+                    );
+                    if actionable {
+                        for event in events {
+                            let source = event
+                                .get("event")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("change");
+                            // App events never become spoken triggers.
+                            if source == "app" {
+                                continue;
+                            }
+                            let text = event.to_string();
+                            let fact = friday_tools::decision::facts_from_context(
+                                &format!("native:{source}"),
+                                &text,
+                            );
+                            let now_secs = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            let result = app.decision_engine.evaluate(&fact, now_secs);
+                            // Only explicit escalation/notification decisions wake
+                            // the model. `Allow` is silently absorbed as context.
+                            match result.decision {
+                                friday_tools::decision::Decision::Allow
+                                | friday_tools::decision::Decision::Hold => {}
+                                other => app.route_trigger(
+                                    format!("native:{source}"),
+                                    text,
+                                    other,
+                                    cx,
+                                ),
+                            }
+                        }
                     }
                 }
                 let mode = app.presence.mode().to_string();

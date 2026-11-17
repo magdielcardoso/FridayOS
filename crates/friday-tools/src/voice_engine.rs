@@ -158,21 +158,64 @@ pub fn play(path: &Path) -> Result<(), String> {
         return Err(format!("arquivo de áudio não encontrado: {}", path.display()));
     }
     let command = format!("play {}", path.display());
-    let mut guard = lock_engine()?;
-    let proc = ensure_engine(&mut guard)?;
-    send(proc, &command)?;
-    wait_for_event(proc, &["play-done", "play-stopped"])?;
-    Ok(())
+    // Respawn once on a dead helper (device change / AVAudioEngine error).
+    for attempt in 0..2 {
+        let result = (|| -> Result<(), String> {
+            let mut guard = lock_engine()?;
+            let proc = ensure_engine(&mut guard)?;
+            send(proc, &command)?;
+            wait_for_event(proc, &["play-done", "play-stopped"])?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt == 0 && is_dead_helper(&error) => {
+                reset_engine();
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err("voice_engine: falha ao reproduzir".into())
+}
+
+fn is_dead_helper(error: &str) -> bool {
+    error.contains(" Broken pipe")
+        || error.contains("processo encerrou")
+        || error.contains("-66784")
+        || error.contains("coreaudio")
+}
+
+fn reset_engine() {
+    if let Ok(mut guard) = lock_engine() {
+        if let Some(mut proc) = guard.take() {
+            let _ = proc.child.kill();
+            let _ = proc.child.wait();
+        }
+    }
 }
 
 /// Starts streaming voice-processed (AEC) microphone PCM16 into `path`.
 pub fn start_stream(path: &Path) -> Result<(), String> {
     let command = format!("stream-start {}", path.display());
-    let mut guard = lock_engine()?;
-    let proc = ensure_engine(&mut guard)?;
-    send(proc, &command)?;
-    wait_for_event(proc, &["stream-started"])?;
-    Ok(())
+    for attempt in 0..2 {
+        let result = (|| -> Result<(), String> {
+            let mut guard = lock_engine()?;
+            let proc = ensure_engine(&mut guard)?;
+            send(proc, &command)?;
+            wait_for_event(proc, &["stream-started"])?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt == 0 && is_dead_helper(&error) => {
+                reset_engine();
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err("voice_engine: falha ao iniciar captura".into())
 }
 
 /// Stops the streaming tap.
