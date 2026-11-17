@@ -120,7 +120,22 @@ impl Registry {
             .ok_or_else(|| ToolError::NotFound(name.to_string()))?;
         tool.authorize(ctx)?;
         ctx.audit.record(name, tool.spec().risk, args, ctx.dry_run);
-        tool.call(args, ctx)
+
+        // Snapshot whatever the action is about to change *before* it runs,
+        // then journal it only if the call actually succeeded. Dry runs perform
+        // no action, so they never enter the action journal.
+        let journaling = !ctx.dry_run && crate::tools::undo::is_mutating_tool(name);
+        let backup = journaling
+            .then(|| crate::tools::undo::capture_backup(name, args, ctx));
+
+        let result = tool.call(args, ctx);
+
+        if journaling && result.is_ok() {
+            if let Some(backup) = backup {
+                crate::tools::undo::record_action(name, args, backup, ctx);
+            }
+        }
+        result
     }
 }
 

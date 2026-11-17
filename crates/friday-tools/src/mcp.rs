@@ -68,17 +68,27 @@ pub fn run(registry: Registry) -> ! {
     let stdout = io::stdout();
     let mut out = BufWriter::new(stdout.lock());
 
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(line) => line,
+    let mut reader = stdin.lock();
+    loop {
+        // Bounded read: `lines()` would grow a single newline-free frame until
+        // the process ran out of memory.
+        let mut buffer = String::new();
+        let read = match io::BufRead::read_line(&mut reader, &mut buffer) {
+            Ok(read) => read,
             Err(err) => {
                 eprintln!("friday-mcp: erro lendo stdin: {err}");
                 let _ = out.flush();
                 std::process::exit(1);
             }
         };
-
-        let line = line.trim();
+        if read == 0 {
+            break;
+        }
+        if buffer.len() > 8 * 1024 * 1024 {
+            eprintln!("friday-mcp: frame grande demais; ignorando");
+            continue;
+        }
+        let line = buffer.trim();
         if line.is_empty() {
             continue;
         }
@@ -499,12 +509,16 @@ fn tools_call(registry: &Registry, id: Option<Value>, params: &Value) -> Outcome
                     .get("arguments")
                     .cloned()
                     .unwrap_or_else(|| json!({}));
-                if let (Some(confirm), Some(dry)) = (
-                    args.get("__confirm").and_then(Value::as_bool),
-                    args.get("__dry_run").and_then(Value::as_bool),
-                ) {
-                    if let Value::Object(map) = &mut call_args {
+                // Forward each flag on its own. Requiring both meant `__confirm`
+                // alone was dropped (sensitive tools could never be confirmed)
+                // and `__dry_run` alone was ignored (the tool really executed).
+                let confirm_flag = args.get("__confirm").and_then(Value::as_bool);
+                let dry_flag = args.get("__dry_run").and_then(Value::as_bool);
+                if let Value::Object(map) = &mut call_args {
+                    if let Some(confirm) = confirm_flag {
                         map.insert("__confirm".into(), json!(confirm));
+                    }
+                    if let Some(dry) = dry_flag {
                         map.insert("__dry_run".into(), json!(dry));
                     }
                 }
@@ -597,7 +611,9 @@ fn tools_call(registry: &Registry, id: Option<Value>, params: &Value) -> Outcome
     }
 
     let risk = tool.spec().risk;
-    if risk.needs_confirmation() && !confirmed {
+    // A dry run performs no action by contract, so it does not need the user's
+    // confirmation; requiring it made `__dry_run` alone pointless.
+    if risk.needs_confirmation() && !confirmed && !dry_run {
         eprintln!("friday-mcp: `{name}` exige confirmação (risco {})", risk.label());
         let payload = json!({
             "error": "confirmation_required",
@@ -819,13 +835,20 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_is_empty_for_an_empty_registry() {
+    fn tools_list_matches_mode_for_an_empty_registry() {
         let response = answered(dispatch(
             &Registry::new(),
             r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
         ));
-
-        assert!(response["result"]["tools"].as_array().unwrap().is_empty());
+        let tools = response["result"]["tools"].as_array().unwrap();
+        if compact_mode() {
+            // Compact mode always exposes the three discovery meta-tools.
+            assert!(tools.iter().any(|tool| tool["name"] == "exec"));
+            assert!(tools.iter().any(|tool| tool["name"] == "search"));
+            assert!(tools.iter().any(|tool| tool["name"] == "schema"));
+        } else {
+            assert!(tools.is_empty());
+        }
     }
 
     #[test]

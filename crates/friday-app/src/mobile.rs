@@ -119,7 +119,11 @@ pub fn user_message(text: &str) {
 pub fn assistant_delta(text: &str) {
     if let Some(bridge) = bridge() {
         if let Ok(mut streaming) = bridge.streaming.lock() {
-            streaming.push_str(text);
+            // Bounded: the buffer is only a convenience and used to grow for
+            // the whole session.
+            if streaming.len() < 8_192 {
+                streaming.push_str(text);
+            }
         }
         let _ = bridge.events.send(Event::Delta {
             text: text.into(),
@@ -179,7 +183,11 @@ pub fn notify_push(title: &str, body: &str) {
 }
 
 struct MobileState {
-    pair_code: String,
+    pair_code: Mutex<String>,
+    /// Failed pairing attempts per IP, with the first attempt time.
+    pair_failures: Mutex<HashMap<IpAddr, (Instant, u32)>>,
+    /// After too many failures the code is rotated and pairing is locked.
+    pair_locked_until: Mutex<Option<Instant>>,
     session_token: String,
     secure_cookie: bool,
     vapid_public: String,
@@ -199,8 +207,27 @@ fn data_dir() -> PathBuf {
 pub fn pair_code() -> String {
     STATE
         .get()
-        .map(|state| state.pair_code.clone())
+        .and_then(|state| state.pair_code.lock().ok().map(|code| code.clone()))
         .unwrap_or_default()
+}
+
+/// Rotates the pairing code and persists it. The phone keeps its session
+/// cookie, so this only invalidates the old code.
+fn rotate_pair_code(state: &MobileState) {
+    let fresh: String = random_hex(3).chars().take(6).collect();
+    if let Ok(mut code) = state.pair_code.lock() {
+        *code = fresh.clone();
+    }
+    let path = data_dir().join("mobile.json");
+    let mut value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    value["pair_code"] = serde_json::json!(fresh);
+    if let Ok(text) = serde_json::to_vec_pretty(&value) {
+        let _ = std::fs::write(&path, text);
+    }
+    mlog(&format!("novo código de pareamento: {fresh}"));
 }
 
 fn random_hex(bytes: usize) -> String {
@@ -464,11 +491,49 @@ struct PairBody {
 
 async fn pair(
     State(state): State<Arc<MobileState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<PairBody>,
 ) -> Response {
-    if body.code.trim().to_uppercase() != state.pair_code {
+    let addr = addr.ip();
+    if let Ok(lock) = state.pair_locked_until.lock() {
+        if lock.map(|until| Instant::now() < until).unwrap_or(false) {
+            return (StatusCode::TOO_MANY_REQUESTS, "aguarde antes de tentar de novo")
+                .into_response();
+        }
+    }
+    let attempt = body.code.trim().to_uppercase();
+    let expected = state
+        .pair_code
+        .lock()
+        .map(|code| code.clone())
+        .unwrap_or_default();
+    if attempt != expected {
+        let now = Instant::now();
+        let mut rotate = false;
+        if let Ok(mut failures) = state.pair_failures.lock() {
+            let entry = failures.entry(addr).or_insert((now, 0));
+            if now.duration_since(entry.0) > Duration::from_secs(600) {
+                *entry = (now, 0);
+            }
+            entry.1 += 1;
+            if entry.1 >= 5 {
+                rotate = true;
+                *entry = (now, 0);
+            }
+        }
+        if rotate {
+            if let Ok(mut lock) = state.pair_locked_until.lock() {
+                *lock = Some(Instant::now() + Duration::from_secs(60));
+            }
+            rotate_pair_code(&state);
+        }
+        // Small delay makes brute force expensive even before the lockout.
+        tokio::time::sleep(Duration::from_millis(400)).await;
         return (StatusCode::UNAUTHORIZED, "código inválido").into_response();
+    }
+    if let Ok(mut failures) = state.pair_failures.lock() {
+        failures.remove(&addr);
     }
     // Secure cookies are dropped by browsers over plain HTTP. Tailscale Serve
     // terminates TLS and forwards X-Forwarded-Proto; use that signal, and fall
@@ -539,8 +604,25 @@ async fn transcribe(
     if body.len() < 1000 || body.len() > MAX_BODY {
         return (StatusCode::BAD_REQUEST, "áudio inválido").into_response();
     }
-    let bytes = body.to_vec();
-    match friday_core::stt::transcribe(&friday_core::auth::CodexAuth::discover(), bytes).await {
+    // iOS sends m4a/ogg; the backend wants PCM16 mono 16 kHz WAV. Convert here
+    // instead of uploading mislabeled bytes that transcribe as noise.
+    let raw = body.to_vec();
+    let bytes = match tokio::task::spawn_blocking(move || normalize_audio(raw)).await {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(error)) => {
+            return (StatusCode::BAD_REQUEST, error).into_response();
+        }
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "conversão falhou").into_response(),
+    };
+    // On-device recognition first; the subscription backend is only a fallback.
+    let backend_bytes = bytes.clone();
+    let local = tokio::task::spawn_blocking(move || transcribe_local(bytes)).await;
+    let text = if let Ok(Ok(text)) = local {
+        Ok(text)
+    } else {
+        friday_core::stt::transcribe(&friday_core::auth::CodexAuth::discover(), backend_bytes).await
+    };
+    match text {
         Ok(text) => Json(json!({ "ok": true, "text": text })).into_response(),
         Err(error) => (
             StatusCode::BAD_GATEWAY,
@@ -548,6 +630,89 @@ async fn transcribe(
         )
             .into_response(),
     }
+}
+
+/// On-device Siri/Dictation transcription of a WAV, with no network call.
+fn transcribe_local(bytes: Vec<u8>) -> Result<String, String> {
+    let dir = std::env::temp_dir().join("friday-mobile-upload");
+    std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    let path = dir.join(format!(
+        "stt-{}-{}.wav",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::write(&path, &bytes).map_err(|error| error.to_string())?;
+    let helper = friday_tools::swift::helper("speech").map_err(|error| error.to_string())?;
+    let output = std::process::Command::new(helper)
+        .arg("transcribe")
+        .arg(&path)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|error| error.to_string());
+    let _ = std::fs::remove_file(&path);
+    let output = output.map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err("reconhecimento local falhou".into());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines().rev() {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(text) = value.get("text").and_then(|value| value.as_str()) {
+                if !text.trim().is_empty() {
+                    return Ok(text.trim().to_string());
+                }
+            }
+        }
+    }
+    Err("reconhecimento local sem texto".into())
+}
+
+/// Converts any audio the phone sends into PCM16 mono 16 kHz WAV.
+fn normalize_audio(bytes: Vec<u8>) -> Result<Vec<u8>, String> {
+    if bytes.len() > 44 && &bytes[0..4] == b"RIFF" {
+        // Already a WAV: resample only if needed.
+        let pcm = friday_core::wav::parse_wav(&bytes).map_err(|e| e.to_string())?;
+        if pcm.sample_rate == 16_000 && pcm.channels == 1 {
+            return Ok(bytes);
+        }
+    }
+    let extension = if bytes.starts_with(b"OggS") {
+        "ogg"
+    } else if bytes.starts_with(b"fLaC") {
+        "flac"
+    } else {
+        "m4a"
+    };
+    let dir = std::env::temp_dir().join("friday-mobile-upload");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let stem = format!(
+        "upload-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let input = dir.join(format!("{stem}.{extension}"));
+    let output = dir.join(format!("{stem}.wav"));
+    std::fs::write(&input, &bytes).map_err(|e| e.to_string())?;
+    let status = std::process::Command::new("/usr/bin/afconvert")
+        .args(["-f", "WAVE", "-d", "LEI16@16000", "-c", "1"])
+        .arg(&input)
+        .arg(&output)
+        .status()
+        .map_err(|e| format!("afconvert: {e}"))?;
+    let result = if status.success() {
+        std::fs::read(&output).map_err(|e| e.to_string())
+    } else {
+        Err("formato de áudio não suportado".to_string())
+    };
+    let _ = std::fs::remove_file(&input);
+    let _ = std::fs::remove_file(&output);
+    result
 }
 
 async fn ws_handler(
@@ -581,29 +746,55 @@ async fn ws_handler(
     ws.on_upgrade(move |socket| stream_ws(socket))
 }
 
+/// Sends the whole history; also used to resynchronize after the broadcast
+/// channel lagged.
+async fn send_history(
+    socket: &mut axum::extract::ws::WebSocket,
+    bridge: &Bridge,
+) -> Result<(), axum::Error> {
+    let history = bridge.history.lock().map(|h| h.clone()).unwrap_or_default();
+    let message = serde_json::to_string(&Event::History { messages: history })
+        .unwrap_or_else(|_| "{}".into());
+    socket.send(WsMessage::Text(message.into())).await
+}
+
 async fn stream_ws(mut socket: axum::extract::ws::WebSocket) {
     let Some(bridge) = bridge() else {
         return;
     };
-    let history = bridge.history.lock().map(|h| h.clone()).unwrap_or_default();
-    let message = serde_json::to_string(&Event::History { messages: history })
-        .unwrap_or_else(|_| "{}".into());
-    if socket.send(WsMessage::Text(message.into())).await.is_err() {
+    // Subscribe before the snapshot: events emitted while the history was
+    // being serialized used to be lost.
+    let mut receiver = bridge.events.subscribe();
+    if send_history(&mut socket, &bridge).await.is_err() {
         return;
     }
-    let mut receiver = bridge.events.subscribe();
     loop {
-        match receiver.recv().await {
-            Ok(event) => {
-                let Ok(text) = serde_json::to_string(&event) else {
-                    continue;
-                };
-                if socket.send(WsMessage::Text(text.into())).await.is_err() {
-                    break;
+        tokio::select! {
+            incoming = socket.recv() => {
+                // Notice client close/ping instead of keeping a dead
+                // subscription alive forever.
+                match incoming {
+                    Some(Ok(_)) => continue,
+                    _ => break,
                 }
             }
-            Err(broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(_) => break,
+            event = receiver.recv() => match event {
+                Ok(event) => {
+                    let Ok(text) = serde_json::to_string(&event) else {
+                        continue;
+                    };
+                    if socket.send(WsMessage::Text(text.into())).await.is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    // Resynchronize the phone instead of leaving it blank.
+                    if send_history(&mut socket, &bridge).await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
         }
     }
 }
@@ -744,7 +935,24 @@ async fn send_push(state: &MobileState, title: &str, body: &str, url: &str) -> V
             }
         }
     }
-    save_subscriptions(&alive);
+    // Merge instead of overwriting: a subscription registered while the pushes
+    // were in flight used to be deleted by this stale snapshot.
+    let known: std::collections::HashSet<String> = alive
+        .iter()
+        .filter_map(|item| item.get("endpoint").and_then(|v| v.as_str()).map(str::to_string))
+        .collect();
+    let mut merged = alive;
+    for item in load_subscriptions() {
+        let endpoint = item
+            .get("endpoint")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if !endpoint.is_empty() && !known.contains(&endpoint) {
+            merged.push(item);
+        }
+    }
+    save_subscriptions(&merged);
     json!({ "ok": sent > 0, "sent": sent, "failed": failed })
 }
 
@@ -794,15 +1002,17 @@ fn mlog(message: &str) {
     }
 }
 
-pub fn start(port: u16) -> String {
+pub fn start(port: u16) -> Option<String> {
     let (pair_code, session_token) = load_config();
     let Some((vapid_public, vapid_private)) = ensure_vapid() else {
-        mlog("VAPID indisponível");
-        return pair_code;
+        mlog("VAPID indisponível; servidor móvel não iniciado");
+        return None;
     };
     mlog("VAPID pronto");
     let state = Arc::new(MobileState {
-        pair_code: pair_code.clone(),
+        pair_code: Mutex::new(pair_code.clone()),
+        pair_failures: Mutex::new(HashMap::new()),
+        pair_locked_until: Mutex::new(None),
         session_token,
         secure_cookie: std::env::var("FRIDAY_MOBILE_INSECURE").is_err(),
         vapid_public,
@@ -852,7 +1062,9 @@ pub fn start(port: u16) -> String {
                         match tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port))).await {
                             Ok(listener) => listener,
                             Err(error) => {
-                                mlog(&format!("bind local falhou: {error}"));
+                                // Say it out loud: the UI used to show a pairing
+                                // code for a server that never bound.
+                                mlog(&format!("servidor móvel indisponível: {error}"));
                                 return;
                             }
                         }
@@ -864,7 +1076,7 @@ pub fn start(port: u16) -> String {
         })
         .ok();
 
-    pair_code
+    Some(pair_code)
 }
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);

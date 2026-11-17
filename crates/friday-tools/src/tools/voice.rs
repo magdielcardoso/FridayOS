@@ -28,10 +28,11 @@ use serde_json::{json, Value};
 use crate::policy::Risk;
 use crate::registry::{Registry, Tool, ToolCtx, ToolError, ToolResult, ToolSpec};
 
-/// RMS above this starts an utterance.
-pub const SPEECH_THRESHOLD: f32 = 0.03;
+/// Noise-relative gates replace hard-coded levels so the VAD works whether
+/// the input volume is 20 or 100. These are only fallbacks/caps.
+pub const SPEECH_THRESHOLD: f32 = 0.012;
 /// RMS above this while Friday is speaking triggers barge-in.
-pub const BARGE_THRESHOLD: f32 = 0.18;
+pub const BARGE_THRESHOLD: f32 = 0.10;
 /// Set when audible playback actually starts. The capture loop consumes it to
 /// restart the echo grace period there — not at first token, when synthesis
 /// still needs ~1 s and the grace would already be half spent.
@@ -159,6 +160,7 @@ impl VoiceEngine {
         let channels = self.config.channels as usize;
         let sample_format = self.sample_format;
         let mut resampler = LinearResampler::new(device_rate, TARGET_SAMPLE_RATE);
+        let mut agc = Agc::new();
         let mut vad = VadState::new();
 
         let callback_tx = tx.clone();
@@ -184,6 +186,7 @@ impl VoiceEngine {
                     + 8) as usize;
                 let mut resampled = Vec::with_capacity(capacity);
                 resampler.process(&mono, &mut resampled);
+                agc.apply(&mut resampled);
                 vad.push(
                     &resampled,
                     callback_speaking.load(Ordering::Relaxed),
@@ -303,6 +306,89 @@ impl Drop for VoiceHandle {
     }
 }
 
+/// Drops leading and trailing frames below `threshold`, keeping a 120 ms
+/// margin on each side so consonants are not clipped. Trimming before STT is
+/// what turns a 30 s noisy capture into a usable clip.
+fn trim_edges(samples: &[f32], gate: f32) -> Vec<f32> {
+    let frame = FRAME_SIZE / 4;
+    if samples.len() <= frame * 2 {
+        return samples.to_vec();
+    }
+    // Relative to the clip's own peak: a quiet speaker must not be trimmed to
+    // nothing, and a loud one still loses the room tone around the words.
+    let peak = samples
+        .iter()
+        .fold(0.0f32, |acc, sample| acc.max(sample.abs()));
+    let threshold = (peak * 0.1).clamp(0.005, (gate * 0.6).max(0.02));
+    let energy = |chunk: &[f32]| {
+        (chunk.iter().map(|s| s * s).sum::<f32>() / chunk.len().max(1) as f32).sqrt()
+    };
+    let mut first = 0usize;
+    let mut last = samples.len();
+    for (index, chunk) in samples.chunks(frame).enumerate() {
+        if energy(chunk) >= threshold {
+            first = index * frame;
+            break;
+        }
+    }
+    for (index, chunk) in samples.chunks(frame).enumerate().rev() {
+        if energy(chunk) >= threshold {
+            last = ((index + 1) * frame).min(samples.len());
+            break;
+        }
+    }
+    let margin = (TARGET_SAMPLE_RATE as usize * 120 / 1_000).min(first);
+    let start = first.saturating_sub(margin);
+    let end = (last + margin).min(samples.len());
+    if end <= start {
+        return samples.to_vec();
+    }
+    samples[start..end].to_vec()
+}
+
+/// Automatic gain control. The mac mini's input volume can be anywhere from
+/// 20 to 100; without this, quiet speech (~0.06 RMS) was below the STT's usable
+/// range and came back as an empty transcript.
+struct Agc {
+    gain: f32,
+    peak: f32,
+    floor: f32,
+}
+
+impl Agc {
+    fn new() -> Self {
+        Self {
+            gain: 1.0,
+            peak: 0.05,
+            floor: 0.01,
+        }
+    }
+
+    fn apply(&mut self, samples: &mut [f32]) {
+        if samples.is_empty() {
+            return;
+        }
+        let rms = (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt();
+        // Slowly decaying peak (voice level) and noise floor (silence level).
+        self.peak = rms.max(self.peak * 0.99);
+        if rms < self.floor {
+            self.floor = rms;
+        } else {
+            self.floor += (rms - self.floor) * 0.005;
+        }
+        // Aim for ~0.30 RMS on speech, but never amplify noise above ~0.10.
+        let wanted = (0.30 / self.peak.max(0.001)).clamp(1.0, 8.0);
+        let ceiling = (0.10 / self.floor.max(0.001)).clamp(1.0, 8.0);
+        let target = wanted.min(ceiling);
+        self.gain += (target - self.gain) * 0.08;
+        if (self.gain - 1.0).abs() > 0.01 {
+            for sample in samples.iter_mut() {
+                *sample = (*sample * self.gain).clamp(-1.0, 1.0);
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // VAD + resampling
 // ---------------------------------------------------------------------------
@@ -327,6 +413,9 @@ struct VadState {
     /// Consecutive loud frames while Friday speaks, so one echo transient
     /// cannot kill her sentence; a real interruption sustains.
     barge_run: u32,
+    /// Loudest mic level observed while her own audio plays. Without AEC this
+    /// is the best estimate of her echo, and an interruption must beat it.
+    echo_ref: f32,
     /// Frames kept before speech starts, so the first syllable is not clipped.
     pre_roll: std::collections::VecDeque<Vec<f32>>,
     /// Fixed hangover override (`FRIDAY_VAD_HANGOVER_MS`) for tuning without a rebuild.
@@ -348,6 +437,7 @@ impl VadState {
             barge_capturing: false,
             voiced_run: 0,
             barge_run: 0,
+            echo_ref: 0.0,
             pre_roll: std::collections::VecDeque::with_capacity(3),
             hangover_override: std::env::var("FRIDAY_VAD_HANGOVER_MS")
                 .ok()
@@ -379,7 +469,9 @@ impl VadState {
             let target = rms.clamp(0.002, 0.08);
             self.noise += (target - self.noise) * 0.04;
         }
-        let gate = (self.noise * 3.0).max(SPEECH_THRESHOLD).min(0.18);
+        // Relative to the measured room: absolute thresholds broke completely
+        // when the input volume was lowered.
+        let gate = (self.noise * 2.2).max(SPEECH_THRESHOLD).min(0.22);
 
         // While Friday speaks, the microphone also hears her. Never treat that
         // as an utterance: only a much louder voice after a short grace period
@@ -391,21 +483,27 @@ impl VadState {
                 self.speaking_frames = 0;
                 self.barge_sent = false;
                 self.barge_run = 0;
+                self.echo_ref = 0.0;
             }
             self.speaking_frames += 1;
+            // Learn her own echo level from the mic; it decays slowly so a
+            // quieter passage does not lower the bar for a false barge-in.
+            self.echo_ref = (self.echo_ref * 0.995).max(rms);
             self.in_speech = false;
             self.silence_frames = 0;
             self.frames_captured = 0;
-            let barge_gate = (self.noise * 6.0).max(BARGE_THRESHOLD);
+            // Her own voice through the speakers sets the reference. A real
+            // interruption has to be clearly louder than the echo we measured.
+            let echo_bar = (self.echo_ref * 1.3).min(0.95);
+            let barge_gate = (self.noise * 4.0).max(BARGE_THRESHOLD).max(echo_bar);
             if rms >= barge_gate {
                 self.barge_run += 1;
             } else {
                 self.barge_run = 0;
             }
-            // ~3 s grace from first audible sample, then two loud frames in a
-            // row (~0.5 s of sustained voice) so a single echo transient
-            // cannot cut the start of her sentence.
-            if self.speaking_frames > 12 && self.barge_run >= 2 {
+            // ~2 s grace from the first audible sample, then two loud frames in
+            // a row (~0.5 s) so a transient cannot cut her sentence.
+            if self.speaking_frames > 8 && self.barge_run >= 2 {
                 if !self.barge_sent {
                     self.barge_sent = true;
                     // Start capturing right away: the words that interrupted
@@ -431,8 +529,10 @@ impl VadState {
         }
 
         // Hysteresis: while already in a sentence, quieter trailing syllables
-        // still count as speech. Onset keeps the stricter gate so clicks lose.
-        let sustain = gate * 0.6;
+        // still count as speech. The sustain threshold must stay above the room
+        // noise, otherwise a loud room (mic at 100%) keeps the utterance open
+        // until the 30 s cap and sends noise to STT.
+        let sustain = (gate * 0.65).max(self.noise * 1.3).min(0.45);
         let voiced = rms >= if self.in_speech { sustain } else { gate };
 
         self.pre_roll.push_back(frame.to_vec());
@@ -467,6 +567,10 @@ impl VadState {
             self.silence_frames = 0;
         } else {
             self.silence_frames += 1;
+            // Adapt the floor during silence inside a sentence, so a slowly
+            // rising fan/AC cannot hold the utterance open forever.
+            let target = rms.clamp(0.002, 0.1);
+            self.noise += (target - self.noise) * 0.02;
         }
 
         // Short commands close quickly; longer thoughts get room for a natural
@@ -490,10 +594,20 @@ impl VadState {
             self.barge_capturing = false;
             // Utterances shorter than ~0.75 s are clicks, not speech.
             if frames >= 3 {
-                let _ = tx.send(VoiceEvent::SpeechEnd {
-                    captured,
-                    sample_rate: TARGET_SAMPLE_RATE,
-                });
+                let trimmed = trim_edges(&captured, sustain.max(gate));
+                // Never ship an empty clip: if trimming ate everything, keep the
+                // original capture and let STT decide.
+                let captured = if trimmed.len() >= FRAME_SIZE / 2 {
+                    trimmed
+                } else {
+                    captured
+                };
+                if captured.len() >= FRAME_SIZE / 2 {
+                    let _ = tx.send(VoiceEvent::SpeechEnd {
+                        captured,
+                        sample_rate: TARGET_SAMPLE_RATE,
+                    });
+                }
             }
         }
     }
@@ -650,6 +764,18 @@ pub fn write_wav(path: &Path, samples: &[f32], sample_rate: u32) -> Result<(), S
 
 /// Reads PCM (8/16/24/32-bit) or float32 WAVs, downmixing to mono.
 fn read_wav_mono(path: &Path) -> Result<(Vec<f32>, u32), String> {
+    // Refuse huge files: a model-supplied path used to be read whole and
+    // expanded to f32, which could exhaust memory.
+    const MAX_BYTES: u64 = 64 * 1024 * 1024;
+    let size = std::fs::metadata(path)
+        .map(|meta| meta.len())
+        .map_err(|e| format!("não foi possível abrir {}: {e}", path.display()))?;
+    if size > MAX_BYTES {
+        return Err(format!(
+            "{} é grande demais ({size} bytes; limite 64 MB)",
+            path.display()
+        ));
+    }
     let bytes =
         std::fs::read(path).map_err(|e| format!("não foi possível ler {}: {e}", path.display()))?;
     if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {

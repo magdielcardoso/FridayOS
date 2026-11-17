@@ -221,7 +221,13 @@ fn delegate(assistant: &Value, task: &str, timeout_secs: u64) -> Result<String, 
     live_append(&live, "task", task);
     live_append(&live, "status", "iniciando o Codex…");
 
-    let out = std::env::temp_dir().join(format!("friday-assistant-{}.txt", std::process::id()));
+    // One answer file per assistant: sharing a pid-only path made concurrent
+    // delegations return each other's answers.
+    let out = std::env::temp_dir().join(format!(
+        "friday-assistant-{}-{}.txt",
+        std::process::id(),
+        slug(name)
+    ));
     let _ = std::fs::remove_file(&out);
     let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
     let previous_thread = std::fs::read_to_string(thread_path(name))
@@ -305,6 +311,9 @@ fn delegate(assistant: &Value, task: &str, timeout_secs: u64) -> Result<String, 
             }
             Ok(None) => {}
             Err(error) => {
+                // Do not leave the child running invisibly.
+                let _ = child.kill();
+                let _ = child.wait();
                 let _ = std::fs::remove_file(pid_path(name));
                 live_append(&live, "error", &error.to_string());
                 return Err(ToolError::failed(error.to_string()));
@@ -363,6 +372,11 @@ impl Tool for AssistantTool {
                 let mut list = Vec::new();
                 if let Ok(entries) = std::fs::read_dir(dir()) {
                     for entry in entries.filter_map(|entry| entry.ok()) {
+                        // Skip `.pid`, `.thread` and `.live.jsonl`: a bare pid
+                        // number parsed as JSON and became a phantom assistant.
+                        if entry.path().extension().and_then(|ext| ext.to_str()) != Some("json") {
+                            continue;
+                        }
                         if let Ok(raw) = std::fs::read_to_string(entry.path()) {
                             if let Ok(value) = serde_json::from_str::<Value>(&raw) {
                                 list.push(value);
@@ -408,6 +422,17 @@ impl Tool for AssistantTool {
                         "note": "não havia tarefa em execução"
                     }));
                 };
+                if !pid_is_assistant(pid) {
+                    // The process died and the pid was reused; killing it would
+                    // hit an unrelated program.
+                    let _ = std::fs::remove_file(pid_path(name));
+                    return Ok(json!({
+                        "ok": true,
+                        "cancelled": false,
+                        "assistant": slug(name),
+                        "note": "tarefa já terminou (pid obsoleto)"
+                    }));
+                }
                 let _ = Command::new("/bin/kill")
                     .args(["-TERM", &pid.to_string()])
                     .status();
@@ -444,6 +469,18 @@ impl Tool for AssistantTool {
             other => Err(ToolError::NotFound(other.to_string())),
         }
     }
+}
+
+/// True when `pid` still looks like a Codex child, never an arbitrary process.
+fn pid_is_assistant(pid: u32) -> bool {
+    let Ok(output) = Command::new("/bin/ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .output()
+    else {
+        return false;
+    };
+    let line = String::from_utf8_lossy(&output.stdout).to_lowercase();
+    line.contains("codex")
 }
 
 fn now_secs() -> u64 {

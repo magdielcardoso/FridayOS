@@ -23,6 +23,10 @@ use crate::auth::CodexAuth;
 
 const CODEX_BIN: &str = "codex";
 
+/// A server-initiated approval left unanswered this long is declined so a
+/// forgotten prompt cannot keep the Codex turn waiting forever.
+const APPROVAL_TIMEOUT_SECS: u64 = 120;
+
 fn configured_reasoning_effort() -> Option<String> {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
     let path = home.join("Library/Application Support/FridayOS/reasoning.json");
@@ -170,6 +174,14 @@ pub enum CodexEvent {
         /// Result/output of the step, when available (command output, tool result).
         detail: Option<String>,
     },
+    /// A server-initiated approval/permission request that needs a human
+    /// decision. The session does not answer it until `approve`/`deny` arrives.
+    ApprovalRequest {
+        id: u64,
+        method: String,
+        summary: String,
+        params: Value,
+    },
     /// Turn finished (completed, failed, interrupted).
     Done { status: String },
     Error(String),
@@ -183,6 +195,14 @@ enum Command {
     Cancel,
     /// Ask the server to summarize the thread and shrink its context.
     Compact,
+    /// Drop the current child and connect again (watchdog recovery).
+    Reconnect,
+    /// Answer a pending server-initiated approval request positively.
+    Approve { id: u64 },
+    /// Answer a pending server-initiated approval request negatively.
+    Deny { id: u64 },
+    /// Internal: a pending approval outlived its deadline and must be declined.
+    ApprovalTimeout { id: u64 },
     Shutdown,
 }
 
@@ -197,6 +217,9 @@ impl Codex {
     pub fn spawn(config: CodexConfig) -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        // A clone lives inside each Session so a stalled approval can inject a
+        // `Command::ApprovalTimeout` back into the very loop that owns it.
+        let timeout_cmd_tx = cmd_tx.clone();
 
         let thread = std::thread::Builder::new()
             .name("friday-codex".into())
@@ -213,7 +236,12 @@ impl Codex {
                         return;
                     }
                 };
-                runtime.block_on(supervise(config, event_tx.clone(), cmd_rx));
+                runtime.block_on(supervise(
+                    config,
+                    event_tx.clone(),
+                    cmd_rx,
+                    timeout_cmd_tx,
+                ));
             })
             .expect("spawn friday-codex thread");
 
@@ -242,9 +270,25 @@ impl Codex {
         let _ = self.tx.send(Command::Cancel);
     }
 
+    /// Approves a pending `CodexEvent::ApprovalRequest` by id. No-op if the
+    /// request was already answered, timed out, or belongs to another session.
+    pub fn approve(&self, id: u64) {
+        let _ = self.tx.send(Command::Approve { id });
+    }
+
+    /// Denies a pending `CodexEvent::ApprovalRequest` by id.
+    pub fn deny(&self, id: u64) {
+        let _ = self.tx.send(Command::Deny { id });
+    }
+
     /// Summarizes the thread to reclaim context without losing the session.
     pub fn compact(&self) {
         let _ = self.tx.send(Command::Compact);
+    }
+
+    /// Forces a clean reconnect; used when a turn wedges.
+    pub fn reconnect(&self) {
+        let _ = self.tx.send(Command::Reconnect);
     }
 
     pub fn shutdown(&self) {
@@ -262,11 +306,17 @@ impl Drop for Codex {
 
 /// Restarts the CLI if it dies; keeps the same thread id when possible.
 async fn supervise(
-    config: CodexConfig,
+    mut config: CodexConfig,
     events: mpsc::UnboundedSender<CodexEvent>,
     mut commands: mpsc::UnboundedReceiver<Command>,
+    timeout_cmd_tx: mpsc::UnboundedSender<Command>,
 ) {
+    // Kept in sync with the live session, so a reconnect resumes the same
+    // conversation instead of silently starting a new one.
+    let mut resume = config.resume_thread.clone();
+    let mut failures = 0u32;
     loop {
+        config.resume_thread = resume.clone();
         let (child, stdout, stdin) = match launch(&config).await {
             Ok(parts) => parts,
             Err(error) => {
@@ -278,24 +328,52 @@ async fn supervise(
         let (tx, rx) = mpsc::unbounded_channel::<Value>();
         tokio::spawn(writer_task(stdin, rx));
 
-        let mut session = match Session::connect(child, stdout, tx.clone(), &config, &events).await {
+        let mut session = match Session::connect(
+            child,
+            stdout,
+            tx.clone(),
+            &config,
+            &events,
+            timeout_cmd_tx.clone(),
+        )
+        .await
+        {
             Ok(session) => session,
             Err(error) => {
                 let _ = events.send(CodexEvent::Error(error));
+                // Never spin: a failed handshake used to relaunch the CLI in a
+                // tight loop, burning a core and spawning processes forever.
+                failures = failures.saturating_add(1);
+                let delay = failures.min(8) as u64;
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
                 continue;
             }
         };
+        failures = 0;
+        resume = Some(session.thread_id.clone());
 
         let steer_tx = tx.clone();
         let turn_slot = session.turn_id.clone();
         let thread_id = session.thread_id.clone();
 
-        loop {
+        'session: loop {
             // Idle: wait for a prompt. A steer with no turn running becomes one.
             let text = loop {
                 match commands.recv().await {
                     Some(Command::Prompt(text)) | Some(Command::Steer(text)) => break text,
                     Some(Command::Cancel) => continue,
+                    Some(Command::Approve { id }) => {
+                        session.respond_to_approval(id, true).await;
+                        continue;
+                    }
+                    Some(Command::Deny { id }) => {
+                        session.respond_to_approval(id, false).await;
+                        continue;
+                    }
+                    Some(Command::ApprovalTimeout { id }) => {
+                        session.expire_approval(id).await;
+                        continue;
+                    }
                     Some(Command::Compact) => {
                         let result = session
                             .try_request(
@@ -315,6 +393,11 @@ async fn supervise(
                         }
                         continue;
                     }
+                    Some(Command::Reconnect) => {
+                        session.kill().await;
+                        resume = Some(session.thread_id.clone());
+                        continue 'session;
+                    }
                     Some(Command::Shutdown) | None => {
                         session.kill().await;
                         return;
@@ -322,8 +405,15 @@ async fn supervise(
                 }
             };
 
+            // Discard notifications left over from the previous turn, so a
+            // stale `turn/completed` cannot end the new one immediately.
+            session.drain().await;
+
             if let Err(error) = session.start_turn(&text).await {
                 let _ = events.send(CodexEvent::Error(error));
+                let _ = events.send(CodexEvent::Done {
+                    status: "failed".into(),
+                });
                 break;
             }
 
@@ -384,12 +474,44 @@ async fn supervise(
                             }));
                         }
                     }
+                    TurnEvent::Cmd(Some(Command::Reconnect)) => {
+                        resume = Some(session.thread_id.clone());
+                        session.kill().await;
+                        break;
+                    }
+                    TurnEvent::Cmd(Some(Command::Approve { id })) => {
+                        session.respond_to_approval(id, true).await;
+                    }
+                    TurnEvent::Cmd(Some(Command::Deny { id })) => {
+                        session.respond_to_approval(id, false).await;
+                    }
+                    TurnEvent::Cmd(Some(Command::ApprovalTimeout { id })) => {
+                        session.expire_approval(id).await;
+                    }
                     TurnEvent::Cmd(Some(Command::Compact)) => {}
                     TurnEvent::Cmd(Some(Command::Cancel)) => {
-                        session.kill().await;
+                        let turn_id = turn_slot
+                            .lock()
+                            .ok()
+                            .and_then(|slot| slot.clone());
+                        if let Some(turn_id) = turn_id {
+                            // Fire and forget: waiting for the reply could block
+                            // the cancel path for two minutes.
+                            let _ = session
+                                .send_request(
+                                    "turn/interrupt",
+                                    json!({
+                                        "threadId": thread_id,
+                                        "turnId": turn_id
+                                    }),
+                                )
+                                .await;
+                        }
                         let _ = events.send(CodexEvent::Done {
                             status: "interrupted".into(),
                         });
+                        // Keep the process alive: killing it made the next
+                        // message vanish into a dead child.
                         break;
                     }
                     TurnEvent::Cmd(Some(Command::Shutdown)) | TurnEvent::Cmd(None) => {
@@ -415,6 +537,13 @@ async fn writer_task(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<Valu
 }
 
 type Parts = (Child, Lines<BufReader<ChildStdout>>, ChildStdin);
+
+/// A server-initiated request we surfaced to the UI and are holding open.
+#[derive(Debug, Clone)]
+struct PendingApproval {
+    method: String,
+    params: Value,
+}
 
 async fn launch(config: &CodexConfig) -> Result<Parts, String> {
     let binary = codex_binary().ok_or_else(|| {
@@ -454,11 +583,19 @@ struct Session {
     next_id: u64,
     pending: HashMap<u64, oneshot::Sender<Value>>,
     thread_id: String,
+    /// Workspace used by `turn/start`. The process cwd is `/` in a bundled app,
+    /// which made sandbox and shell resolve in the wrong place.
+    cwd: String,
     turn_effort: Option<String>,
     turn_finished: bool,
+    in_turn: bool,
     seen_deltas: std::collections::HashSet<String>,
     commentary_items: std::collections::HashSet<String>,
     events: mpsc::UnboundedSender<CodexEvent>,
+    /// Approval requests waiting for a human decision, by JSON-RPC id.
+    approvals: HashMap<u64, PendingApproval>,
+    /// Clone of the command channel, used to schedule timeout notifications.
+    command_tx: mpsc::UnboundedSender<Command>,
 }
 
 impl Session {
@@ -468,6 +605,7 @@ impl Session {
         tx: mpsc::UnboundedSender<Value>,
         config: &CodexConfig,
         events: &mpsc::UnboundedSender<CodexEvent>,
+        command_tx: mpsc::UnboundedSender<Command>,
     ) -> Result<Self, String> {
         let mut session = Self {
             child,
@@ -477,11 +615,15 @@ impl Session {
             next_id: 0,
             pending: HashMap::new(),
             thread_id: String::new(),
+            cwd: config.cwd.clone(),
             turn_effort: config.effort.clone(),
             turn_finished: false,
+            in_turn: false,
             seen_deltas: std::collections::HashSet::new(),
             commentary_items: std::collections::HashSet::new(),
             events: events.clone(),
+            approvals: HashMap::new(),
+            command_tx,
         };
 
         session
@@ -549,7 +691,7 @@ impl Session {
         let mut params = json!({
             "threadId": self.thread_id,
             "input": [{ "type": "text", "text": text, "text_elements": [] }],
-            "cwd": std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| ".".into()),
+            "cwd": self.cwd.clone(),
             "approvalPolicy": "on-request",
             "sandboxPolicy": {
                 "type": "workspaceWrite",
@@ -563,6 +705,7 @@ impl Session {
             params["effort"] = json!(effort);
         }
         self.turn_finished = false;
+        self.in_turn = true;
         if let Ok(mut slot) = self.turn_id.lock() {
             *slot = None;
         }
@@ -580,26 +723,63 @@ impl Session {
                 eprintln!("[codex] {method} {}", message);
             }
             let params = message.get("params").cloned().unwrap_or(Value::Null);
-            // Server-initiated requests have an id: decline politely for now.
-            if let Some(id) = message.get("id") {
-                let reply = if method == "mcpServer/elicitation/request" {
-                    // Codex asks the host to approve MCP tool calls. Friday's own
-                    // tool server already enforces risk + confirmation, so only
-                    // its calls are auto-accepted here.
-                    let is_friday = params
+            // Server-initiated requests carry a non-null id. Notifications may
+            // carry `"id": null`, which is not a request and keeps its old path.
+            if let Some(id_value) = message.get("id").filter(|id| !id.is_null()) {
+                // Friday's own tool server already enforces risk + confirmation,
+                // so its elicitation stays auto-accepted. Every other request
+                // that needs a decision is handed to the user instead of being
+                // silently declined.
+                let is_friday_elicitation = method == "mcpServer/elicitation/request"
+                    && params
                         .get("serverName")
                         .and_then(Value::as_str)
                         .map(|name| name == "friday")
                         .unwrap_or(false);
-                    let action = if is_friday { "accept" } else { "decline" };
-                    json!({ "id": id, "result": { "action": action, "content": {} } })
-                } else if method.contains("requestApproval") {
-                    json!({ "id": id, "result": { "decision": "decline" } })
-                } else if method.contains("requestPermissions") {
-                    json!({ "id": id, "result": { "permissions": {}, "scope": "turn" } })
-                } else {
-                    json!({ "id": id, "result": {} })
-                };
+
+                if !is_friday_elicitation {
+                    if let Some(id) = id_value.as_u64() {
+                        let summary = approval_summary(method, &params);
+                        self.approvals.insert(
+                            id,
+                            PendingApproval {
+                                method: method.to_string(),
+                                params: params.clone(),
+                            },
+                        );
+                        let _ = self.events.send(CodexEvent::ApprovalRequest {
+                            id,
+                            method: method.to_string(),
+                            summary,
+                            params,
+                        });
+
+                        // If the user never answers, decline on a timer so a
+                        // forgotten prompt cannot wedge the session forever.
+                        let command_tx = self.command_tx.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_secs(
+                                APPROVAL_TIMEOUT_SECS,
+                            ))
+                            .await;
+                            let _ = command_tx.send(Command::ApprovalTimeout { id });
+                        });
+                        return;
+                    }
+
+                    // A non-numeric id cannot be surfaced as an ApprovalRequest;
+                    // send a best-effort decline instead of leaving it hanging.
+                    let _ = self.events.send(CodexEvent::Error(format!(
+                        "Solicitação de aprovação com id não numérico ({method}); respondi 'decline' automaticamente."
+                    )));
+                    let reply = json!({ "id": id_value, "result": { "decision": "declined" } });
+                    let _ = self.write(&reply).await;
+                    return;
+                }
+
+                // Historical behaviour for Friday's own MCP tool server.
+                let reply =
+                    json!({ "id": id_value, "result": { "action": "accept", "content": {} } });
                 let _ = self.write(&reply).await;
                 return;
             }
@@ -725,8 +905,35 @@ impl Session {
                             .unwrap_or("Erro no Codex")
                             .to_string(),
                     ));
+                    // A rejected request during a turn used to leave the turn
+                    // open forever (no Done, UI stuck in PENSANDO).
+                    if self.in_turn {
+                        self.in_turn = false;
+                        self.turn_finished = true;
+                    }
                 }
                 let _ = sender.send(message.get("result").cloned().unwrap_or(Value::Null));
+            }
+        }
+    }
+
+    /// Discards lines already sitting in the pipe (late notifications from a
+    /// previous/interrupted turn) so they cannot end the next turn instantly.
+    async fn drain(&mut self) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(250);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(
+                remaining.min(std::time::Duration::from_millis(30)),
+                self.lines.next_line(),
+            )
+            .await
+            {
+                Ok(Ok(Some(_))) => continue,
+                _ => break,
             }
         }
     }
@@ -737,7 +944,9 @@ impl Session {
                 if line.trim().is_empty() {
                     return Ok(Some(Value::Null));
                 }
-                Ok(serde_json::from_str(&line).ok())
+                // A stray non-JSON line must not look like EOF: that false
+                // "process died" triggered the relaunch loop.
+                Ok(Some(serde_json::from_str(&line).unwrap_or(Value::Null)))
             }
             Ok(None) => Ok(None),
             Err(error) => Err(format!("Falha lendo o Codex: {error}")),
@@ -750,7 +959,13 @@ impl Session {
         self.pending.insert(id, tx);
 
         loop {
-            match self.next_message().await? {
+            let next = tokio::time::timeout(
+                std::time::Duration::from_secs(120),
+                self.next_message(),
+            )
+            .await
+            .map_err(|_| "tempo esgotado esperando o Codex".to_string())??;
+            match next {
                 Some(message) => self.handle(message).await,
                 None => return Err("O processo do Codex foi encerrado.".into()),
             }
@@ -767,7 +982,13 @@ impl Session {
         let (tx, mut rx) = oneshot::channel();
         self.pending.insert(id, tx);
         loop {
-            match self.next_message().await? {
+            let next = tokio::time::timeout(
+                std::time::Duration::from_secs(120),
+                self.next_message(),
+            )
+            .await
+            .map_err(|_| "tempo esgotado esperando o Codex".to_string())??;
+            match next {
                 Some(message) => {
                     if message.get("id").and_then(Value::as_u64) == Some(id) {
                         if let Some(error) = message.get("error") {
@@ -805,6 +1026,35 @@ impl Session {
             .map_err(|_| "O processo do Codex foi encerrado.".to_string())
     }
 
+    /// Answers a surfaced approval request and removes it from the pending map.
+    /// The reply is queued to the writer task, so this never blocks on the CLI.
+    async fn respond_to_approval(&mut self, id: u64, approved: bool) {
+        let Some(approval) = self.approvals.remove(&id) else {
+            // Already answered, timed out, or from a previous session.
+            return;
+        };
+        let (result, warning) = approval_reply(&approval.method, &approval.params, approved);
+        let reply = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+        let _ = self.write(&reply).await;
+        if let Some(warning) = warning {
+            let _ = self.events.send(CodexEvent::Error(warning));
+        }
+    }
+
+    /// A timed-out approval is declined with the same schema as an explicit
+    /// deny. Removing it first makes a late user click a harmless no-op.
+    async fn expire_approval(&mut self, id: u64) {
+        let Some(approval) = self.approvals.remove(&id) else {
+            return;
+        };
+        let (result, _) = approval_reply(&approval.method, &approval.params, false);
+        let reply = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+        let _ = self.write(&reply).await;
+        let _ = self.events.send(CodexEvent::Error(format!(
+            "Aprovação #{id} expirou após {APPROVAL_TIMEOUT_SECS}s e foi recusada automaticamente."
+        )));
+    }
+
     async fn kill(&mut self) {
         let _ = self.child.kill().await;
     }
@@ -812,15 +1062,9 @@ impl Session {
 
 /// Resolves the Codex CLI path and whether a subscription login is present.
 pub fn status() -> (bool, bool) {
-    let bin = which(CODEX_BIN);
-    (bin.is_some(), CodexAuth::discover().exists())
-}
-
-fn which(bin: &str) -> Option<std::path::PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(bin))
-        .find(|candidate| candidate.is_file())
+    // Use the same resolution as `launch`: a GUI app has a minimal PATH, so
+    // `which` reported "CLI não encontrado" while chat worked fine.
+    (codex_binary().is_some(), CodexAuth::discover().exists())
 }
 
 /// Creates a clean `CODEX_HOME` for Friday: no user plugins, hooks or unrelated
@@ -981,6 +1225,150 @@ fn step_detail(item: &Value) -> Option<String> {
         _ => None,
     };
     text.filter(|text| !text.trim().is_empty())
+}
+
+/// Builds the JSON-RPC `result` for a stored approval decision. The optional
+/// second value is a UI warning for methods whose schema we had to guess.
+fn approval_reply(method: &str, params: &Value, approved: bool) -> (Value, Option<String>) {
+    if method == "mcpServer/elicitation/request" {
+        let action = if approved { "accept" } else { "decline" };
+        return (json!({ "action": action, "content": {} }), None);
+    }
+    if method.contains("requestApproval") {
+        let decision = if approved { "approved" } else { "declined" };
+        return (json!({ "decision": decision }), None);
+    }
+    if method.contains("requestPermissions") {
+        let granted = if approved {
+            requested_permissions(params)
+        } else {
+            Vec::new()
+        };
+        return (json!({ "permissions": granted, "scope": "turn" }), None);
+    }
+    (
+        json!({}),
+        Some(format!(
+            "Método de aprovação desconhecido ({method}); enviei uma resposta best-effort. Se o Codex não a aceitar, a solicitação pode falhar."
+        )),
+    )
+}
+
+/// Best-effort extraction of permission names, so an approval can echo back
+/// what the request asked for. Covers arrays, objects of flags and bare strings.
+fn requested_permissions(params: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut roots: Vec<&Value> = Vec::new();
+    for key in ["permissions", "requestedPermissions", "permission"] {
+        if let Some(value) = params.get(key) {
+            roots.push(value);
+        }
+    }
+    if roots.is_empty() {
+        roots.push(params);
+    }
+    for value in roots {
+        match value {
+            Value::String(text) => out.push(text.clone()),
+            Value::Array(items) => {
+                for item in items {
+                    if let Some(text) = item.as_str() {
+                        out.push(text.to_string());
+                    } else if let Some(map) = item.as_object() {
+                        for key in ["permission", "name", "id", "type"] {
+                            if let Some(text) = map.get(key).and_then(Value::as_str) {
+                                out.push(text.to_string());
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            Value::Object(map) => {
+                for (key, flag) in map {
+                    if flag.as_bool().unwrap_or(false) || flag.is_null() {
+                        out.push(key.clone());
+                    } else if let Some(text) = flag.as_str() {
+                        out.push(format!("{key}={text}"));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Short human-facing summary of a pending approval, capped at ~160 chars.
+fn approval_summary(method: &str, params: &Value) -> String {
+    let label = if method == "mcpServer/elicitation/request" {
+        "aprovação de ferramenta MCP"
+    } else if method.contains("requestApproval") {
+        "aprovação necessária"
+    } else if method.contains("requestPermissions") {
+        "permissão solicitada"
+    } else {
+        "solicitação do servidor"
+    };
+
+    let mut details: Vec<String> = Vec::new();
+    if let Some(server) = find_string(params, &["serverName", "server", "server_name"]) {
+        details.push(format!("servidor {server}"));
+    }
+    if let Some(tool) = find_string(params, &["tool", "toolName"]) {
+        details.push(format!("ferramenta {tool}"));
+    }
+    if let Some(command) = find_string(params, &["command", "cmd", "argv"]) {
+        details.push(format!("comando {}", truncate(command, 80)));
+    }
+    if let Some(permission) = find_string(
+        params,
+        &["permission", "permissions", "permissionProfile", "requestedPermissions"],
+    ) {
+        details.push(format!("permissão {}", truncate(permission, 60)));
+    }
+    if let Some(reason) = find_string(params, &["reason", "message", "description", "explanation"]) {
+        details.push(format!("motivo {}", truncate(reason, 60)));
+    }
+
+    let summary = if details.is_empty() {
+        label.to_string()
+    } else {
+        format!("{label}: {}", details.join(" · "))
+    };
+    truncate(&summary, 160)
+}
+
+/// Recursively finds the first non-empty string stored under any of `keys`.
+/// Codex nests approval details in `params`, `info`, arrays and so on.
+fn find_string<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    for key in keys {
+        if let Some(nested) = value.get(key) {
+            if let Some(text) = nested.as_str() {
+                if !text.trim().is_empty() {
+                    return Some(text.trim());
+                }
+            }
+            if let Some(found) = find_string(nested, keys) {
+                return Some(found);
+            }
+        }
+    }
+    if let Some(items) = value.as_array() {
+        for item in items {
+            if let Some(text) = item.as_str() {
+                if !text.trim().is_empty() {
+                    return Some(text.trim());
+                }
+            }
+            if let Some(found) = find_string(item, keys) {
+                return Some(found);
+            }
+        }
+    }
+    None
 }
 
 fn truncate(value: &str, max: usize) -> String {

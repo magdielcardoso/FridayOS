@@ -7,6 +7,15 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT" || exit 1
 
+# Um dev loop por repositório. Sem isso, duas cópias do script competiam:
+# cada uma matava e reabria o app por conta própria — exatamente o efeito de
+# "a Friday abre sozinha toda hora".
+LOCK="$ROOT/.dev-loop.lock"
+if ! mkdir "$LOCK" 2>/dev/null; then
+  echo "[friday] já existe um dev loop rodando neste repositório — saindo"
+  exit 1
+fi
+
 APP_PID=""
 
 kill_app() {
@@ -20,13 +29,17 @@ kill_app() {
 
 cleanup() {
   kill_app
+  rmdir "$LOCK" 2>/dev/null
   exit 0
 }
 trap cleanup INT TERM
+trap 'rmdir "$LOCK" 2>/dev/null' EXIT
 
 launch() {
+  # Sem `-n`: `open -n` abre sempre uma cópia nova. Era isso que deixava
+  # várias Fridays vivas ao mesmo tempo, cada uma reabrindo a própria janela.
   kill_app
-  open -n "$ROOT/dist/FridayOS.app"
+  open "$ROOT/dist/FridayOS.app"
   sleep 1
   APP_PID="$(pgrep -f 'FridayOS.app/Contents/MacOS/FridayOS' | head -1)"
   echo "[friday] running (pid ${APP_PID:-?})"

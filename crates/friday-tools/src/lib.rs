@@ -13,6 +13,10 @@ pub mod mcp;
 pub mod registry;
 pub mod swift;
 pub mod tools;
+pub mod voice_engine;
+pub mod delivery;
+pub mod decision;
+pub mod watcher_events;
 
 pub use audit::AuditLog;
 pub use policy::{Autonomy, Risk};

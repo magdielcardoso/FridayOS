@@ -33,7 +33,14 @@ type Result<T> = std::result::Result<T, SttError>;
 
 /// Uploads a WAV (PCM16 mono, 16 kHz) and returns the transcript.
 pub async fn transcribe(auth: &CodexAuth, wav: Vec<u8>) -> Result<String> {
-    let duration_ms = wav.len().saturating_sub(44) / 2 / 16;
+    // Parse the header instead of assuming a 44-byte PCM16/16 kHz/WAV: mobile
+    // uploads used to report a meaningless duration.
+    let duration_ms = crate::wav::parse_wav(&wav)
+        .map(|pcm| {
+            let frames = pcm.samples.len() / pcm.channels.max(1) as usize;
+            frames * 1000 / pcm.sample_rate.max(1) as usize
+        })
+        .unwrap_or_else(|_| wav.len().saturating_sub(44) / 32);
     try_transcribe(auth, &wav, duration_ms, false).await
 }
 

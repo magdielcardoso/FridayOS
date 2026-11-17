@@ -55,6 +55,20 @@ fn now() -> u64 {
         .unwrap_or(0)
 }
 
+/// 128-bit hex token from /dev/urandom, with a time-based fallback.
+fn random_secret() -> String {
+    let mut bytes = [0u8; 16];
+    if std::fs::File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut bytes))
+        .is_err()
+    {
+        let seed = now() ^ (std::process::id() as u64) << 32;
+        bytes[..8].copy_from_slice(&seed.to_le_bytes());
+        bytes[8..].copy_from_slice(&seed.rotate_left(17).to_le_bytes());
+    }
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 fn arg_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(|value| value.as_str()).map(str::trim).filter(|v| !v.is_empty())
 }
@@ -87,7 +101,11 @@ impl Tool for AutomationTool {
             "webhook_create" => {
                 let name = arg_str(args, "name").ok_or_else(|| ToolError::invalid("informe `name`"))?;
                 let prompt = arg_str(args, "prompt").ok_or_else(|| ToolError::invalid("informe `prompt`"))?;
-                let secret = arg_str(args, "secret").unwrap_or("");
+                // An empty secret made the endpoint open to any local page.
+                let secret = match arg_str(args, "secret").filter(|value| !value.is_empty()) {
+                    Some(value) => value.to_string(),
+                    None => random_secret(),
+                };
                 if ctx.dry_run {
                     return Ok(json!({ "dry_run": true, "would_create": name }));
                 }
@@ -105,7 +123,9 @@ impl Tool for AutomationTool {
                     "name": name,
                     "url": format!("http://127.0.0.1:{}/hook/{}", port(), name),
                     "method": "POST",
-                    "note": "a Friday precisa estar aberta para receber o evento"
+                    "secret": secret,
+                    "header": format!("X-Friday-Secret: {secret}"),
+                    "note": "envie o header X-Friday-Secret; a Friday precisa estar aberta"
                 }))
             }
             "webhook_list" => Ok(json!({

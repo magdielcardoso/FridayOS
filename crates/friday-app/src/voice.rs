@@ -154,6 +154,35 @@ pub fn wake_once(phrase: &str, seconds: u32) -> Result<bool, String> {
 }
 
 /// Transcreve um WAV gravado pelo [`Mic`] (cria o próprio runtime tokio). Bloqueante.
+/// Transcribes a WAV with SFSpeechRecognizer running fully on-device.
+fn siri_transcribe_file(path: &Path) -> Result<String, String> {
+    let helper = friday_tools::swift::helper("speech").map_err(|error| error.to_string())?;
+    let output = Command::new(helper)
+        .arg("transcribe")
+        .arg(path)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("reconhecimento local: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "reconhecimento local: {}",
+            stderr.trim().lines().last().unwrap_or("falhou")
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines().rev() {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(text) = value.get("text").and_then(|text| text.as_str()) {
+                if !text.trim().is_empty() {
+                    return Ok(text.trim().to_string());
+                }
+            }
+        }
+    }
+    Err("reconhecimento local sem texto".into())
+}
+
 pub fn transcribe_wav(path: &Path) -> Result<String, String> {
     let bytes = std::fs::read(path)
         .map_err(|e| format!("não foi possível ler {}: {e}", path.display()))?;
@@ -216,6 +245,12 @@ pub fn stop_speaking() {
             let _ = child.wait();
         }
     }
+    if let Ok(mut slot) = siri_playback().lock() {
+        if let Some(mut child) = slot.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -223,6 +258,120 @@ pub fn stop_speaking() {
 // ---------------------------------------------------------------------------
 
 static PLAYBACK: Mutex<Option<Child>> = Mutex::new(None);
+/// Native system/Siri voice helper (`speech speak`).
+static SIRI_PLAYBACK: Mutex<Option<Child>> = Mutex::new(None);
+/// Subtle rate/pitch multipliers supplied by the presence module.
+static PROSODY_RATE: AtomicU32 = AtomicU32::new(1_065_353_216); // 1.0f32 bits
+static PROSODY_PITCH: AtomicU32 = AtomicU32::new(1_065_353_216);
+
+fn siri_playback() -> &'static Mutex<Option<Child>> {
+    &SIRI_PLAYBACK
+}
+
+/// Updates the subtle prosody used by the native voice. Values are multipliers
+/// around 1.0; the helper clamps them to a natural-sounding band.
+pub fn set_prosody(rate: f32, pitch: f32) {
+    PROSODY_RATE.store(rate.clamp(0.75, 1.35).to_bits(), Ordering::Relaxed);
+    PROSODY_PITCH.store(pitch.clamp(0.85, 1.18).to_bits(), Ordering::Relaxed);
+}
+
+/// Short spoken backchannel ("entendo", "um momento") without blocking the UI.
+pub fn speak_quick_async(text: impl Into<String>) {
+    let text = text.into();
+    std::thread::spawn(move || {
+        let cancel = AtomicBool::new(false);
+        let _ = play_text(&text, &cancel);
+    });
+}
+
+/// Speaks text with the on-device system voice (Siri/Dictation engine). No
+/// network request, no hourly quota, and progress drives the orb.
+fn play_text(text: &str, cancel: &AtomicBool) -> Result<(), String> {
+    stop_speaking();
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(());
+    }
+    friday_tools::tools::voice::mark_audible_playback();
+    let helper = friday_tools::swift::helper("speech").map_err(|error| error.to_string())?;
+    let rate = f32::from_bits(PROSODY_RATE.load(Ordering::Relaxed));
+    let pitch = f32::from_bits(PROSODY_PITCH.load(Ordering::Relaxed));
+    let mut command = Command::new(helper);
+    let expressive = (rate - 1.0).abs() > 0.01 || (pitch - 1.0).abs() > 0.01;
+    if expressive {
+        command
+            .arg("speak-prosody")
+            .arg(rate.to_string())
+            .arg(pitch.to_string());
+    } else {
+        command.arg("speak");
+    }
+    let mut child = command
+        .arg(text)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("voz nativa: {error}"))?;
+
+    let stop_level = Arc::new(AtomicBool::new(false));
+    if let Some(pipe) = child.stdout.take() {
+        let flag = Arc::clone(&stop_level);
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(pipe).lines().flatten() {
+                if flag.load(Ordering::Relaxed) {
+                    break;
+                }
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+                    if let Some(progress) = value.get("progress").and_then(|v| v.as_f64()) {
+                        set_speech_level((progress.clamp(0.0, 1.0) * 0.75) as f32);
+                    }
+                }
+            }
+        });
+    }
+    {
+        let mut slot = siri_playback()
+            .lock()
+            .map_err(|_| "estado de voz indisponível".to_string())?;
+        *slot = Some(child);
+    }
+
+    let result = loop {
+        if cancel.load(Ordering::Relaxed) {
+            stop_speaking();
+            break Ok(());
+        }
+        let mut slot = match siri_playback().lock() {
+            Ok(slot) => slot,
+            Err(_) => break Ok(()),
+        };
+        match slot.as_mut() {
+            None => break Ok(()),
+            Some(child) => match child.try_wait() {
+                Ok(Some(status)) => {
+                    *slot = None;
+                    break if status.success() {
+                        Ok(())
+                    } else {
+                        Err("síntese nativa falhou".to_string())
+                    };
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    *slot = None;
+                    break Err(format!("voz nativa: {error}"));
+                }
+            },
+        }
+        drop(slot);
+        thread::sleep(Duration::from_millis(25));
+    };
+    stop_level.store(true, Ordering::Relaxed);
+    set_speech_level(0.0);
+    result
+}
 
 /// Current TTS amplitude (0..1), updated while afplay runs so the orb can
 /// pulse with the actual voice instead of a fixed sine.
@@ -279,13 +428,94 @@ fn cache_lookup(text: &str) -> Option<PathBuf> {
     }
 }
 
+/// Permanent home for cached clips. Temp files are deleted after playback, so
+/// the cache must own its own copy or every entry died on first use.
+fn cache_dir() -> PathBuf {
+    voice_dir().join("cache")
+}
+
+fn cache_file_path(key: &str) -> PathBuf {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    cache_dir().join(format!("{:016x}.wav", hasher.finish()))
+}
+
 fn cache_store(text: &str, path: &Path) {
+    let key = cache_key(text);
+    let target = cache_file_path(&key);
+    if let Some(parent) = target.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if std::fs::copy(path, &target).is_err() {
+        return;
+    }
     if let Ok(mut guard) = TTS_CACHE.lock() {
         let cache = guard.get_or_insert_with(std::collections::HashMap::new);
-        if cache.len() >= 24 {
+        if cache.len() >= 48 {
+            // Drop only the in-memory index; files are pruned on startup.
             cache.clear();
         }
-        cache.insert(cache_key(text), path.to_path_buf());
+        cache.insert(key, target);
+    }
+}
+
+/// Keeps the cache bounded: newest 64 clips survive.
+fn prune_cache() {
+    let Ok(entries) = std::fs::read_dir(cache_dir()) else {
+        return;
+    };
+    let mut files: Vec<(SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("wav") {
+                return None;
+            }
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            Some((modified, path))
+        })
+        .collect();
+    if files.len() <= 64 {
+        return;
+    }
+    files.sort_by_key(|(modified, _)| *modified);
+    for (_, path) in files.iter().take(files.len() - 64) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Keeps the voice cache bounded: drops utterances older than a week and any
+/// beyond the newest 200 (30 s captures made this grow by ~100 MB).
+pub fn prune_utterances() {
+    prune_cache();
+    let Ok(entries) = std::fs::read_dir(voice_dir()) else {
+        return;
+    };
+    let cutoff = SystemTime::now() - Duration::from_secs(7 * 24 * 3600);
+    let mut files: Vec<(SystemTime, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !name.starts_with("utterance-") {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .unwrap_or(UNIX_EPOCH);
+        if modified < cutoff {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        files.push((modified, path));
+    }
+    if files.len() <= 200 {
+        return;
+    }
+    files.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    for (_, path) in files.iter().skip(200) {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -294,136 +524,13 @@ fn playback() -> &'static Mutex<Option<Child>> {
 }
 
 fn speak_sentences(sentences: &[String], cancel: &Arc<AtomicBool>) -> Result<(), String> {
-    if cancel.load(Ordering::Relaxed) {
-        return Ok(());
-    }
-
-    let rt = runtime()?;
-    let auth = CodexAuth::discover();
-    std::fs::create_dir_all(temp_dir())
-        .map_err(|e| format!("não foi possível criar {}: {e}", temp_dir().display()))?;
-
     for sentence in sentences {
         if cancel.load(Ordering::Relaxed) {
             return Ok(());
         }
-        let text = sentence.trim();
-        if text.is_empty() {
-            continue;
-        }
-
-        match rt.block_on(tts::synthesize(&auth, text)) {
-            Ok(pcm) => {
-                let samples: Vec<i16> = pcm
-                    .mono_f32()
-                    .iter()
-                    .map(|s| (s.clamp(-1.0, 1.0) * 32_767.0).round() as i16)
-                    .collect();
-                if samples.is_empty() {
-                    continue;
-                }
-                let bytes = encode_pcm16_wav(&samples, pcm.sample_rate.max(8_000));
-                let path = temp_audio_path();
-                if std::fs::write(&path, &bytes).is_err() {
-                    continue;
-                }
-                let result = play_file(&path, cancel);
-                let _ = std::fs::remove_file(&path);
-                result?;
-            }
-            Err(error) => {
-                // Only the ChatGPT voice is acceptable; never substitute a
-                // local macOS voice.
-                return Err(error.to_string());
-            }
-        }
+        play_text(sentence.trim(), cancel)?;
     }
-
     Ok(())
-}
-
-/// Last time audible playback started (ms since epoch). A fresh start after
-/// silence gets leading padding: cold audio devices drop the first
-/// ~100–200 ms, which otherwise eats the first syllable.
-static LAST_PLAY_MS: AtomicU64 = AtomicU64::new(0);
-
-/// Prepends ~180 ms of digital silence plus a short fade-in. Only for the
-/// first playback after idle; between sentences the device is already warm
-/// and padding would just add gaps.
-fn pad_first_playback(path: &Path) {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    if now.saturating_sub(LAST_PLAY_MS.load(Ordering::Relaxed)) <= 3_000 {
-        return;
-    }
-    let Ok(bytes) = std::fs::read(path) else { return };
-    let Ok(pcm) = parse_wav(&bytes) else { return };
-    let rate = pcm.sample_rate.max(8_000);
-    let mono = pcm.mono_f32();
-    if mono.is_empty() {
-        return;
-    }
-    let silence = (rate as usize * 180 / 1_000).clamp(1, rate as usize);
-    let fade = (rate as usize * 10 / 1_000).clamp(1, mono.len());
-    let mut padded = Vec::with_capacity(silence + mono.len());
-    padded.resize(silence, 0.0f32);
-    padded.extend_from_slice(&mono);
-    for i in 0..fade {
-        let gain = (i as f32 + 1.0) / (fade as f32 + 1.0);
-        padded[silence + i] *= gain;
-    }
-    let samples: Vec<i16> = padded
-        .iter()
-        .map(|v| (v.clamp(-1.0, 1.0) * 32_767.0).round() as i16)
-        .collect();
-    if std::fs::write(path, encode_pcm16_wav(&samples, rate)).is_ok() {
-        vlog("áudio: pad inicial de 180ms (dispositivo frio)");
-    }
-}
-
-fn play_file(path: &Path, cancel: &AtomicBool) -> Result<(), String> {
-    // Fresh audible start: restart the echo grace in the VAD so her own voice
-    // through the speakers is not mistaken for a barge-in that cuts the start.
-    friday_tools::tools::voice::mark_audible_playback();
-    pad_first_playback(path);
-    LAST_PLAY_MS.store(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0),
-        Ordering::Relaxed,
-    );
-    // Drive the orb from the synthesized envelope, window by window.
-    let stop = Arc::new(AtomicBool::new(false));
-    if let Ok(bytes) = std::fs::read(path) {
-        if let Ok(pcm) = friday_core::wav::parse_wav(&bytes) {
-            let mono = pcm.mono_f32();
-            let window = (pcm.sample_rate as usize / 20).max(1);
-            let stop = Arc::clone(&stop);
-            std::thread::spawn(move || {
-                for chunk in mono.chunks(window) {
-                    if stop.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let rms = (chunk.iter().map(|sample| sample * sample).sum::<f32>()
-                        / chunk.len().max(1) as f32)
-                        .sqrt();
-                    set_speech_level((rms * 6.0).clamp(0.0, 1.0));
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                set_speech_level(0.0);
-            });
-        }
-    }
-
-    let mut command = Command::new("/usr/bin/afplay");
-    command.arg(path);
-    let result = run_playback(&mut command, cancel);
-    stop.store(true, Ordering::Relaxed);
-    set_speech_level(0.0);
-    result
 }
 
 /// Inicia o comando, registra no global e espera checando `cancel`.
@@ -951,90 +1058,19 @@ fn stream_sentences(
     sentences: std::sync::mpsc::Receiver<String>,
     cancel: &Arc<AtomicBool>,
 ) -> Result<(), String> {
-    std::fs::create_dir_all(temp_dir())
-        .map_err(|e| format!("não foi possível criar {}: {e}", temp_dir().display()))?;
-
-    // Bounded queue: the synthesizer stays up to three sentences ahead of the
-    // speaker, so network jitter does not become audible silence.
-    let (path_tx, path_rx) = std::sync::mpsc::sync_channel::<PathBuf>(3);
-    let synth_cancel = Arc::clone(cancel);
-    let first_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let error_slot = Arc::clone(&first_error);
-    let synthesizer = thread::Builder::new()
-        .name("friday-tts-synth".to_string())
-        .spawn(move || {
-            let Ok(rt) = runtime() else { return };
-            let auth = CodexAuth::discover();
-            for sentence in sentences {
-                if synth_cancel.load(Ordering::Relaxed) {
-                    break;
-                }
-                let text = sentence.trim();
-                if text.is_empty() {
-                    continue;
-                }
-                if let Some(cached) = cache_lookup(text) {
-                    vlog(format!("cache: {}", &text.chars().take(40).collect::<String>()));
-                    if path_tx.send(cached).is_err() {
-                        break;
-                    }
-                    continue;
-                }
-                let path = if tts_blocked() {
-                    vlog("TTS em cooldown (429 recente); pulando áudio");
-                    continue;
-                } else {
-                    let synth_started = std::time::Instant::now();
-                    match synthesize_file(&rt, &auth, text) {
-                        Ok(path) => {
-                            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                            vlog(format!(
-                                "sintetizado {size} bytes em {}ms: {}",
-                                synth_started.elapsed().as_millis(),
-                                &text.chars().take(40).collect::<String>()
-                            ));
-                            cache_store(text, &path);
-                            path
-                        }
-                        Err(error) => {
-                            if error.contains("limite") {
-                                block_tts(120);
-                            }
-                            vlog(format!("síntese falhou: {error}"));
-                            if let Ok(mut slot) = error_slot.lock() {
-                                if slot.is_none() {
-                                    *slot = Some(error);
-                                }
-                            }
-                            continue;
-                        }
-                    }
-                };
-                if path_tx.send(path).is_err() {
-                    break;
-                }
-            }
-        })
-        .map_err(|e| format!("não foi possível iniciar a síntese: {e}"))?;
-
-    for path in path_rx {
-        vlog(format!("tocando {}", path.display()));
+    for sentence in sentences {
         if cancel.load(Ordering::Relaxed) {
-            let _ = std::fs::remove_file(&path);
             break;
         }
-        let result = play_file(&path, cancel);
-        let _ = std::fs::remove_file(&path);
-        if result.is_err() {
-            break;
+        let text = sentence.trim();
+        if text.is_empty() {
+            continue;
         }
+        vlog(format!("voz nativa: {}", &text.chars().take(60).collect::<String>()));
+        play_text(text, cancel)?;
     }
-
-    let _ = synthesizer.join();
-    match first_error.lock().ok().and_then(|mut slot| slot.take()) {
-        Some(error) => Err(error),
-        None => Ok(()),
-    }
+    set_speech_level(0.0);
+    Ok(())
 }
 
 fn usage_path() -> PathBuf {

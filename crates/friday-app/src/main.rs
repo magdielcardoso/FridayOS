@@ -18,6 +18,9 @@ use serde_json::json;
 
 mod automation;
 mod mobile;
+mod presence;
+mod approval_queue;
+mod decision_panel;
 mod voice;
 
 const BG: u32 = 0x050505;
@@ -382,10 +385,19 @@ struct FridayApp {
     stream: String,
     reasoning: String,
     status: Status,
+    /// Approval requested by the Codex server, waiting for a spoken/typed answer.
+    pending_approval: Option<(u64, String)>,
+    approvals: approval_queue::ApprovalQueue,
+    decision_engine: friday_tools::decision::DecisionEngine,
+    presence: presence::Presence,
     thread: Option<String>,
     tools: usize,
     mic: Option<voice::Mic>,
     mic_starting: bool,
+    /// Last level frame from the capture thread; a long silence means the
+    /// device died (the UI used to keep showing OUVINDO forever).
+    last_mic_level: Option<std::time::Instant>,
+    mic_restart_at: Option<std::time::Instant>,
     voice_phase: voice::VoicePhase,
     level: f32,
     speak_cancel: Option<Arc<AtomicBool>>,
@@ -393,6 +405,8 @@ struct FridayApp {
     speech_pending: String,
     speech_batch: String,
     speech_sent_first: bool,
+    /// Set when the user hushes her: no new audio may start until the next turn.
+    speech_muted: bool,
     transcript: String,
     external_pending: VecDeque<(String, String)>,
     notify_on_done: bool,
@@ -456,10 +470,16 @@ impl FridayApp {
             stream: String::new(),
             reasoning: String::new(),
             status: Status::Connecting,
+            pending_approval: None,
+            approvals: approval_queue::ApprovalQueue::load(&approval_path()),
+            decision_engine: friday_tools::decision::load(&decision_path()),
+            presence: presence::Presence::new(),
             thread: None,
             tools: friday_tools::Registry::with_defaults().specs().len(),
             mic: None,
             mic_starting: false,
+            last_mic_level: None,
+            mic_restart_at: None,
             voice_phase: voice::VoicePhase::Idle,
             level: 0.0,
             speak_cancel: None,
@@ -467,6 +487,7 @@ impl FridayApp {
             speech_pending: String::new(),
             speech_batch: String::new(),
             speech_sent_first: false,
+            speech_muted: false,
             transcript: String::new(),
             external_pending: VecDeque::new(),
             notify_on_done: false,
@@ -529,6 +550,34 @@ impl FridayApp {
         app.connect(cx);
         // Voice-first: open the microphone as soon as the HUD is up.
         app.start_listen(cx);
+        if !friday_tools::decision::has_token() {
+            let _ = cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        point(px(1200.0), px(180.0)),
+                        size(px(420.0), px(260.0)),
+                    ))),
+                    titlebar: None,
+                    focus: true,
+                    show: true,
+                    is_movable: true,
+                    is_resizable: false,
+                    is_minimizable: false,
+                    kind: WindowKind::PopUp,
+                    window_background: gpui::WindowBackgroundAppearance::Transparent,
+                    ..Default::default()
+                },
+                |_, cx| cx.new(|cx| decision_panel::DecisionPanel::new(cx)),
+            );
+        }
+        std::thread::spawn(voice::prune_utterances);
+        if std::env::var("FRIDAY_MUSIC").map(|value| value != "0").unwrap_or(true) {
+            std::thread::spawn(|| {
+                if let Err(error) = friday_tools::voice_engine::music_start(None) {
+                    log(format!("música ambiente: {error}"));
+                }
+            });
+        }
         app
     }
 
@@ -551,6 +600,7 @@ impl FridayApp {
                     match result {
                         Ok(mic) => {
                             app.mic = Some(mic);
+                            app.last_mic_level = Some(std::time::Instant::now());
                             app.spawn_mic_poll(cx);
                             app.voice_phase = voice::VoicePhase::Listening;
                             cx.notify();
@@ -632,6 +682,7 @@ impl FridayApp {
             }
             voice::MicEvent::Level(level) => {
                 self.level = level;
+                self.last_mic_level = Some(std::time::Instant::now());
                 cx.notify();
             }
             voice::MicEvent::Utterance { path } => {
@@ -699,6 +750,7 @@ impl FridayApp {
                                     app.stream.clear();
                                     app.status = Status::Thinking;
                                     app.voice_phase = voice::VoicePhase::Idle;
+                                    app.speech_muted = false;
                                     app.turn_started = Some(std::time::Instant::now());
                                     app.last_prompt_at = app.turn_started;
                                     app.first_token_ms = None;
@@ -747,7 +799,9 @@ impl FridayApp {
     }
 
     fn begin_speech(&mut self, cx: &mut Context<Self>) {
-        self.stop_speech_now();
+        self.halt_audio();
+        self.speech_muted = false;
+        self.set_duck(true);
         let cancel = Arc::new(AtomicBool::new(false));
         self.speak_cancel = Some(cancel.clone());
         let (tx, rx) = std::sync::mpsc::channel::<String>();
@@ -780,6 +834,7 @@ impl FridayApp {
             if let Some(result) = done_rx.recv().await {
                 let _ = this.update(cx, |app, cx| {
                     log("speech: termina");
+                    app.set_duck(false);
                     if let Err(error) = result {
                         log(format!("voz: {error}"));
                         app.messages.push(Line {
@@ -807,23 +862,40 @@ impl FridayApp {
 
     /// Streams finished sentences to the speaker while the model is still talking.
     fn feed_speech(&mut self, delta: &str, cx: &mut Context<Self>) {
-        self.speech_pending.push_str(delta);
         if !self.tts_stream {
             // Single-request mode: one TTS call per answer keeps us inside
             // ChatGPT's hourly read-aloud quota.
+            self.speech_pending.push_str(delta);
             return;
         }
+        // Open the speech session first: `begin_speech` clears the buffers, so
+        // pushing the delta before it silently dropped the first words of every
+        // answer ("Oi! Tudo bem?" was spoken as "!" + "Tudo bem?").
         if self.speech_tx.is_none() {
+            if self.speech_muted {
+                return;
+            }
             self.begin_speech(cx);
         }
-        let earliest = if self.speech_sent_first { 24 } else { 16 };
-        let sentences = take_sentences_with(&mut self.speech_pending, earliest);
+        self.speech_pending.push_str(delta);
+        let sentences = take_sentences_with(&mut self.speech_pending, 24);
         if let Some(tx) = self.speech_tx.as_ref() {
             for sentence in sentences {
+                // Punctuation-only chunks ("!", "…") have nothing to say and
+                // used to consume a whole TTS request each.
+                if !speakable(&sentence) {
+                    continue;
+                }
                 // One request starts the voice immediately; everything else is
                 // batched to respect ChatGPT's hourly TTS request limit.
                 if !self.speech_sent_first {
                     self.speech_sent_first = true;
+                    let mut sentence = sentence;
+                    if std::env::var("FRIDAY_SIGNATURE").map(|value| value != "0").unwrap_or(true)
+                        && !sentence.trim_start().to_lowercase().starts_with("senhor")
+                    {
+                        sentence = format!("Senhor. {sentence}");
+                    }
                     let _ = tx.send(sentence);
                 } else {
                     self.speech_batch.push_str(&sentence);
@@ -834,6 +906,12 @@ impl FridayApp {
     }
 
     fn end_speech(&mut self, cx: &mut Context<Self>) {
+        if self.speech_muted {
+            self.speech_pending.clear();
+            self.speech_batch.clear();
+            self.speech_tx = None;
+            return;
+        }
         if !self.tts_stream {
             let text = self.speech_pending.trim().to_string();
             self.speech_pending.clear();
@@ -849,7 +927,7 @@ impl FridayApp {
         }
 
         let rest = self.speech_pending.trim().to_string();
-        if !rest.is_empty() {
+        if !rest.is_empty() && speakable(&rest) {
             if !self.speech_sent_first {
                 self.speech_sent_first = true;
                 if let Some(tx) = self.speech_tx.as_ref() {
@@ -859,8 +937,22 @@ impl FridayApp {
                 self.speech_batch.push_str(&rest);
             }
         }
-        let batch = self.speech_batch.trim().to_string();
-        if !batch.is_empty() {
+        let mut batch = self.speech_batch.trim().to_string();
+        let long_turn = self
+            .turn_started
+            .map(|started| started.elapsed() > Duration::from_secs(8))
+            .unwrap_or(false);
+        if long_turn
+            && std::env::var("FRIDAY_SIGNATURE").map(|value| value != "0").unwrap_or(true)
+        {
+            if !batch.is_empty() {
+                batch.push_str(" À disposição.");
+            } else if speakable(&self.stream) {
+                // No batch? the whole answer was one chunk; append as a new one.
+                let _ = self.speech_tx.as_ref().map(|tx| tx.send("À disposição.".to_string()));
+            }
+        }
+        if speakable(&batch) {
             if let Some(tx) = self.speech_tx.as_ref() {
                 let _ = tx.send(batch);
             }
@@ -871,7 +963,16 @@ impl FridayApp {
         cx.notify();
     }
 
+    /// User-initiated stop: silence her until the next turn. Without this the
+    /// next streamed delta called `begin_speech` again and she resumed talking
+    /// over the user right after being interrupted.
     fn stop_speech_now(&mut self) {
+        self.speech_muted = true;
+        self.halt_audio();
+    }
+
+    /// Stops the audio only; a later delta may start speaking again.
+    fn halt_audio(&mut self) {
         self.speaking_since = None;
         if let Some(cancel) = self.speak_cancel.take() {
             cancel.store(true, Ordering::Relaxed);
@@ -962,6 +1063,12 @@ impl FridayApp {
         cx.notify();
     }
 
+    fn set_duck(&self, on: bool) {
+        std::thread::spawn(move || {
+            let _ = friday_tools::voice_engine::music_duck(on);
+        });
+    }
+
     /// Runs blocking work on a plain thread and folds the result back on GPUI.
     fn blocking<T: Send + 'static>(
         cx: &mut Context<Self>,
@@ -1044,6 +1151,35 @@ impl FridayApp {
                 if app.agent_view.is_some() && app.tick % 4 == 0 {
                     app.poll_agent_log();
                 }
+                let mode = app.presence.mode().to_string();
+                let active = app.voice_phase == voice::VoicePhase::Listening
+                    && voice::speech_level() > 0.01;
+                app.presence.update(90, app.level, active, &mode);
+                let (rate, pitch) = app.presence.prosody();
+                voice::set_prosody(rate, pitch);
+                if app.presence.state() == presence::PresenceState::HearingUser {
+                    if let Some(backchannel) = app.presence.backchannel() {
+                        voice::speak_quick_async(backchannel);
+                    }
+                }
+                if app.mic.is_some()
+                    && !app.mic_starting
+                    && app
+                        .last_mic_level
+                        .map(|at| at.elapsed() > Duration::from_secs(15))
+                        .unwrap_or(false)
+                    && app
+                        .mic_restart_at
+                        .map(|at| at.elapsed() > Duration::from_secs(30))
+                        .unwrap_or(true)
+                {
+                    log("mic: sem níveis por 15s; reiniciando captura");
+                    app.mic_restart_at = Some(std::time::Instant::now());
+                    app.last_mic_level = None;
+                    app.mic = None;
+                    app.voice_phase = voice::VoicePhase::Idle;
+                    app.start_listen(cx);
+                }
                 if app.first_audio_ms.is_none()
                     && app.voice_phase == voice::VoicePhase::Speaking
                     && voice::speech_level() > 0.01
@@ -1063,12 +1199,9 @@ impl FridayApp {
                     app.highlight_until = None;
                 }
 
-                let messages = {
-                    let mut inbox = match overlay_inbox().lock() {
-                        Ok(inbox) => inbox,
-                        Err(_) => return,
-                    };
-                    std::mem::take(&mut *inbox)
+                let messages = match overlay_inbox().lock() {
+                    Ok(mut inbox) => std::mem::take(&mut *inbox),
+                    Err(_) => Vec::new(),
                 };
                 for message in messages {
                     match message {
@@ -1097,19 +1230,59 @@ impl FridayApp {
                     }
                 }
 
-                let triggers = {
-                    let mut inbox = match trigger_inbox().lock() {
-                        Ok(inbox) => inbox,
-                        Err(_) => return,
-                    };
-                    std::mem::take(&mut *inbox)
+                let triggers = match trigger_inbox().lock() {
+                    Ok(mut inbox) => std::mem::take(&mut *inbox),
+                    Err(_) => std::collections::VecDeque::new(),
                 };
                 for trigger in triggers {
-                    if app.status == Status::Thinking {
-                        app.external_pending
-                            .push_back((trigger.source, trigger.prompt));
-                    } else {
-                        app.inject_trigger(trigger.source, trigger.prompt, cx);
+                    let critical = trigger.prompt.contains("urgente")
+                        || trigger.prompt.contains("[urgente]")
+                        || trigger.prompt.contains("erro")
+                        || trigger.prompt.contains("autoheal");
+                    let secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() % 86_400)
+                        .unwrap_or(0);
+                    let fact = friday_tools::decision::Fact {
+                        source: trigger.source.clone(),
+                        text: trigger.prompt.clone(),
+                        app: app.active_app.clone(),
+                        mode: app.presence.mode().to_string(),
+                        hour: (((secs / 3_600) + 21) % 24) as u32,
+                        minute: ((secs / 60) % 60) as u32,
+                        urgency: if critical { 3 } else { 1 },
+                        mission_status: String::new(),
+                        clipboard_preview: String::new(),
+                    };
+                    let now_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let result = app.decision_engine.evaluate(&fact, now_secs);
+                    trace(json!({
+                        "event": "decision",
+                        "source": trigger.source,
+                        "decision": format!("{:?}", result.decision),
+                        "rule": result.rule,
+                        "reason": result.reason,
+                    }));
+                    match result.decision {
+                        friday_tools::decision::Decision::Hold => {
+                            app.external_pending
+                                .push_back((trigger.source, trigger.prompt));
+                        }
+                        friday_tools::decision::Decision::Drop => {}
+                        friday_tools::decision::Decision::NotifyPush => {
+                            mobile::notify_push(&trigger.source, &trigger.prompt);
+                        }
+                        _ => {
+                            if app.status == Status::Thinking {
+                                app.external_pending
+                                    .push_back((trigger.source, trigger.prompt));
+                            } else {
+                                app.inject_trigger(trigger.source, trigger.prompt, cx);
+                            }
+                        }
                     }
                 }
                 cx.notify();
@@ -1172,7 +1345,7 @@ impl FridayApp {
                         .unwrap_or(true);
                     if stale {
                         log("watchdog: fala travada, resetando");
-                        app.stop_speech_now();
+                        app.halt_audio();
                         app.voice_phase = voice::VoicePhase::Listening;
                         cx.notify();
                     }
@@ -1379,6 +1552,9 @@ impl FridayApp {
                     return;
                 }
                 let mut spoken = None;
+                std::thread::spawn(|| {
+                    let _ = friday_tools::voice_engine::ui_sound("done");
+                });
                 log(format!(
                     "done: status={status} stream={} chars",
                     self.stream.chars().count()
@@ -1444,13 +1620,29 @@ impl FridayApp {
                     text: "contexto compactado".into(),
                 });
             }
+            CodexEvent::ApprovalRequest { id, method, summary, params: _ } => {
+                self.pending_approval = Some((id, method.clone()));
+                self.approvals.add(id, &method, &summary);
+                let _ = self.approvals.save(&approval_path());
+                self.messages.push(Line {
+                    role: Role::System,
+                    text: format!("Aprovação pedida ({method}): {summary} — diga ou escreva sim/não"),
+                });
+                log(format!("aprovação pendente {id}: {summary}"));
+                std::thread::spawn(|| {
+                    let _ = friday_tools::voice_engine::ui_sound("confirm");
+                });
+                self.scroll.scroll_to_bottom();
+            }
             CodexEvent::Error(error) => {
+                std::thread::spawn(|| {
+                    let _ = friday_tools::voice_engine::ui_sound("error");
+                });
                 mobile::assistant_error(&error);
                 self.messages.push(Line {
                     role: Role::System,
                     text: error.clone(),
                 });
-                self.status = Status::Offline;
                 for activity in self.activity.iter_mut() {
                     if activity.state == StepState::Started {
                         activity.state = StepState::Failed;
@@ -1458,10 +1650,39 @@ impl FridayApp {
                             Some(activity.started.elapsed().as_millis());
                     }
                 }
+                // A tool/turn error is not a dead connection: ending the turn is
+                // enough. Only transport failures justify a reconnect.
+                let fatal = error.contains("encerrado")
+                    || error.contains("processo")
+                    || error.contains("conexão")
+                    || error.contains("conect")
+                    || error.contains("tempo esgotado")
+                    || error.contains("Codex");
+                if self.status == Status::Thinking || self.turn_started.is_some() {
+                    self.status = Status::Interrupted;
+                    self.turn_started = None;
+                    self.first_token_ms = None;
+                    self.speech_muted = true;
+                    self.speech_tx = None;
+                    self.speech_pending.clear();
+                    self.speech_batch.clear();
+                    voice::stop_speaking();
+                    if let Some(mic) = self.mic.as_ref() {
+                        mic.set_speaking(false);
+                    }
+                    self.voice_phase = if self.mic.is_some() {
+                        voice::VoicePhase::Listening
+                    } else {
+                        voice::VoicePhase::Idle
+                    };
+                }
+                if fatal {
+                    self.status = Status::Offline;
+                }
                 trace(json!({ "event": "error", "message": error }));
                 self.scroll.scroll_to_bottom();
                 // Recover from a dropped app-server without losing the thread.
-                if self.reconnect_attempts < 3 {
+                if fatal && self.reconnect_attempts < 3 {
                     self.reconnect_attempts += 1;
                     let delay = 2_u64 * self.reconnect_attempts as u64;
                     log(format!(
@@ -1515,6 +1736,7 @@ impl FridayApp {
             text: format!("[{source}] {prompt}"),
         });
         adaptive_effort(&prompt);
+        self.speech_muted = false;
         self.turn_started = Some(std::time::Instant::now());
         self.last_prompt_at = self.turn_started;
         self.first_audio_ms = None;
@@ -1522,6 +1744,7 @@ impl FridayApp {
         self.last_tools = 0;
         trace(json!({ "event": "turn_start", "source": source, "chars": prompt.chars().count() }));
         self.activity.clear();
+        self.arm_turn_watchdog(cx);
         self.push_activity(format!("evento · {source}"), StepState::Completed);
         self.stream.clear();
         self.status = Status::Thinking;
@@ -1609,8 +1832,11 @@ impl FridayApp {
         if file.read_to_string(&mut buffer).is_err() {
             return;
         }
-        self.agent_offset += buffer.len() as u64;
-        for line in buffer.lines() {
+        // Advance only through complete lines: a half-written JSONL record used
+        // to be skipped forever (usually the final `done`).
+        let complete = buffer.rfind('\n').map(|index| index + 1).unwrap_or(0);
+        self.agent_offset += complete as u64;
+        for line in buffer[..complete].lines() {
             let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
                 continue;
             };
@@ -1672,7 +1898,53 @@ impl FridayApp {
             }
             return;
         }
-        if text.is_empty() || self.status == Status::Thinking {
+        if text.is_empty() {
+            return;
+        }
+        if let Some((id, method)) = self.pending_approval.take() {
+            let answer = text.to_ascii_lowercase();
+            let yes = ["sim", "s", "yes", "y", "ok", "autorizo", "pode", "aprovo"]
+                .iter()
+                .any(|word| answer.split_whitespace().any(|part| part == *word));
+            if let Some(codex) = self.codex.as_ref() {
+                if yes {
+                    codex.approve(id);
+                } else {
+                    codex.deny(id);
+                }
+            }
+            self.approvals.decide(id, yes);
+            let _ = self.approvals.save(&approval_path());
+            if self.approvals.count() > 0 {
+                let digest = self.approvals.digest();
+                self.messages.push(Line {
+                    role: Role::System,
+                    text: digest,
+                });
+            }
+            self.messages.push(Line {
+                role: Role::System,
+                text: format!("{method}: {}", if yes { "aprovado" } else { "negado" }),
+            });
+            self.input.clear();
+            cx.notify();
+            return;
+        }
+        if self.status == Status::Thinking {
+            // Typed input during a turn is guidance, exactly like voice: send it
+            // as a steer instead of silently swallowing the Enter.
+            if let Some(codex) = self.codex.as_ref() {
+                codex.steer(text.clone());
+            }
+            self.messages.push(Line {
+                role: Role::User,
+                text: format!("[orientação] {text}"),
+            });
+            self.input.clear();
+            mobile::user_message(&format!("[orientação] {text}"));
+            self.push_activity("orientação enviada", StepState::Completed);
+            self.scroll.scroll_to_bottom();
+            cx.notify();
             return;
         }
         self.messages.push(Line {
@@ -1688,6 +1960,7 @@ impl FridayApp {
         mobile::user_message(&text);
         adaptive_effort(&text);
         self.activity.clear();
+        self.speech_muted = false;
         self.turn_started = Some(std::time::Instant::now());
         self.last_prompt_at = self.turn_started;
         self.first_token_ms = None;
@@ -1698,6 +1971,7 @@ impl FridayApp {
         self.graph_highlight.clear();
         self.highlight_until = None;
         self.push_activity("enviado ao código", StepState::Completed);
+        self.arm_turn_watchdog(cx);
 
         match self.codex.as_ref() {
             Some(codex) => codex.prompt(text),
@@ -1711,6 +1985,45 @@ impl FridayApp {
         }
         self.scroll.scroll_to_bottom();
         cx.notify();
+    }
+
+    /// No turn may hang forever: if no completion arrives, the UI returns to a
+    /// usable state instead of locking the keyboard and the microphone.
+    fn arm_turn_watchdog(&mut self, cx: &mut Context<Self>) {
+        const LIMIT: Duration = Duration::from_secs(240);
+        let started = self.turn_started;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(LIMIT).await;
+            let _ = this.update(cx, |app, cx| {
+                if app.status != Status::Thinking || app.turn_started != started {
+                    return;
+                }
+                app.status = Status::Interrupted;
+                app.speech_muted = true;
+                app.speech_tx = None;
+                app.speech_pending.clear();
+                app.speech_batch.clear();
+                app.turn_started = None;
+                app.messages.push(Line {
+                    role: Role::System,
+                    text: "turno expirou sem resposta; núcleo reiniciado".into(),
+                });
+                log("turno: watchdog disparou");
+                if let Some(codex) = app.codex.as_ref() {
+                    codex.reconnect();
+                }
+                if let Some(mic) = app.mic.as_ref() {
+                    mic.set_speaking(false);
+                }
+                app.voice_phase = if app.mic.is_some() {
+                    voice::VoicePhase::Listening
+                } else {
+                    voice::VoicePhase::Idle
+                };
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn cancel_turn(&mut self, cx: &mut Context<Self>) {
@@ -2985,9 +3298,21 @@ fn assistant_live_file(name: &str) -> std::path::PathBuf {
 
 /// True when the assistant's last live record is neither `done` nor `error`.
 fn assistant_running(name: &str) -> bool {
-    let Ok(raw) = std::fs::read_to_string(assistant_live_file(name)) else {
+    // Read only the tail: parsing the whole live log on every tick was a
+    // growing cost on the UI thread.
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(assistant_live_file(name)) else {
         return false;
     };
+    let len = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+    let start = len.saturating_sub(8 * 1024);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return false;
+    }
+    let mut raw = String::new();
+    if file.read_to_string(&mut raw).is_err() {
+        return false;
+    }
     raw.lines()
         .rev()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
@@ -3005,7 +3330,13 @@ fn load_assistants() -> Vec<(String, String)> {
     };
     let mut list = Vec::new();
     for entry in entries.filter_map(|entry| entry.ok()) {
-        let Ok(raw) = std::fs::read_to_string(entry.path()) else {
+        let path = entry.path();
+        // Only assistant records: `.pid`, `.thread` and `.live.jsonl` used to be
+        // parsed too and produced phantom entries.
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(&path) else {
             continue;
         };
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
@@ -3061,8 +3392,25 @@ fn persona() -> String {
     format!("{PERSONA_BASE}\n\n{manifest}{memories}")
 }
 
+fn approval_path() -> std::path::PathBuf {
+    let home = std::env::var_os("HOME").unwrap_or_default();
+    std::path::PathBuf::from(home)
+        .join("Library/Application Support/FridayOS/approvals.json")
+}
+
+fn decision_path() -> std::path::PathBuf {
+    let home = std::env::var_os("HOME").unwrap_or_default();
+    std::path::PathBuf::from(home)
+        .join("Library/Application Support/FridayOS/sistema-decisao.json")
+}
+
 /// Pulls complete sentences out of a growing stream buffer, with an early
 /// clause flush so the voice can start before the answer is finished.
+/// A chunk is worth a TTS request only if it carries letters or digits.
+fn speakable(text: &str) -> bool {
+    text.chars().any(|ch| ch.is_alphanumeric())
+}
+
 fn take_sentences(buffer: &mut String) -> Vec<String> {
     take_sentences_with(buffer, 24)
 }
@@ -3656,8 +4004,10 @@ fn open_overlay(cx: &mut App, request: OverlayRequest) {
         None => (1440.0, 900.0, 0.0, 0.0),
     };
 
-    let width = request.width.clamp(280.0, screen_w - 40.0);
-    let height = estimate_height(&request.body, width).clamp(120.0, screen_h - 40.0);
+    let max_width = (screen_w - 40.0).max(240.0);
+    let width = request.width.clamp(240.0_f32.min(max_width), max_width);
+    let max_height = (screen_h - 40.0).max(100.0);
+    let height = estimate_height(&request.body, width).clamp(100.0_f32.min(max_height), max_height);
     let margin = 28.0;
     let (mut x, mut y) = match request.anchor.to_lowercase().as_str() {
         "top" | "top-center" => ((screen_w - width) / 2.0, margin),
@@ -3711,18 +4061,45 @@ fn open_overlay(cx: &mut App, request: OverlayRequest) {
 
     if request.seconds > 0 {
         let ttl = Duration::from_secs(request.seconds.clamp(3, 600));
+        let own = handle.clone();
         cx.spawn(async move |cx| {
             cx.background_executor().timer(ttl).await;
-            let handles = match overlay_windows().lock() {
-                Ok(mut windows) => std::mem::take(&mut *windows),
-                Err(_) => return,
-            };
-            for handle in handles {
-                let _ = handle.update(cx, |_, window, _| window.remove_window());
+            // Expire only this overlay: a 12 s event card used to close every
+            // panel the user had opened.
+            if let Ok(mut windows) = overlay_windows().lock() {
+                windows.retain(|window| window != &own);
             }
+            let _ = own.update(cx, |_, window, _| window.remove_window());
         })
         .detach();
     }
+}
+
+/// Uma Friday por máquina.
+///
+/// `open -n`, scripts de dev e recompilações abriam cópias extras: cada uma
+/// subia os daemons de tela/overlay, o servidor mobile na mesma porta e o
+/// mesmo estado em disco — na prática, "aparece outra janela do nada".
+/// Aqui a segunda cópia detecta a primeira por um socket e sai em silêncio.
+fn single_instance_guard() -> Option<std::os::unix::net::UnixListener> {
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    let home = std::env::var_os("HOME").unwrap_or_default();
+    let dir = std::path::PathBuf::from(home).join("Library/Application Support/FridayOS");
+    let _ = std::fs::create_dir_all(&dir);
+    let socket = dir.join("instance.sock");
+
+    if UnixStream::connect(&socket).is_ok() {
+        return None;
+    }
+    // Socket órfão de um processo que morreu sem limpar: pode reutilizar.
+    let _ = std::fs::remove_file(&socket);
+    let listener = UnixListener::bind(&socket).ok()?;
+    let _ = std::fs::set_permissions(
+        &socket,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    );
+    Some(listener)
 }
 
 fn main() {
@@ -3801,14 +4178,22 @@ fn main() {
         }
         return;
     }
+    let Some(_instance) = single_instance_guard() else {
+        log("instância: já existe uma Friday rodando — esta cópia vai sair");
+        return;
+    };
     start_screen_daemon();
     start_overlay_daemon();
     let mobile_port = std::env::var("FRIDAY_MOBILE_PORT")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(3000);
-    let _pairing = mobile::start(mobile_port);
-    log(format!("mobile: servidor em http://127.0.0.1:{mobile_port}"));
+    match mobile::start(mobile_port) {
+        Some(code) => log(format!(
+            "mobile: servidor em http://127.0.0.1:{mobile_port} · código {code}"
+        )),
+        None => log("mobile: servidor não iniciou (veja o log)"),
+    }
     automation::start(
         automation::hook_port(),
         Arc::new(|trigger| {

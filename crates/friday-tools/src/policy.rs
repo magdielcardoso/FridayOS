@@ -144,7 +144,8 @@ pub fn authorize_tool(tool: &str, risk: Risk, ctx: &ToolCtx) -> ToolResult {
         Autonomy::Standard => risk >= Risk::Sensitive || destructive,
         Autonomy::Full => destructive,
     };
-    if needs && !ctx.confirmed {
+    // A dry run performs no action, so it never needs the user's confirmation.
+    if needs && !ctx.confirmed && !ctx.dry_run {
         return Err(ToolError::Denied(format!(
             "`{tool}` é {}{} e precisa de confirmação explícita (autonomia: {})",
             risk.label(),

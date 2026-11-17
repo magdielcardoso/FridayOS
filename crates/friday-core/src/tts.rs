@@ -187,7 +187,15 @@ fn decode_audio(bytes: &[u8], content_type: &str) -> Result<Pcm> {
 
     let dir = std::env::temp_dir().join("friday-tts");
     std::fs::create_dir_all(&dir).map_err(|e| TtsError::Failed(e.to_string()))?;
-    let stem = format!("speech-{}", std::process::id());
+    // Unique per synthesis: a pid-only stem made concurrent clips overwrite
+    // each other and afconvert read half-written input.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let stem = format!("speech-{}-{seq}-{nanos}", std::process::id());
     let input = dir.join(format!("{stem}.{}", extension(content_type)));
     let output = dir.join(format!("{stem}.wav"));
 

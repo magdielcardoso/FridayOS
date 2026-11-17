@@ -216,6 +216,19 @@ impl CodexAuth {
     }
 
     async fn refresh(&self, file: &AuthFile, session: Session) -> Result<Session> {
+        // Refresh tokens are single-use and rotate. The per-instance mutex was
+        // not enough: every caller builds its own CodexAuth, so two concurrent
+        // TTS/STT paths refreshed with the same token and one of them lost.
+        static GATE: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        let gate = GATE.get_or_init(|| tokio::sync::Mutex::new(()));
+        let _gate = gate.lock().await;
+        if let Ok((_, fresh)) = self.read().await {
+            if !fresh.is_expired() && fresh.refresh_token != session.refresh_token {
+                // Someone else already rotated it; reuse their session.
+                return Ok(fresh);
+            }
+        }
+
         let form = [
             ("grant_type", "refresh_token".to_string()),
             ("client_id", CODEX_CLIENT_ID.to_string()),
@@ -299,7 +312,14 @@ impl CodexAuth {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
-        let tmp = parent.join(format!(".auth.json.friday-{}", std::process::id()));
+        // Unique per write: two processes sharing one temp name could rename a
+        // half-written file over auth.json.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = parent.join(format!(
+            ".auth.json.friday-{}-{seq}",
+            std::process::id()
+        ));
 
         tokio::fs::write(&tmp, &raw).await?;
         set_private_permissions(&tmp).await?;
