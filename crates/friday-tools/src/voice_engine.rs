@@ -240,6 +240,10 @@ pub fn music_stop() -> Result<(), String> {
 
 /// Lowers the bed while Friday speaks and restores it afterwards.
 pub fn music_duck(on: bool) -> Result<(), String> {
+    // Never spawn the music helper just to duck a bed that was never started.
+    if MUSIC.lock().map(|guard| guard.is_none()).unwrap_or(true) {
+        return Ok(());
+    }
     music_command(if on { "duck on" } else { "duck off" }, &["duck"])?;
     Ok(())
 }

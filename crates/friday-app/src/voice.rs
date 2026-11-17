@@ -284,8 +284,62 @@ pub fn speak_quick_async(text: impl Into<String>) {
     });
 }
 
-/// Speaks text with the on-device system voice (Siri/Dictation engine). No
-/// network request, no hourly quota, and progress drives the orb.
+/// Piper (local neural voice) paths. The venv and model live under the app's
+/// data dir; nothing is installed system-wide and no network is used at runtime.
+fn piper_dir() -> PathBuf {
+    let home = std::env::var_os("HOME").unwrap_or_default();
+    PathBuf::from(home)
+        .join("Library/Application Support/FridayOS/piper")
+}
+
+fn piper_python() -> PathBuf {
+    piper_dir().join("venv/bin/python")
+}
+
+fn piper_model() -> PathBuf {
+    piper_dir()
+        .join("models")
+        .join(std::env::var("FRIDAY_PIPER_MODEL").unwrap_or_else(|_| "dii_pt-BR.onnx".into()))
+}
+
+pub fn piper_ready() -> bool {
+    piper_python().is_file() && piper_model().is_file()
+}
+
+/// Synthesizes WAV with Piper. `rate` is a multiplier around 1.0; Piper's
+/// `length_scale` is inverse (higher = slower), so it is inverted here.
+fn synthesize_piper(text: &str, rate: f32) -> Result<PathBuf, String> {
+    let python = piper_python();
+    let model = piper_model();
+    let rate = rate.clamp(0.7, 1.4);
+    let out = temp_dir().join(format!(
+        "piper-{}-{}.wav",
+        std::process::id(),
+        stamp()
+    ));
+    let status = Command::new(python)
+        .arg("-m")
+        .arg("piper")
+        .arg("-m")
+        .arg(model)
+        .arg("-f")
+        .arg(&out)
+        .arg("--length-scale")
+        .arg((1.0 / rate).to_string())
+        .arg("--sentence-silence")
+        .arg("0.15")
+        .stdin(std::process::Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("piper: {error}"))?;
+    if !status.success() || !out.is_file() {
+        return Err("piper falhou ao sintetizar".to_string());
+    }
+    Ok(out)
+}
+
+/// Speaks text locally. Piper is the default; the macOS voice is the fallback.
 fn play_text(text: &str, cancel: &AtomicBool) -> Result<(), String> {
     stop_speaking();
     let text = text.trim();
@@ -293,6 +347,19 @@ fn play_text(text: &str, cancel: &AtomicBool) -> Result<(), String> {
         return Ok(());
     }
     friday_tools::tools::voice::mark_audible_playback();
+    let rate = f32::from_bits(PROSODY_RATE.load(Ordering::Relaxed));
+    let use_piper = std::env::var("FRIDAY_TTS_ENGINE")
+        .map(|value| value != "siri")
+        .unwrap_or(true);
+    if use_piper && piper_ready() {
+        if let Ok(wav) = synthesize_piper(text, rate) {
+            let result = play_wav(&wav, cancel);
+            let _ = std::fs::remove_file(&wav);
+            set_speech_level(0.0);
+            return result;
+        }
+        vlog("piper indisponível; usando voz do sistema");
+    }
     let helper = friday_tools::swift::helper("speech").map_err(|error| error.to_string())?;
     let rate = f32::from_bits(PROSODY_RATE.load(Ordering::Relaxed));
     let pitch = f32::from_bits(PROSODY_PITCH.load(Ordering::Relaxed));
@@ -531,6 +598,38 @@ fn speak_sentences(sentences: &[String], cancel: &Arc<AtomicBool>) -> Result<(),
         play_text(sentence.trim(), cancel)?;
     }
     Ok(())
+}
+
+/// Reproduz um WAV com envelope na HUD e cancelamento cooperativo.
+fn play_wav(path: &Path, cancel: &AtomicBool) -> Result<(), String> {
+    if let Ok(bytes) = std::fs::read(path) {
+        if let Ok(pcm) = friday_core::wav::parse_wav(&bytes) {
+            let mono = pcm.mono_f32();
+            let window = (pcm.sample_rate as usize / 20).max(1);
+            let stop = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                for chunk in mono.chunks(window) {
+                    if flag.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let rms = (chunk.iter().map(|sample| sample * sample).sum::<f32>()
+                        / chunk.len().max(1) as f32)
+                        .sqrt();
+                    set_speech_level((rms * 6.0).clamp(0.0, 1.0));
+                    thread::sleep(Duration::from_millis(50));
+                }
+                set_speech_level(0.0);
+            });
+            let mut command = Command::new("/usr/bin/afplay");
+            command.arg(path);
+            let result = run_playback(&mut command, cancel);
+            stop.store(true, Ordering::Relaxed);
+            set_speech_level(0.0);
+            return result;
+        }
+    }
+    Err("WAV inválido".to_string())
 }
 
 /// Inicia o comando, registra no global e espera checando `cancel`.

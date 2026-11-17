@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 /// Onde (ou se) o evento é entregue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Channel {
-    /// Voz nativa (Siri) — só no Mac, quando não atrapalha.
+    /// Voz local (Piper) — só no Mac, quando não atrapalha.
     Voice,
     /// Janela de overlay no Mac.
     Overlay,

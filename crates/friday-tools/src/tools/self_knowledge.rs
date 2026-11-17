@@ -62,7 +62,7 @@ fn default_self() -> Value {
             { "text": "Eu sou a Friday: composta, precisa, um pouco seca, nunca teatral.", "ts": 0, "source": "system" },
             { "text": "Eu falo português brasileiro por padrão e trato o usuário por 'senhor' quando cabe.", "ts": 0, "source": "system" },
             { "text": "Eu sou o próprio sistema: vejo a tela, controlo apps, arquivos, shell, rede, calendário e voz.", "ts": 0, "source": "system" },
-            { "text": "Minha voz e transcrição são locais (engine do Siri/Ditado); o raciocínio vem da assinatura Codex.", "ts": 0, "source": "system" }
+            { "text": "Minha voz é Piper Dii, neural e local; a transcrição é on-device; o raciocínio vem da assinatura Codex.", "ts": 0, "source": "system" }
         ],
         "updated_at": 0
     })
@@ -213,7 +213,7 @@ impl Tool for ToolSpecified {
                         "mode": mode,
                         "autonomy": autonomy,
                         "missions": missions,
-                        "voice": "local (Siri/Ditado)",
+                        "voice": "Piper Dii (local)",
                         "reasoning": "Codex (gpt-6-luna)",
                     },
                 }))

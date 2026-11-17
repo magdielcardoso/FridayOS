@@ -100,7 +100,7 @@ Context: `context_now` reports the active app and its declared category.
 Tool routing: `tools/search` finds tools by name/description when needed.
 Voice: the app speaks your answers automatically with the ChatGPT voice. NEVER
 call the `say` tool unless ChatGPT voice is blocked by the hourly limit; calling
-it duplicates speech in Siri's voice.
+it duplicates speech in her own local voice.
 You also have: `diagnose` (read logs, list recent errors and environment
 problems), `say` (macOS speech as an explicit fallback), `memory_save` /
 `memory_list` / `memory_update` (persistent memories that survive restarts),
@@ -577,7 +577,9 @@ impl FridayApp {
             );
         }
         std::thread::spawn(voice::prune_utterances);
-        if std::env::var("FRIDAY_MUSIC").map(|value| value != "0").unwrap_or(true) {
+        // Off by default: the procedural pad was audible as a low background
+        // hiss. Opt in explicitly with FRIDAY_MUSIC=1 (and optionally a file).
+        if std::env::var("FRIDAY_MUSIC").map(|value| value == "1").unwrap_or(false) {
             std::thread::spawn(|| {
                 if let Err(error) = friday_tools::voice_engine::music_start(None) {
                     log(format!("música ambiente: {error}"));
@@ -1070,6 +1072,9 @@ impl FridayApp {
     }
 
     fn set_duck(&self, on: bool) {
+        if !std::env::var("FRIDAY_MUSIC").map(|value| value == "1").unwrap_or(false) {
+            return;
+        }
         std::thread::spawn(move || {
             let _ = friday_tools::voice_engine::music_duck(on);
         });
