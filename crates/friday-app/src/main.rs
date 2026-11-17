@@ -553,6 +553,9 @@ impl FridayApp {
         app.connect(cx);
         // Voice-first: open the microphone as soon as the HUD is up.
         app.start_listen(cx);
+        if friday_tools::decision::has_token() {
+            log("sistema de decisão: chave Jev carregada · decisões via TypeSafe");
+        }
         if !friday_tools::decision::has_token() {
             let _ = cx.open_window(
                 WindowOptions {

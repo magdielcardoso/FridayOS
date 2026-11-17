@@ -233,23 +233,45 @@ impl Render for DecisionPanel {
                     .child(bracket(true, false))
                     .child(bracket(false, true))
                     .child(bracket(false, false))
-                    // Cabeçalho
+                    // Cabeçalho com fechar no canto superior direito.
                     .child(
                         div()
                             .flex()
+                            .justify_between()
                             .items_center()
-                            .gap(px(8.0))
                             .child(
                                 div()
-                                    .w(px(6.0))
-                                    .h(px(6.0))
-                                    .bg(rgb(0xff2f2f)),
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.0))
+                                    .child(
+                                        div()
+                                            .w(px(6.0))
+                                            .h(px(6.0))
+                                            .bg(rgb(0xff2f2f)),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(12.0))
+                                            .text_color(rgb(0xff2f2f))
+                                            .child(SharedString::from("SISTEMA DE DECISÃO · JEV (TYPESAFE)")),
+                                    ),
                             )
                             .child(
                                 div()
+                                    .id("decision-close")
+                                    .px(px(6.0))
+                                    .py(px(2.0))
+                                    .rounded(px(4.0))
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(rgba(0x2a0505ff)))
                                     .text_size(px(12.0))
-                                    .text_color(rgb(0xff2f2f))
-                                    .child(SharedString::from("SISTEMA DE DECISÃO · JEV (TYPESAFE)")),
+                                    .text_color(rgb(0xff3448))
+                                    .child(SharedString::from("×"))
+                                    .on_mouse_down(
+                                        gpui::MouseButton::Left,
+                                        cx.listener(|_, _, window, _| window.remove_window()),
+                                    ),
                             ),
                     )
                     // Regra decorativa
