@@ -853,9 +853,20 @@ impl FridayApp {
                         });
                     }
                     app.speaking_since = None;
-                    if let Some(mic) = app.mic.as_ref() {
-                        mic.set_speaking(false);
-                    }
+                    // Keep the VAD's echo guard up briefly after playback ends:
+                    // the speakers/reverb were still feeding the mic and the
+                    // capture opened a 30 s "utterance" of her own voice.
+                    cx.spawn(async move |this, cx| {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(1200))
+                            .await;
+                        let _ = this.update(cx, |app, _| {
+                            if let Some(mic) = app.mic.as_ref() {
+                                mic.set_speaking(false);
+                            }
+                        });
+                    })
+                    .detach();
                     app.speak_cancel = None;
                     app.speech_tx = None;
                     app.voice_phase = if app.mic.is_some() {

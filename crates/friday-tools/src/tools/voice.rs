@@ -52,8 +52,9 @@ pub const LONG_HANGOVER_FRAMES: u32 = 6;
 pub const LONG_UTTERANCE_FRAMES: usize = 8;
 /// Kept for compatibility with callers that referenced the old constant.
 pub const SILENCE_FRAMES_TO_END: u32 = SHORT_HANGOVER_FRAMES;
-/// Hard cap on an utterance (~30 s at 16 kHz / 4096-sample frames).
-pub const MAX_FRAMES: usize = 117;
+/// Hard cap on an utterance (~8 s). Longer clips make the on-device
+/// recognizer silently return no text and were almost always speaker echo.
+pub const MAX_FRAMES: usize = 32;
 /// Samples per VAD frame.
 pub const FRAME_SIZE: usize = 4096;
 /// Rate we hand to the STT layer.

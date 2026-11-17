@@ -157,30 +157,57 @@ pub fn wake_once(phrase: &str, seconds: u32) -> Result<bool, String> {
 /// Transcribes a WAV with SFSpeechRecognizer running fully on-device.
 fn siri_transcribe_file(path: &Path) -> Result<String, String> {
     let helper = friday_tools::swift::helper("speech").map_err(|error| error.to_string())?;
-    let output = Command::new(helper)
-        .arg("transcribe")
-        .arg(path)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| format!("reconhecimento local: {error}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "reconhecimento local: {}",
-            stderr.trim().lines().last().unwrap_or("falhou")
-        ));
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines().rev() {
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
-            if let Some(text) = value.get("text").and_then(|text| text.as_str()) {
-                if !text.trim().is_empty() {
-                    return Ok(text.trim().to_string());
+    let run = |input: &Path| -> Result<String, String> {
+        let output = Command::new(&helper)
+            .arg("transcribe")
+            .arg(input)
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|error| format!("reconhecimento local: {error}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "reconhecimento local: {}",
+                stderr.trim().lines().last().unwrap_or("falhou")
+            ));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines().rev() {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+                if let Some(text) = value.get("text").and_then(|text| text.as_str()) {
+                    if !text.trim().is_empty() {
+                        return Ok(text.trim().to_string());
+                    }
                 }
             }
         }
+        Err("reconhecimento local sem texto".into())
+    };
+
+    match run(path) {
+        Ok(text) => return Ok(text),
+        Err(first) => {
+            // SFSpeechRecognizer on macOS returns no text for long files.
+            // Retry on a short leading window, where it is reliable.
+            if let Ok(bytes) = std::fs::read(path) {
+                if let Ok(pcm) = friday_core::wav::parse_wav(&bytes) {
+                    let keep = (pcm.sample_rate as usize * 6).min(pcm.samples.len());
+                    if keep > 0 {
+                        let trimmed = temp_dir().join(format!("stt-short-{}-{}.wav", std::process::id(), stamp()));
+                        let wav = encode_pcm16_wav(&pcm.samples[..keep], pcm.sample_rate);
+                        if std::fs::write(&trimmed, wav).is_ok() {
+                            let result = run(&trimmed);
+                            let _ = std::fs::remove_file(&trimmed);
+                            if let Ok(text) = result {
+                                return Ok(text);
+                            }
+                        }
+                    }
+                }
+            }
+            Err(first)
+        }
     }
-    Err("reconhecimento local sem texto".into())
 }
 
 pub fn transcribe_wav(path: &Path) -> Result<String, String> {
