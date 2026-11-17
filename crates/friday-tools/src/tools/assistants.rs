@@ -6,7 +6,120 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use crate::artifact;
 use crate::registry::{Registry, Tool, ToolCtx, ToolError, ToolResult, ToolSpec};
+
+fn harness_path() -> PathBuf {
+    let home = std::env::var_os("HOME").unwrap_or_default();
+    PathBuf::from(home).join("Library/Application Support/FridayOS/harness.json")
+}
+
+/// Maximum allowed orchestration depth: env override, then
+/// `harness.json.subagent_depth`, then 2.
+fn max_subagent_depth() -> u64 {
+    if let Ok(raw) = std::env::var("FRIDAY_SUBAGENT_DEPTH") {
+        if let Ok(value) = raw.trim().parse::<u64>() {
+            return value.min(8);
+        }
+    }
+    std::fs::read_to_string(harness_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|value| {
+            value
+                .get("subagent_depth")
+                .and_then(Value::as_u64)
+                .or_else(|| {
+                    value
+                        .get("harness")
+                        .and_then(|nested| nested.get("subagent_depth"))
+                        .and_then(Value::as_u64)
+                })
+        })
+        .unwrap_or(2)
+        .min(8)
+}
+
+fn active_path(name: &str) -> PathBuf {
+    dir().join(format!(".{}.active.json", slug(name)))
+}
+
+fn write_active(name: &str, value: &Value) {
+    let path = active_path(name);
+    let _ = std::fs::create_dir_all(dir());
+    if let Ok(bytes) = serde_json::to_vec_pretty(value) {
+        let _ = std::fs::write(path, bytes);
+    }
+}
+
+fn truncate_chars(text: &str, max: usize) -> String {
+    let mut out = String::new();
+    for (index, ch) in text.chars().enumerate() {
+        if index >= max {
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Normalise a worker's raw output into the structured result contract:
+/// `{ok, answer, evidence, verification, findings}`. Plain text is wrapped as
+/// `answer` with `verification: "unknown"`.
+fn structure_answer(raw: &str, budget_chars: Option<usize>) -> Value {
+    let mut result = if let Some(object) = serde_json::from_str::<Value>(raw)
+        .ok()
+        .filter(|value| value.is_object())
+    {
+        let answer = object
+            .get("answer")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| serde_json::to_string(&object).unwrap_or_default());
+        let evidence = object
+            .get("evidence")
+            .cloned()
+            .filter(|value| value.is_array())
+            .unwrap_or_else(|| json!([]));
+        let findings = object
+            .get("findings")
+            .cloned()
+            .filter(|value| value.is_array())
+            .unwrap_or_else(|| json!([]));
+        let verification = match object.get("verification").and_then(Value::as_str) {
+            Some("pass") => "pass",
+            Some("fail") => "fail",
+            _ => "unknown",
+        };
+        let ok = object.get("ok").and_then(Value::as_bool).unwrap_or(true);
+        json!({
+            "ok": ok,
+            "answer": answer,
+            "evidence": evidence,
+            "verification": verification,
+            "findings": findings,
+        })
+    } else {
+        json!({
+            "ok": true,
+            "answer": raw.trim().to_string(),
+            "evidence": [],
+            "verification": "unknown",
+            "findings": [],
+        })
+    };
+    if let Some(max) = budget_chars {
+        let replacement = result
+            .get("answer")
+            .and_then(Value::as_str)
+            .filter(|text| text.chars().count() > max)
+            .map(|text| truncate_chars(text, max));
+        if let Some(text) = replacement {
+            result["answer"] = json!(text);
+        }
+    }
+    result
+}
 
 fn dir() -> PathBuf {
     let home = std::env::var_os("HOME").unwrap_or_default();
@@ -196,18 +309,23 @@ fn summarize_event(event: &Value) -> Option<(String, String)> {
     }
 }
 
-fn delegate(assistant: &Value, task: &str, timeout_secs: u64) -> Result<String, ToolError> {
+fn delegate(assistant: &Value, task: &str, timeout_secs: u64, meta: &Value) -> Result<String, ToolError> {
     let binary = codex_binary().ok_or_else(|| ToolError::failed("CLI do Codex não encontrado"))?;
     let name = assistant.get("name").and_then(|v| v.as_str()).unwrap_or("assistente");
     let role = assistant.get("role").and_then(|v| v.as_str()).unwrap_or("");
     let instructions = assistant.get("instructions").and_then(|v| v.as_str()).unwrap_or("");
-    let prompt = format!(
+    let mut prompt = format!(
         "Você é {name}, um assistente permanente criado pela Friday.\n\
          Papel: {role}\n\
          Instruções: {instructions}\n\n\
          Tarefa delegada pela Friday: {task}\n\n\
          Responda de forma objetiva e completa, em português."
     );
+    if let Some(budget) = meta.get("budget_chars").and_then(Value::as_u64) {
+        if budget > 0 {
+            prompt.push_str(&format!("\nResponda em no máximo {budget} caracteres."));
+        }
+    }
 
     if let Some(pid) = running_pid(name) {
         return Err(ToolError::failed(format!(
@@ -220,6 +338,9 @@ fn delegate(assistant: &Value, task: &str, timeout_secs: u64) -> Result<String, 
     let _ = std::fs::write(&live, "");
     live_append(&live, "task", task);
     live_append(&live, "status", "iniciando o Codex…");
+    if meta.as_object().is_some_and(|map| !map.is_empty()) {
+        live_append(&live, "meta", &serde_json::to_string(meta).unwrap_or_default());
+    }
 
     // One answer file per assistant: sharing a pid-only path made concurrent
     // delegations return each other's answers.
@@ -372,13 +493,45 @@ impl Tool for AssistantTool {
                 let mut list = Vec::new();
                 if let Ok(entries) = std::fs::read_dir(dir()) {
                     for entry in entries.filter_map(|entry| entry.ok()) {
-                        // Skip `.pid`, `.thread` and `.live.jsonl`: a bare pid
-                        // number parsed as JSON and became a phantom assistant.
+                        // Skip `.pid`, `.thread`, `.live.jsonl` and the hidden
+                        // `.active.json` records: a bare pid parsed as JSON
+                        // became a phantom assistant.
+                        if entry.file_name().to_string_lossy().starts_with('.') {
+                            continue;
+                        }
                         if entry.path().extension().and_then(|ext| ext.to_str()) != Some("json") {
                             continue;
                         }
                         if let Ok(raw) = std::fs::read_to_string(entry.path()) {
-                            if let Ok(value) = serde_json::from_str::<Value>(&raw) {
+                            if let Ok(mut value) = serde_json::from_str::<Value>(&raw) {
+                                let key = value.get("slug").and_then(Value::as_str).unwrap_or("");
+                                if !key.is_empty() {
+                                    if let Ok(active_raw) = std::fs::read_to_string(active_path(key)) {
+                                        if let Ok(active) = serde_json::from_str::<Value>(&active_raw) {
+                                            value["run_id"] =
+                                                active.get("run_id").cloned().unwrap_or(Value::Null);
+                                            value["depth"] =
+                                                active.get("depth").cloned().unwrap_or(json!(0));
+                                            value["status"] = active
+                                                .get("status")
+                                                .cloned()
+                                                .unwrap_or(json!("unknown"));
+                                            if let Some(verification) =
+                                                active.get("verification").and_then(Value::as_str)
+                                            {
+                                                value["verification"] = json!(verification);
+                                            } else if let Some(run_id) =
+                                                active.get("run_id").and_then(Value::as_str)
+                                            {
+                                                if let Some((status, _)) =
+                                                    artifact::verification_status(run_id)
+                                                {
+                                                    value["verification"] = json!(status);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                                 list.push(value);
                             }
                         }
@@ -398,12 +551,135 @@ impl Tool for AssistantTool {
                     .filter(|v| !v.is_empty())
                     .ok_or_else(|| ToolError::invalid("informe `task`"))?;
                 let timeout = args.get("timeout_secs").and_then(|v| v.as_u64()).unwrap_or(300);
-                if ctx.dry_run {
-                    return Ok(json!({ "dry_run": true, "would_delegate_to": slug(name), "task": task }));
+                let run_id = args
+                    .get("run_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+                let depth = args.get("depth").and_then(Value::as_i64).unwrap_or(0);
+                if depth < 0 {
+                    return Err(ToolError::invalid("`depth` não pode ser negativo"));
                 }
+                let max_depth = max_subagent_depth() as i64;
+                if depth > max_depth {
+                    return Err(ToolError::invalid(format!(
+                        "`depth` {depth} excede o limite de {max_depth} (harness.json → subagent_depth); delegação mais profunda não é permitida"
+                    )));
+                }
+                let goal = args
+                    .get("goal")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let condition = args
+                    .get("condition")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let budget_chars = args
+                    .get("budget_chars")
+                    .and_then(Value::as_u64)
+                    .filter(|&value| value > 0);
+
+                let meta = json!({
+                    "run_id": run_id,
+                    "depth": depth,
+                    "goal": goal,
+                    "condition": condition,
+                    "budget_chars": budget_chars,
+                });
+
+                if ctx.dry_run {
+                    return Ok(json!({
+                        "dry_run": true,
+                        "would_delegate_to": slug(name),
+                        "task": task,
+                        "run_id": run_id,
+                        "depth": depth,
+                        "goal": goal,
+                        "condition": condition,
+                        "budget_chars": budget_chars,
+                        "max_depth": max_depth,
+                    }));
+                }
+
                 let assistant = load(name)?;
-                let answer = delegate(&assistant, task, timeout)?;
-                Ok(json!({ "ok": true, "assistant": slug(name), "answer": answer }))
+                write_active(
+                    name,
+                    &json!({
+                        "run_id": run_id,
+                        "depth": depth,
+                        "goal": goal,
+                        "condition": condition,
+                        "status": "running",
+                        "started": now_secs(),
+                    }),
+                );
+
+                let raw = match delegate(&assistant, task, timeout, &meta) {
+                    Ok(raw) => raw,
+                    Err(error) => {
+                        write_active(
+                            name,
+                            &json!({
+                                "run_id": run_id,
+                                "depth": depth,
+                                "goal": goal,
+                                "condition": condition,
+                                "status": "error",
+                                "error": error.to_string(),
+                                "finished": now_secs(),
+                            }),
+                        );
+                        return Err(error);
+                    }
+                };
+                let mut result = structure_answer(&raw, budget_chars.map(|value| value as usize));
+                result["assistant"] = json!(slug(name));
+                result["run_id"] = json!(run_id);
+                result["depth"] = json!(depth);
+                result["goal"] = json!(goal);
+                result["condition"] = json!(condition);
+                result["budget_chars"] = json!(budget_chars);
+
+                let verification = result
+                    .get("verification")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string();
+                write_active(
+                    name,
+                    &json!({
+                        "run_id": run_id,
+                        "depth": depth,
+                        "goal": goal,
+                        "condition": condition,
+                        "status": "done",
+                        "verification": verification,
+                        "finished": now_secs(),
+                    }),
+                );
+
+                if let Some(run_id) = run_id.as_deref() {
+                    if let Some(run) = artifact::load_run(run_id) {
+                        let preview = result
+                            .get("answer")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let _ = run.append_finding(&format!(
+                            "worker `{assistant}` (depth {depth}) respondeu: {summary}",
+                            assistant = slug(name),
+                            summary = truncate_chars(preview, 400)
+                        ));
+                        let _ = run.record_tool("assistant_task", &meta);
+                        let _ = run.set_verification(&verification, "worker concluído");
+                    }
+                }
+
+                Ok(result)
             }
             "assistant_cancel" => {
                 let name = args
@@ -529,7 +805,12 @@ pub fn register(registry: &mut Registry) {
             "properties": {
                 "name": { "type": "string" },
                 "task": { "type": "string" },
-                "timeout_secs": { "type": "integer", "minimum": 30, "maximum": 600, "default": 300 }
+                "timeout_secs": { "type": "integer", "minimum": 30, "maximum": 600, "default": 300 },
+                "run_id": { "type": "string", "description": "Id de uma execução (run) para registrar achados e verificação." },
+                "depth": { "type": "integer", "minimum": 0, "default": 0, "description": "Profundidade de delegação; limitada por harness.json → subagent_depth (padrão 2)." },
+                "goal": { "type": "string", "description": "Objetivo deste worker dentro da run." },
+                "condition": { "type": "string", "description": "Critério pelo qual o worker é considerado concluído." },
+                "budget_chars": { "type": "integer", "minimum": 1, "description": "Limite de caracteres da resposta final." }
             }
         }),
     ));

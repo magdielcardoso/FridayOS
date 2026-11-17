@@ -17,6 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
+use crate::artifact;
 use crate::delivery::{self, PresenceContext};
 use crate::policy::Risk;
 use crate::registry::{Registry, Tool, ToolCtx, ToolError, ToolResult, ToolSpec};
@@ -25,6 +26,7 @@ const MAX_MISSIONS: usize = 256;
 const MAX_JOURNAL_LINES: usize = 1_000;
 const MAX_WATCHERS: usize = 128;
 const MAX_FINDINGS_SCAN: usize = 50;
+const MAX_RUNS_SCAN: usize = 64;
 const SWEEP_CHARS: usize = 600;
 const DEFAULT_SINCE_SECS: u64 = 3600;
 const DEFAULT_LIMIT: usize = 50;
@@ -234,6 +236,37 @@ fn read_watchers() -> Vec<Value> {
     list
 }
 
+/// Findings from the newest run artifacts, newest line first, bounded by both
+/// the number of runs and the per-run scan window.
+fn read_run_findings() -> Vec<(String, i64, String)> {
+    let root = artifact::runs_dir();
+    let mut dirs: Vec<PathBuf> = fs::read_dir(root)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.path())
+        .collect();
+    dirs.sort_by(|a, b| b.cmp(a));
+    let mut out = Vec::new();
+    for dir in dirs.into_iter().take(MAX_RUNS_SCAN) {
+        let run_id = dir.file_name().and_then(|name| name.to_str()).unwrap_or("").to_string();
+        let raw = match fs::read_to_string(dir.join("findings.jsonl")) {
+            Ok(raw) => raw,
+            Err(_) => continue,
+        };
+        for line in raw.lines().rev().take(MAX_FINDINGS_SCAN) {
+            if let Ok(finding) = serde_json::from_str::<Value>(line) {
+                let ts = field_i64(&finding, "ts").unwrap_or(0);
+                let text = truncate_chars(field_str(&finding, "text").unwrap_or(""), 200);
+                out.push((run_id.clone(), ts, text));
+            }
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Tool plumbing
 // ---------------------------------------------------------------------------
@@ -315,6 +348,7 @@ fn mission_sweep() -> ToolResult {
     let mut waiting = 0usize;
     let mut blocked = 0usize;
     let mut lines: Vec<String> = Vec::new();
+    let mut runs: Vec<Value> = Vec::new();
 
     for mission in &missions {
         let status = field_str(mission, "status").unwrap_or("active").to_lowercase();
@@ -353,12 +387,28 @@ fn mission_sweep() -> ToolResult {
         } else {
             "ativa"
         };
+        let mission_id = field_str(mission, "id")
+            .or_else(|| field_str(mission, "slug"))
+            .unwrap_or("?");
+        let mut run_note = String::new();
+        if let Some(run_id) = field_str(mission, "run_id") {
+            let (verification, note) = artifact::verification_status(run_id)
+                .unwrap_or_else(|| ("unknown".to_string(), String::new()));
+            run_note = format!(", run:{} ver:{}", truncate_chars(run_id, 18), verification);
+            runs.push(json!({
+                "mission": mission_id,
+                "run_id": run_id,
+                "verification": verification,
+                "note": note,
+            }));
+        }
         lines.push(format!(
-            "{}: {}, {}, último: '{}'",
+            "{}: {}, {}, último: '{}'{}",
             name,
             status_label,
             human_age(age),
-            last
+            last,
+            run_note
         ));
     }
 
@@ -391,6 +441,20 @@ fn mission_sweep() -> ToolResult {
     }
     let summary = truncate_chars(&summary, SWEEP_CHARS);
 
+    // Nudge the agent to act on what it just read: ask now when a decision is
+    // pending, otherwise offer a brief status while work is in flight.
+    let proactive_hint = if waiting > 0 {
+        "Pergunte ao usuário agora: há missões aguardando aprovação (sim/não).".to_string()
+    } else if active > 0 {
+        format!(
+            "Dê um status curto ao usuário: {} {} em andamento.",
+            active,
+            if active == 1 { "missão ativa" } else { "missões ativas" }
+        )
+    } else {
+        String::new()
+    };
+
     Ok(json!({
         "ok": true,
         "summary": summary,
@@ -398,6 +462,8 @@ fn mission_sweep() -> ToolResult {
         "waiting_approval": waiting,
         "blocked": blocked,
         "missions_loaded": missions.len(),
+        "proactive_hint": proactive_hint,
+        "runs": runs,
     }))
 }
 
@@ -482,6 +548,21 @@ fn timeline_query(args: &Value) -> ToolResult {
                     "mission": mission_id,
                 }));
             }
+        }
+    }
+
+    // Run-artifact findings (orchestrator/worker state store).
+    if tool_filter.is_none() {
+        for (run_id, ts, text) in read_run_findings() {
+            if ts < cutoff {
+                continue;
+            }
+            entries.push(json!({
+                "ts": ts,
+                "kind": "artifact",
+                "text": text,
+                "run": run_id,
+            }));
         }
     }
 
@@ -726,6 +807,39 @@ fn watcher_triage(args: &Value, ctx: &ToolCtx) -> ToolResult {
         found_mission,
     );
 
+    // Ask the real delivery policy (delivery.json) for its decision and add it
+    // alongside the local result. The local score/channel above are untouched and
+    // serve as the fallback if delivery is unavailable or fails.
+    let delivery_urgency = if critical {
+        delivery::Urgency::Critical
+    } else if urgency > 0.0 {
+        delivery::Urgency::ActionNeeded
+    } else if partial {
+        delivery::Urgency::Routine
+    } else {
+        delivery::Urgency::Background
+    };
+    let wants_decision = mission
+        .as_ref()
+        .and_then(|m| m.get("needs_approval").and_then(Value::as_bool))
+        .unwrap_or(false);
+    let (delivery_channel, delivery_reason) = (|| {
+        let event = delivery::DeliveryEvent {
+            source: source.clone(),
+            text: text.clone(),
+            urgency: delivery_urgency,
+            wants_decision,
+            timestamp: now_ms(),
+        };
+        // `policy` is the one loaded from delivery.json above (defaults when the
+        // file is missing or malformed), so no second read is needed.
+        Some((
+            policy.decide(&event).label().to_string(),
+            policy.explain(&event),
+        ))
+    })()
+    .unwrap_or_else(|| (channel.to_string(), reason.clone()));
+
     Ok(json!({
         "ok": true,
         "source": source,
@@ -733,6 +847,8 @@ fn watcher_triage(args: &Value, ctx: &ToolCtx) -> ToolResult {
         "should_notify": should_notify,
         "channel": channel,
         "reason": reason,
+        "delivery_channel": delivery_channel,
+        "delivery_reason": delivery_reason,
         "urgency": if critical { "critical" } else if urgency > 0.0 { "action_needed" } else { "none" },
         "repeated": repeated,
         "mission": found_mission.unwrap_or(""),

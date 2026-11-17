@@ -1,5 +1,6 @@
 //! Persistent memories: facts Friday chooses to remember across sessions.
 
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -56,6 +57,46 @@ fn load() -> Vec<Value> {
     text.lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .collect()
+}
+
+/// Leitura limitada usada pela busca relevante: no máximo `max_lines` linhas.
+fn load_limited(max_lines: usize) -> Vec<Value> {
+    let Ok(text) = std::fs::read_to_string(path()) else {
+        return Vec::new();
+    };
+    text.lines()
+        .take(max_lines)
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect()
+}
+
+/// Conjunto de palavras normalizado (minúsculas, sem acentos).
+fn word_set(text: &str) -> HashSet<String> {
+    normalize(text)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Fração das palavras da consulta presentes no conteúdo (0.0 .. 1.0).
+fn relevance_score(query_words: &HashSet<String>, content: &str) -> f64 {
+    if query_words.is_empty() {
+        return 0.0;
+    }
+    let content_words = word_set(content);
+    let hits = query_words
+        .iter()
+        .filter(|word| content_words.contains(*word))
+        .count();
+    hits as f64 / query_words.len() as f64
+}
+
+fn relevance_item(memory: &Value, score: f64) -> Value {
+    json!({
+        "id": memory.get("id").cloned().unwrap_or(Value::Null),
+        "content": memory.get("content").cloned().unwrap_or(Value::Null),
+        "score": score,
+    })
 }
 
 struct MemoryTool {
@@ -164,6 +205,64 @@ impl Tool for MemoryTool {
                     .take(limit)
                     .collect();
                 Ok(json!({ "ok": true, "count": filtered.len(), "memories": filtered }))
+            }
+            "memory_relevant" => {
+                const MAX_SCAN_LINES: usize = 500;
+                let limit = args
+                    .get("limit")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(6)
+                    .clamp(1, 200) as usize;
+                let query = args
+                    .get("query")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                    .trim();
+                let query_words = word_set(query);
+
+                // Sem consulta, devolve as mais recentes (o arquivo é append-only).
+                if query_words.is_empty() {
+                    let selected: Vec<Value> = load_limited(MAX_SCAN_LINES)
+                        .into_iter()
+                        .rev()
+                        .take(limit)
+                        .map(|memory| relevance_item(&memory, 0.0))
+                        .collect();
+                    return Ok(json!({
+                        "ok": true,
+                        "count": selected.len(),
+                        "memories": selected,
+                    }));
+                }
+
+                let mut scored: Vec<(f64, usize, Value)> = load_limited(MAX_SCAN_LINES)
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(index, memory)| {
+                        let content = memory
+                            .get("content")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("");
+                        let score = relevance_score(&query_words, content);
+                        (score > 0.0).then_some((score, index, memory))
+                    })
+                    .collect();
+                // Maior overlap primeiro; empate desempata pela mais recente.
+                scored.sort_by(|a, b| {
+                    b.0.partial_cmp(&a.0)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| b.1.cmp(&a.1))
+                });
+                let selected: Vec<Value> = scored
+                    .into_iter()
+                    .take(limit)
+                    .map(|(score, _, memory)| relevance_item(&memory, score))
+                    .collect();
+                Ok(json!({
+                    "ok": true,
+                    "count": selected.len(),
+                    "memories": selected,
+                }))
             }
             "memory_update" => {
                 let id = args
@@ -277,6 +376,19 @@ pub fn register(registry: &mut Registry) {
             "properties": {
                 "query": { "type": "string" },
                 "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 20 }
+            }
+        }),
+    ));
+    registry.add(tool(
+        "memory_relevant",
+        "Busca as memórias mais relevantes por sobreposição de palavras (ignora acentos). Sem `query`, devolve as mais recentes.",
+        crate::policy::Risk::ReadOnly,
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "query": { "type": "string" },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 6 }
             }
         }),
     ));

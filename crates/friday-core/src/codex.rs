@@ -27,6 +27,53 @@ const CODEX_BIN: &str = "codex";
 /// forgotten prompt cannot keep the Codex turn waiting forever.
 const APPROVAL_TIMEOUT_SECS: u64 = 120;
 
+/// `initialize` / `thread/resume` / `thread/start` are local to the CLI. They
+/// should finish in well under a second; 15 s is generous. Failing fast here
+/// lets `supervise` retry with backoff instead of hanging behind the 120 s
+/// deadline used for ordinary requests.
+const HANDSHAKE_TIMEOUT_SECS: u64 = 15;
+
+/// Compact automatically after this many completed turns without a compaction.
+const AUTO_COMPACT_TURNS: u32 = 12;
+/// ...or once the deltas streamed since the last compaction pass ~24k chars.
+const AUTO_COMPACT_CHARS: usize = 24_000;
+
+/// Builds the failure used when a handshake step stalls, so supervise can log a
+/// clear reason and apply its backoff instead of spinning forever.
+fn handshake_timeout_error(method: &str) -> String {
+    format!("tempo esgotado ({HANDSHAKE_TIMEOUT_SECS}s) no handshake do Codex: {method}")
+}
+
+/// True when the CLI says a persisted thread id is gone or unusable. Such an id
+/// must be forgotten, otherwise every reconnect retries the same dead thread.
+fn is_thread_not_found(error: &str) -> bool {
+    let lower = error.to_lowercase();
+    [
+        "not found",
+        "não encontrad",
+        "nao encontrad",
+        "invalid",
+        "inválid",
+        "unknown thread",
+        "does not exist",
+        "não existe",
+        "nao existe",
+        "404",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+/// Snapshot returned by `Codex::debug_state`. Shared by the idle and in-turn
+/// command handlers so both produce exactly the same shape for traces.
+fn debug_snapshot(thread_id: &str, resume: &Option<String>, turns_since_compact: u32) -> Value {
+    json!({
+        "thread_id": thread_id,
+        "resume": resume,
+        "turns_since_compact": turns_since_compact,
+    })
+}
+
 fn configured_reasoning_effort() -> Option<String> {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
     let path = home.join("Library/Application Support/FridayOS/reasoning.json");
@@ -203,6 +250,8 @@ enum Command {
     Deny { id: u64 },
     /// Internal: a pending approval outlived its deadline and must be declined.
     ApprovalTimeout { id: u64 },
+    /// Internal: reply with a snapshot of the live session state (for traces).
+    Debug { reply: oneshot::Sender<Value> },
     Shutdown,
 }
 
@@ -291,6 +340,40 @@ impl Codex {
         let _ = self.tx.send(Command::Reconnect);
     }
 
+    /// Trace-friendly snapshot of the live session state. The worker answers
+    /// this command inline in its select loop (also while a turn is running),
+    /// so it never waits for a turn to end. Bounded so a UI thread cannot wedge
+    /// if the worker is mid-handshake or already gone.
+    pub fn debug_state(&self) -> Value {
+        let unavailable = |reason: &str| {
+            json!({
+                "thread_id": Value::Null,
+                "resume": Value::Null,
+                "turns_since_compact": 0,
+                "error": reason,
+            })
+        };
+        let (reply, mut rx) = oneshot::channel();
+        if self.tx.send(Command::Debug { reply }).is_err() {
+            return unavailable("canal do Codex fechado");
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match rx.try_recv() {
+                Ok(value) => return value,
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    return unavailable("worker do Codex não respondeu");
+                }
+                Err(oneshot::error::TryRecvError::Empty) => {
+                    if std::time::Instant::now() >= deadline {
+                        return unavailable("worker do Codex ocupado");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+        }
+    }
+
     pub fn shutdown(&self) {
         let _ = self.tx.send(Command::Shutdown);
     }
@@ -335,6 +418,7 @@ async fn supervise(
             &config,
             &events,
             timeout_cmd_tx.clone(),
+            &mut resume,
         )
         .await
         {
@@ -350,6 +434,8 @@ async fn supervise(
             }
         };
         failures = 0;
+        // Safety net: connect already tracks the live thread, but keep this so
+        // `resume` can never drift from the thread the child actually created.
         resume = Some(session.thread_id.clone());
 
         let steer_tx = tx.clone();
@@ -375,14 +461,9 @@ async fn supervise(
                         continue;
                     }
                     Some(Command::Compact) => {
-                        let result = session
-                            .try_request(
-                                "thread/compact/start",
-                                json!({ "threadId": session.thread_id.clone() }),
-                            )
-                            .await;
-                        match result {
-                            Ok(_) => {
+                        match session.compact_now().await {
+                            Ok(()) => {
+                                session.reset_compaction_counters();
                                 let _ = events.send(CodexEvent::Compacted);
                             }
                             Err(error) => {
@@ -391,6 +472,14 @@ async fn supervise(
                                 )));
                             }
                         }
+                        continue;
+                    }
+                    Some(Command::Debug { reply }) => {
+                        let _ = reply.send(debug_snapshot(
+                            &session.thread_id,
+                            &resume,
+                            session.turns_since_compact,
+                        ));
                         continue;
                     }
                     Some(Command::Reconnect) => {
@@ -422,6 +511,11 @@ async fn supervise(
                 Cmd(Option<Command>),
             }
 
+            // Only a turn that actually reached its end (completed or failed
+            // notification) is counted for auto-compaction. A dead process, a
+            // reconnect or a cancel must never trigger a compact request.
+            let mut turn_completed = false;
+
             loop {
                 let event = {
                     let lines = &mut session.lines;
@@ -441,6 +535,7 @@ async fn supervise(
                         }
                         if session.turn_finished {
                             session.turn_finished = false;
+                            turn_completed = true;
                             break;
                         }
                     }
@@ -448,10 +543,16 @@ async fn supervise(
                         let _ = events.send(CodexEvent::Error(
                             "O processo do Codex foi encerrado durante o turno.".into(),
                         ));
+                        let _ = events.send(CodexEvent::Done {
+                            status: "failed".into(),
+                        });
                         break;
                     }
                     TurnEvent::Line(Err(error)) => {
                         let _ = events.send(CodexEvent::Error(error));
+                        let _ = events.send(CodexEvent::Done {
+                            status: "failed".into(),
+                        });
                         break;
                     }
                     TurnEvent::Cmd(Some(Command::Steer(text)))
@@ -488,6 +589,13 @@ async fn supervise(
                     TurnEvent::Cmd(Some(Command::ApprovalTimeout { id })) => {
                         session.expire_approval(id).await;
                     }
+                    TurnEvent::Cmd(Some(Command::Debug { reply })) => {
+                        let _ = reply.send(debug_snapshot(
+                            &session.thread_id,
+                            &resume,
+                            session.turns_since_compact,
+                        ));
+                    }
                     TurnEvent::Cmd(Some(Command::Compact)) => {}
                     TurnEvent::Cmd(Some(Command::Cancel)) => {
                         let turn_id = turn_slot
@@ -517,6 +625,30 @@ async fn supervise(
                     TurnEvent::Cmd(Some(Command::Shutdown)) | TurnEvent::Cmd(None) => {
                         session.kill().await;
                         return;
+                    }
+                }
+            }
+
+            // Auto-compaction happens only between turns, never mid-stream.
+            // Counters reset on success, so this cannot cascade or loop.
+            if turn_completed {
+                session.turns_since_compact = session.turns_since_compact.saturating_add(1);
+                if session.turns_since_compact >= AUTO_COMPACT_TURNS
+                    || session.prompt_chars_since_compact >= AUTO_COMPACT_CHARS
+                {
+                    match session.compact_now().await {
+                        Ok(()) => {
+                            session.reset_compaction_counters();
+                            let _ = events.send(CodexEvent::Compacted);
+                        }
+                        Err(error) => {
+                            // Cool down instead of erroring on every following
+                            // turn if the server keeps rejecting the compact.
+                            session.reset_compaction_counters();
+                            let _ = events.send(CodexEvent::Error(format!(
+                                "compactação automática falhou: {error}"
+                            )));
+                        }
                     }
                 }
             }
@@ -589,6 +721,10 @@ struct Session {
     turn_effort: Option<String>,
     turn_finished: bool,
     in_turn: bool,
+    /// Completed turns since the last (manual or automatic) compaction.
+    turns_since_compact: u32,
+    /// Rough size of streamed deltas since the last compaction, in chars.
+    prompt_chars_since_compact: usize,
     seen_deltas: std::collections::HashSet<String>,
     commentary_items: std::collections::HashSet<String>,
     events: mpsc::UnboundedSender<CodexEvent>,
@@ -606,6 +742,8 @@ impl Session {
         config: &CodexConfig,
         events: &mpsc::UnboundedSender<CodexEvent>,
         command_tx: mpsc::UnboundedSender<Command>,
+        // Updated in place so `supervise` always resumes the live thread id.
+        resume: &mut Option<String>,
     ) -> Result<Self, String> {
         let mut session = Self {
             child,
@@ -619,6 +757,8 @@ impl Session {
             turn_effort: config.effort.clone(),
             turn_finished: false,
             in_turn: false,
+            turns_since_compact: 0,
+            prompt_chars_since_compact: 0,
             seen_deltas: std::collections::HashSet::new(),
             commentary_items: std::collections::HashSet::new(),
             events: events.clone(),
@@ -626,15 +766,20 @@ impl Session {
             command_tx,
         };
 
-        session
-            .request(
+        // Handshake steps get their own short deadline: a wedged CLI must not
+        // hold `supervise` hostage for the full 120 s request timeout.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
+            session.request(
                 "initialize",
                 json!({
                     "clientInfo": { "name": "friday", "title": "FridayOS", "version": env!("CARGO_PKG_VERSION") },
                     "capabilities": { "experimentalApi": false, "requestAttestation": false }
                 }),
-            )
-            .await?;
+            ),
+        )
+        .await
+        .map_err(|_| handshake_timeout_error("initialize"))??;
         session.notify("initialized", json!({})).await?;
 
         let mut params = json!({
@@ -656,18 +801,40 @@ impl Session {
 
         let mut resumed = None;
         if let Some(previous) = config.resume_thread.as_deref() {
-            let mut resume = json!({
+            let mut resume_params = json!({
                 "threadId": previous,
                 "cwd": config.cwd,
                 "approvalPolicy": "on-request",
                 "sandbox": "workspace-write"
             });
             if let Some(model) = config.model.as_deref().filter(|m| *m != "default") {
-                resume["model"] = json!(model);
+                resume_params["model"] = json!(model);
             }
-            if let Ok(value) = session.try_request("thread/resume", resume).await {
-                if let Some(id) = value.pointer("/thread/id").and_then(Value::as_str) {
-                    resumed = Some(id.to_string());
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
+                session.try_request("thread/resume", resume_params),
+            )
+            .await
+            {
+                // A timeout is a stall, not a dead thread: fail the handshake so
+                // supervise retries the same id with backoff.
+                Err(_) => return Err(handshake_timeout_error("thread/resume")),
+                Ok(Ok(value)) => {
+                    if let Some(id) = value.pointer("/thread/id").and_then(Value::as_str) {
+                        resumed = Some(id.to_string());
+                        *resume = resumed.clone();
+                    } else {
+                        // Accepted but no usable id: forget it, start fresh.
+                        *resume = None;
+                    }
+                }
+                Ok(Err(error)) => {
+                    if is_thread_not_found(&error) {
+                        // Persisted id points at a thread that no longer exists.
+                        *resume = None;
+                    }
+                    // Other errors keep `resume` so a later reconnect retries
+                    // the same thread. Either way a new thread is made below.
                 }
             }
         }
@@ -675,13 +842,21 @@ impl Session {
         let thread_id = if let Some(id) = resumed {
             id
         } else {
-            let result = session.request("thread/start", params).await?;
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
+                session.request("thread/start", params),
+            )
+            .await
+            .map_err(|_| handshake_timeout_error("thread/start"))??;
             result
                 .pointer("/thread/id")
                 .and_then(Value::as_str)
                 .ok_or("Codex não devolveu o id da thread")?
                 .to_string()
         };
+        // Single source of truth: whatever the CLI just resumed or created is
+        // the live thread every later reconnect must resume.
+        *resume = Some(thread_id.clone());
         session.thread_id = thread_id.clone();
         let _ = session.events.send(CodexEvent::Online { thread_id });
         Ok(session)
@@ -814,6 +989,7 @@ impl Session {
                             == Some("commentary")
                             || self.commentary_items.contains(&item);
                         self.seen_deltas.insert(item);
+                        self.note_delta_chars(delta.len());
                         let event = if commentary {
                             CodexEvent::Reasoning(delta.to_string())
                         } else {
@@ -824,6 +1000,7 @@ impl Session {
                 }
                 "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => {
                     if let Some(delta) = params.get("delta").and_then(Value::as_str) {
+                        self.note_delta_chars(delta.len());
                         let _ = self.events.send(CodexEvent::Reasoning(delta.to_string()));
                     }
                 }
@@ -857,6 +1034,7 @@ impl Session {
                         if !self.seen_deltas.contains(&item_id) {
                             if let Some(text) = item.get("text").and_then(Value::as_str) {
                                 if !text.is_empty() {
+                                    self.note_delta_chars(text.len());
                                     let _ = self.events.send(CodexEvent::Delta(text.to_string()));
                                 }
                             }
@@ -874,6 +1052,7 @@ impl Session {
                     if let Ok(mut slot) = self.turn_id.lock() {
                         *slot = None;
                     }
+                    self.in_turn = false;
                     let status = params
                         .pointer("/turn/status")
                         .and_then(Value::as_str)
@@ -888,6 +1067,13 @@ impl Session {
                         .and_then(Value::as_str)
                         .unwrap_or("Erro no servidor Codex.");
                     let _ = self.events.send(CodexEvent::Error(message.to_string()));
+                    // Without a Done the UI stays stuck in PENSANDO forever.
+                    if self.in_turn {
+                        self.in_turn = false;
+                        let _ = self.events.send(CodexEvent::Done {
+                            status: "failed".into(),
+                        });
+                    }
                     self.turn_finished = true;
                 }
                 _ => {}
@@ -910,11 +1096,49 @@ impl Session {
                     if self.in_turn {
                         self.in_turn = false;
                         self.turn_finished = true;
+                        // This is the `turn/start` (or another in-turn request)
+                        // error path: always close the turn for the UI.
+                        let _ = self.events.send(CodexEvent::Done {
+                            status: "failed".into(),
+                        });
                     }
                 }
                 let _ = sender.send(message.get("result").cloned().unwrap_or(Value::Null));
             }
         }
+    }
+
+    /// Both manual and automatic compaction funnel through here, so the
+    /// counters are always reset at the same point `CodexEvent::Compacted`
+    /// leaves the session.
+    fn reset_compaction_counters(&mut self) {
+        self.turns_since_compact = 0;
+        self.prompt_chars_since_compact = 0;
+    }
+
+    /// Cheap heuristic for "the prompt is getting big": sum every streamed
+    /// delta (answer and reasoning) since the last compaction. Capped so a
+    /// single huge answer cannot overflow the counter.
+    fn note_delta_chars(&mut self, chars: usize) {
+        self.prompt_chars_since_compact = self
+            .prompt_chars_since_compact
+            .saturating_add(chars)
+            .min(AUTO_COMPACT_CHARS.saturating_mul(4));
+    }
+
+    /// Bounded compact request; used by both the manual and automatic paths so
+    /// a wedged server cannot stall the command loop for 120 s.
+    async fn compact_now(&mut self) -> Result<(), String> {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
+            self.try_request(
+                "thread/compact/start",
+                json!({ "threadId": self.thread_id.clone() }),
+            ),
+        )
+        .await
+        .map_err(|_| "tempo esgotado ao compactar o contexto".to_string())??;
+        Ok(())
     }
 
     /// Discards lines already sitting in the pipe (late notifications from a

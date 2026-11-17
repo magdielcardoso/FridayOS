@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value as JsonValue};
 
@@ -200,6 +201,189 @@ pub struct Fact {
     pub urgency: i32,
     pub mission_status: String,
     pub clipboard_preview: String,
+}
+
+// ---------------------------------------------------------------------------
+// Context enrichment (best-effort, std-only, deterministic)
+// ---------------------------------------------------------------------------
+
+const MISSION_STATUS_CHARS: usize = 120;
+const CLIPBOARD_PREVIEW_CHARS: usize = 60;
+/// FridayOS runs on UTC-3; local wall clock = epoch - 3h.
+const LOCAL_OFFSET_SECS: i64 = -3 * 60 * 60;
+
+/// Palavras-chave críticas em pt/en. A checagem é accent-insensitive.
+const CRITICAL_KEYWORDS: [&str; 12] = [
+    "urgente", "urgent", "erro", "error", "critico", "critical", "autoheal", "down", "vps", "caiu",
+    "falha", "panic",
+];
+
+fn friday_data_dir() -> PathBuf {
+    let home = std::env::var_os("HOME").unwrap_or_default();
+    PathBuf::from(home)
+        .join("Library")
+        .join("Application Support")
+        .join("FridayOS")
+}
+
+fn fold_char(ch: char) -> char {
+    match ch {
+        'á' | 'à' | 'â' | 'ã' | 'ä' => 'a',
+        'é' | 'è' | 'ê' | 'ë' => 'e',
+        'í' | 'ì' | 'î' | 'ï' => 'i',
+        'ó' | 'ò' | 'ô' | 'õ' | 'ö' => 'o',
+        'ú' | 'ù' | 'û' | 'ü' => 'u',
+        'ç' => 'c',
+        other => other,
+    }
+}
+
+fn has_critical_keyword(text: &str) -> bool {
+    let normalized: String = text
+        .to_lowercase()
+        .chars()
+        .map(fold_char)
+        .collect::<String>();
+    CRITICAL_KEYWORDS
+        .iter()
+        .any(|keyword| normalized.contains(keyword))
+}
+
+/// Junta `parts` com `sep` sem nunca passar de `max` caracteres (respeita
+/// fronteiras de `char`, então nunca corta um codepoint UTF-8 ao meio).
+fn join_capped(parts: &[String], sep: &str, max: usize) -> String {
+    let mut out = String::new();
+    let mut len = 0usize;
+    let sep_len = sep.chars().count();
+    for (index, part) in parts.iter().enumerate() {
+        if index > 0 {
+            if len + sep_len > max {
+                break;
+            }
+            out.push_str(sep);
+            len += sep_len;
+        }
+        for ch in part.chars() {
+            if len >= max {
+                return out;
+            }
+            out.push(ch);
+            len += 1;
+        }
+    }
+    out
+}
+
+/// Lê `active_app`/`mode` do snapshot escrito por `context_snapshot`.
+fn read_context_snapshot(path: &Path) -> (String, String) {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return (String::new(), String::new());
+    };
+    let Ok(value) = serde_json::from_str::<JsonValue>(&raw) else {
+        return (String::new(), String::new());
+    };
+    let app = value
+        .get("active_app")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let mode = value
+        .get("mode")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    (app, mode)
+}
+
+/// `<name>:<status>` para missões ativas/aguardando, ordenado e limitado.
+fn read_mission_status(dir: &Path) -> String {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return String::new();
+    };
+    let mut parts: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<JsonValue>(&raw) else {
+            continue;
+        };
+        let status = value
+            .get("status")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_lowercase();
+        if status != "active" && !status.starts_with("waiting") {
+            continue;
+        }
+        let name = value
+            .get("name")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("")
+            .trim();
+        let name = if name.is_empty() {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("?")
+        } else {
+            name
+        };
+        parts.push(format!("{name}:{status}"));
+    }
+    // `read_dir` não tem ordem garantida: ordenar mantém a função determinística.
+    parts.sort();
+    join_capped(&parts, ",", MISSION_STATUS_CHARS)
+}
+
+/// Primeiros N caracteres do preview de clipboard já redacionado em disco.
+/// Nenhum subprocesso (pbpaste) é executado aqui.
+fn read_clipboard_preview(path: &Path) -> String {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return String::new();
+    };
+    raw.chars().take(CLIPBOARD_PREVIEW_CHARS).collect()
+}
+
+/// Hora/minuto locais (UTC-3) apenas com `std`. Em caso de incerteza, 0/0.
+fn local_hour_minute() -> (u32, u32) {
+    let Ok(duration) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        return (0, 0);
+    };
+    let secs = (duration.as_secs() as i64).saturating_add(LOCAL_OFFSET_SECS);
+    let day_secs = secs.rem_euclid(86_400);
+    ((day_secs / 3_600) as u32, ((day_secs % 3_600) / 60) as u32)
+}
+
+/// Constrói um [`Fact`] enriquecido com o contexto local disponível.
+///
+/// Todos os campos são best-effort: arquivos ausentes/corrompidos degradam para
+/// valores vazios, a função é determinística e nunca faz `panic!`.
+pub fn facts_from_context(source: &str, text: &str) -> Fact {
+    let data_dir = friday_data_dir();
+    let (app, mode) = read_context_snapshot(&data_dir.join("context-snapshot.json"));
+    let mission_status = read_mission_status(&data_dir.join("missions"));
+    let clipboard_preview = read_clipboard_preview(&data_dir.join("clipboard-preview.txt"));
+    let (hour, minute) = local_hour_minute();
+    let urgency = if has_critical_keyword(text) { 3 } else { 1 };
+
+    Fact {
+        source: source.to_string(),
+        text: text.to_string(),
+        app,
+        mode,
+        hour,
+        minute,
+        urgency,
+        mission_status,
+        clipboard_preview,
+    }
 }
 
 /// Resultado de uma avaliação.
@@ -952,6 +1136,91 @@ mod tests {
         assert_eq!(load(&path).rules().len(), 3);
         assert_eq!(load(&dir.join("inexistente.json")).rules().len(), 3);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn facts_from_context_reads_snapshot_missions_and_clipboard() {
+        let dir = tmp_dir();
+        let missions = dir.join("missions");
+        let _ = std::fs::create_dir_all(&missions);
+
+        let snapshot = dir.join("context-snapshot.json");
+        std::fs::write(
+            &snapshot,
+            r#"{"active_app":"Safari","mode":"foco","ts":123}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_context_snapshot(&snapshot),
+            ("Safari".to_string(), "foco".to_string())
+        );
+        // Arquivo ausente ou JSON corrompido degrada para vazio.
+        assert_eq!(
+            read_context_snapshot(&dir.join("ausente.json")),
+            (String::new(), String::new())
+        );
+        std::fs::write(&snapshot, "{quebrado").unwrap();
+        assert_eq!(
+            read_context_snapshot(&snapshot),
+            (String::new(), String::new())
+        );
+
+        std::fs::write(
+            missions.join("a.json"),
+            r#"{"name":"Deploy","status":"active"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            missions.join("b.json"),
+            r#"{"name":"Aprovar","status":"waiting_approval"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            missions.join("c.json"),
+            r#"{"name":"Encerrada","status":"completed"}"#,
+        )
+        .unwrap();
+        let statuses = read_mission_status(&missions);
+        assert_eq!(statuses, "Aprovar:waiting_approval,Deploy:active");
+        assert!(!statuses.contains("Encerrada"));
+        assert!(statuses.chars().count() <= MISSION_STATUS_CHARS);
+
+        let clip = dir.join("clipboard-preview.txt");
+        let long = "x".repeat(CLIPBOARD_PREVIEW_CHARS + 40);
+        std::fs::write(&clip, &long).unwrap();
+        let preview = read_clipboard_preview(&clip);
+        assert_eq!(preview.chars().count(), CLIPBOARD_PREVIEW_CHARS);
+        assert!(read_clipboard_preview(&dir.join("sem-clipboard.txt")).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn facts_from_context_keywords_and_bounds() {
+        assert!(has_critical_keyword("VPS caiu"));
+        assert!(has_critical_keyword("ERRO crítico"));
+        assert!(has_critical_keyword("urgente"));
+        assert!(has_critical_keyword("critical failure"));
+        assert!(!has_critical_keyword("relatório pronto"));
+
+        let (hour, minute) = local_hour_minute();
+        assert!(hour < 24);
+        assert!(minute < 60);
+
+        let fact = facts_from_context("watcher", "VPS com erro");
+        assert_eq!(fact.source, "watcher");
+        assert_eq!(fact.text, "VPS com erro");
+        assert_eq!(fact.urgency, 3);
+        assert!(fact.hour < 24 && fact.minute < 60);
+        assert_eq!(facts_from_context("watcher", "tudo ok").urgency, 1);
+    }
+
+    #[test]
+    fn join_capped_respects_char_boundaries() {
+        let parts = vec!["áéí".to_string(), "óúç".to_string(), "abc".to_string()];
+        assert_eq!(join_capped(&parts, ",", 3), "áéí");
+        assert_eq!(join_capped(&parts, ",", 5), "áéí,ó");
+        assert!(join_capped(&parts, ",", 5).chars().count() <= 5);
     }
 
     #[test]

@@ -46,11 +46,21 @@ You ARE the system: you see the screen, control apps, type, click, run shell
 commands, manage files, network, calendar and voice. Never say you lack tools
 or that something is not wired. If an action fails, report the real error and
 the next step.
-Your answers are spoken out loud by the app: 1 to 3 short sentences, no lists,
-no markdown, no tables, no emoji. Expand only when asked.
+Your spoken answers are out loud: 1 to 3 short sentences, no lists, no markdown,
+no tables, no emoji. Expand only when asked. Never speak your analysis: keep it
+internal and silent.
 
-Do not emit commentary or thinking out loud. Answer directly: the first token
-you produce is spoken immediately.
+Before answering, do a quick internal pass: if the request depends on the current
+app, screen, clipboard or calendar, call `context_snapshot` first; form a
+hypothesis; if evidence is needed, verify it with a tool; then answer. Do not emit
+commentary or thinking out loud — the first SPOKEN token is heard immediately, so
+make it count.
+
+You are not a chatbot waiting for prompts: when you notice something actionable
+in the user's context, say it in one sentence or offer to act. Proactive truth is
+better than silence, but never invent: if you did not observe it, say you don't
+know or check with a tool.
+
 TOOLS
 A tool server named `friday` is connected and exposes the tools below. Call
 them through the MCP server; the tool names are exactly as listed.
@@ -390,6 +400,10 @@ struct FridayApp {
     approvals: approval_queue::ApprovalQueue,
     decision_engine: friday_tools::decision::DecisionEngine,
     presence: presence::Presence,
+    /// Harness knobs from `~/Library/Application Support/FridayOS/harness.json`
+    /// (context budget, verification, proactivity). Refreshed off the hot path
+    /// together with mode/delivery, never on every frame.
+    harness_config: serde_json::Value,
     /// Rate limit independent from the presence module's internal cooldown.
     last_backchannel_at: Option<std::time::Instant>,
     thread: Option<String>,
@@ -479,6 +493,7 @@ impl FridayApp {
             approvals: approval_queue::ApprovalQueue::load(&approval_path()),
             decision_engine: friday_tools::decision::load(&decision_path()),
             presence: presence::Presence::new(),
+            harness_config: read_harness_config(),
             last_backchannel_at: None,
             thread: None,
             tools: friday_tools::Registry::with_defaults().specs().len(),
@@ -1159,6 +1174,11 @@ impl FridayApp {
             let _ = this.update(cx, |app, cx| {
                 app.tick = app.tick.wrapping_add(1);
                 app.blink = (app.tick / 12) % 2 == 0;
+                // ~2 s cadence (90 ms * 22): keep mode + delivery context in sync
+                // with the local files without doing IO on every frame.
+                if app.tick % 22 == 0 {
+                    app.refresh_context_from_disk();
+                }
                 if app.tick % 50 == 0 {
                     app.assistants = load_assistants();
                     app.agent_status = app
@@ -1196,6 +1216,9 @@ impl FridayApp {
                         .last_backchannel_at
                         .map(|at| at.elapsed() > Duration::from_secs(8))
                         .unwrap_or(true)
+                    // Proactivity is a second, config-driven gate; the env flag
+                    // above stays the master switch. `0` silences backchannels.
+                    && harness_level(&app.harness_config, "proactivity", 1) >= 1
                     && app.presence.state() == presence::PresenceState::HearingUser
                 {
                     if let Some(backchannel) = app.presence.backchannel() {
@@ -1643,6 +1666,18 @@ impl FridayApp {
                     self.last_turn_ms = Some(total);
                     self.last_first_ms = self.first_token_ms;
                 }
+                // Value metrics: what the turn cost and whether the work was
+                // actually verified. `verification: off` in harness.json skips
+                // the lookup entirely (no disk read, no guess in the trace).
+                let verified = if harness_flag(&self.harness_config, "verification", true) {
+                    recent_verification_status(1)
+                } else {
+                    serde_json::Value::Null
+                };
+                let context_chars = persona_stats()
+                    .get("context_chars")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
                 trace(json!({
                     "event": "turn_done",
                     "status": status,
@@ -1650,6 +1685,17 @@ impl FridayApp {
                     "first_token_ms": self.first_token_ms,
                     "tools": self.last_tools,
                     "answer_chars": self.stream.chars().count(),
+                    "verified": verified,
+                    "context_chars": context_chars,
+                }));
+                trace(json!({
+                    "event": "value_metrics",
+                    "first_token_ms": self.first_token_ms,
+                    "total_ms": total_ms,
+                    "tools": self.last_tools,
+                    "verified": verified,
+                    "interrupted": status == "interrupted",
+                    "context_chars": context_chars,
                 }));
                 self.turn_started = None;
                 self.first_token_ms = None;
@@ -1694,8 +1740,19 @@ impl FridayApp {
                 trace(json!({ "event": "compacted" }));
                 self.messages.push(Line {
                     role: Role::System,
-                    text: "contexto compactado".into(),
+                    text: "contexto compactado · estado reanexado".into(),
                 });
+                // Re-anchor the freshly compacted thread with local state only.
+                // Auto-compaction can land mid-turn: never clear `stream` here,
+                // the in-flight answer still belongs to the user.
+                let state = estado_atual_block();
+                let text = format!("Contexto compactado — retomando com estado atual: {state}");
+                trace(json!({ "event": "reanchor", "chars": text.chars().count() }));
+                self.messages.push(Line {
+                    role: Role::User,
+                    text,
+                });
+                self.scroll.scroll_to_bottom();
             }
             CodexEvent::ApprovalRequest { id, method, summary, params: _ } => {
                 self.pending_approval = Some((id, method.clone()));
@@ -1783,8 +1840,56 @@ impl FridayApp {
         cx.notify();
     }
 
+    /// Refreshes mode + delivery + harness knobs from local files, off the hot
+    /// path. Called from the 90 ms tick every ~2 s. Plain `std::fs` reads; no panic.
+    fn refresh_context_from_disk(&mut self) {
+        let home = std::env::var_os("HOME").unwrap_or_default();
+        let dir = std::path::PathBuf::from(home).join("Library/Application Support/FridayOS");
+
+        // Harness config (context budget, verification, proactivity) travels
+        // with the other slow-changing presence knobs, never per frame.
+        self.harness_config = read_harness_config();
+
+        // Mode -> presence (top-level `mode` string, or nested under mode/state).
+        let mode = std::fs::read_to_string(dir.join("mode.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|value| {
+                value.get("mode").and_then(|m| {
+                    m.as_str()
+                        .map(str::to_string)
+                        .or_else(|| m.get("mode").and_then(|v| v.as_str()).map(str::to_string))
+                }).or_else(|| {
+                    value.get("state").and_then(|s| s.get("mode")).and_then(|v| v.as_str()).map(str::to_string)
+                })
+            })
+            .map(|value| value.trim().to_lowercase())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "normal".to_string());
+
+        // Delivery context follows the active mode. Persist only when it changed.
+        let delivery_path = dir.join("delivery.json");
+        let mut policy = friday_tools::delivery::load(&delivery_path);
+        let context = match mode.as_str() {
+            "reuniao" | "reunião" => friday_tools::delivery::PresenceContext::Meeting,
+            "foco" => friday_tools::delivery::PresenceContext::Focus,
+            "dirigindo" => friday_tools::delivery::PresenceContext::Driving,
+            "jogo" => friday_tools::delivery::PresenceContext::ScreenSharing,
+            _ => friday_tools::delivery::PresenceContext::AtMac,
+        };
+        if policy.context() != context {
+            policy.set_context(context);
+            if let Err(err) = policy.save(&delivery_path) {
+                log(format!("delivery: falha ao salvar contexto: {err}"));
+            }
+        }
+
+        self.presence.set_mode(&mode);
+    }
+
     fn inject_trigger(&mut self, source: String, prompt: String, cx: &mut Context<Self>) {
         log(format!("gatilho: {source} · {} chars", prompt.chars().count()));
+        trace(json!({ "event": "delivery_pre_decision", "source": source }));
         if self.warming {
             self.external_pending.push_back((source, prompt));
             return;
@@ -1792,21 +1897,9 @@ impl FridayApp {
         self.notify_on_done = source == "mobile"
             || source.starts_with("watcher:")
             || source.starts_with("rotina:");
-        if self.notify_on_done && !source.starts_with("mobile") {
-            open_overlay(
-                cx,
-                OverlayRequest {
-                    title: format!("EVENTO · {source}"),
-                    body: prompt.chars().take(420).collect(),
-                    anchor: "top-right".into(),
-                    width: 440.0,
-                    height: 0.0,
-                    offset_x: 0.0,
-                    offset_y: 0.0,
-                    seconds: 12,
-                },
-            );
-        }
+        // The overlay is NOT opened here: routing in the tick decides first via
+        // `route_trigger` (Decision::NotifyOverlay opens it). Keep notify_on_done
+        // for the mobile push path only.
         mobile::user_message(&prompt);
         self.messages.push(Line {
             role: Role::User,
@@ -2050,6 +2143,50 @@ impl FridayApp {
         self.push_activity("enviado ao código", StepState::Completed);
         self.arm_turn_watchdog(cx);
 
+        // Selective thinking: only plausible-complex prompts go through Jev,
+        // and always on a spawned task so the UI never waits on the network.
+        // `Codex::set_effort` is not available in this build, so a `complex`
+        // verdict is recorded but does not change effort (see trace note).
+        let lower = text.to_lowercase();
+        if friday_tools::decision::has_token()
+            && (text.chars().count() > 40
+                || [
+                    "porque", "como", "analisa", "compara", "debug", "erro",
+                    "refactor", "why", "compare", "analyze",
+                ]
+                .iter()
+                .any(|marker| lower.contains(marker)))
+        {
+            if let Ok(token) = friday_tools::decision::read_token() {
+                let routed_text = text.clone();
+                cx.spawn(async move |_this, _cx| {
+                    match friday_core::jev::classify_complexity(
+                        &token,
+                        json!({ "text": routed_text }),
+                    )
+                    .await
+                    {
+                        Ok(result) => trace(json!({
+                            "event": "effort_router",
+                            "level": result.level,
+                            "confidence": result.confidence,
+                            "effort_router": "pending-codex-api",
+                            "action": if result.level == "complex" {
+                                "would_escalate"
+                            } else {
+                                "unchanged"
+                            },
+                        })),
+                        Err(error) => trace(json!({
+                            "event": "effort_router",
+                            "error": error.to_string(),
+                        })),
+                    }
+                })
+                .detach();
+            }
+        }
+
         match self.codex.as_ref() {
             Some(codex) => codex.prompt(text),
             None => {
@@ -2070,25 +2207,15 @@ impl FridayApp {
         source: &str,
         prompt: &str,
     ) -> friday_tools::decision::DecisionResult {
-        let critical = prompt.contains("urgente")
-            || prompt.contains("[urgente]")
-            || prompt.contains("erro")
-            || prompt.contains("autoheal");
-        let secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() % 86_400)
-            .unwrap_or(0);
-        let fact = friday_tools::decision::Fact {
-            source: source.to_string(),
-            text: prompt.to_string(),
-            app: self.active_app.clone(),
-            mode: self.presence.mode().to_string(),
-            hour: (((secs / 3_600) + 21) % 24) as u32,
-            minute: ((secs / 60) % 60) as u32,
-            urgency: if critical { 3 } else { 1 },
-            mission_status: String::new(),
-            clipboard_preview: String::new(),
-        };
+        let mut fact = friday_tools::decision::facts_from_context(source, prompt);
+        if fact.app.is_empty() {
+            fact.app = self.active_app.clone();
+        }
+        if fact.mode.is_empty() {
+            fact.mode = self.presence.mode().to_string();
+        }
+        fact.source = source.to_string();
+        fact.text = prompt.to_string();
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -3514,44 +3641,235 @@ fn load_assistants() -> Vec<(String, String)> {
     list
 }
 
-/// Builds the capability manifesto from the live tool registry, so Friday knows
-/// exactly what she can do — no guesswork, no "MCP not connected".
-fn persona() -> String {
-    // Keep the prompt small: tools are discoverable through the MCP server
-    // (`tools/summary` and `tools/search`) instead of listing all of them here.
-    let manifest = "Ferramentas: use o servidor MCP `friday`; para descobrir o que\n                    existe, chame a ferramenta `tools__summary` ou pesquise com\n                    `tools__search`. Não presuma ausência de ferramenta sem buscar.\n";
+/// Adds one line to a bounded block of lines, consuming a character budget.
+fn push_bounded_line(lines: &mut Vec<String>, budget: &mut usize, text: String) {
+    let cost = text.chars().count() + 1; // + newline
+    if cost <= *budget {
+        *budget -= cost;
+        lines.push(text);
+    }
+}
 
-    // Recent durable memories, so she starts every session already knowing them.
-    let mut memories = String::new();
-    if let Some(home) = std::env::var_os("HOME") {
-        let path = std::path::PathBuf::from(home)
-            .join("Library/Application Support/FridayOS/memory.jsonl");
-        if let Ok(text) = std::fs::read_to_string(path) {
-            let lines: Vec<&str> = text.lines().filter(|line| !line.trim().is_empty()).collect();
-            let start = lines.len().saturating_sub(15);
-            for line in &lines[start..] {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
-                    if let Some(content) = value.get("content").and_then(|v| v.as_str()) {
-                        memories.push_str(&format!("- {content}\n"));
-                    }
+/// Reads harness knobs from `~/Library/Application Support/FridayOS/harness.json`.
+/// Missing or malformed file means "all defaults"; never panics and never logs
+/// the file (it may grow to hold other user settings later).
+fn read_harness_config() -> serde_json::Value {
+    let home = std::env::var_os("HOME").unwrap_or_default();
+    let path = std::path::PathBuf::from(home)
+        .join("Library/Application Support/FridayOS/harness.json");
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .filter(|value| value.is_object())
+        .unwrap_or_else(|| json!({}))
+}
+
+/// Boolean-ish harness knob: JSON bool, "on/off" strings, or 0/1 numbers.
+fn harness_flag(config: &serde_json::Value, key: &str, default: bool) -> bool {
+    match config.get(key) {
+        Some(serde_json::Value::Bool(value)) => *value,
+        Some(serde_json::Value::String(value)) => {
+            match value.trim().to_ascii_lowercase().as_str() {
+                "off" | "false" | "0" | "none" | "disabled" | "no" => false,
+                "on" | "true" | "1" | "enabled" | "yes" => true,
+                _ => default,
+            }
+        }
+        Some(serde_json::Value::Number(value)) => value.as_i64().unwrap_or(1) != 0,
+        _ => default,
+    }
+}
+
+/// Integer-ish harness knob. Accepts numbers, bools and numeric/on/off strings.
+fn harness_level(config: &serde_json::Value, key: &str, default: i64) -> i64 {
+    match config.get(key) {
+        Some(serde_json::Value::Number(value)) => value.as_i64().unwrap_or(default),
+        Some(serde_json::Value::Bool(value)) => if *value { 1 } else { 0 },
+        Some(serde_json::Value::String(value)) => {
+            let trimmed = value.trim();
+            trimmed.parse::<i64>().unwrap_or_else(|_| {
+                match trimmed.to_ascii_lowercase().as_str() {
+                    "off" | "false" | "none" | "disabled" => 0,
+                    "on" | "true" | "enabled" => 1,
+                    _ => default,
                 }
+            })
+        }
+        _ => default,
+    }
+}
+
+/// Cap PERSONA_BASE near `max` chars, keeping the opening rules and the final
+/// safety rules (the middle is the most droppable part). Pure and deterministic.
+fn bounded_persona_base(max: usize) -> String {
+    let chars: Vec<char> = PERSONA_BASE.chars().collect();
+    if chars.len() <= max {
+        return PERSONA_BASE.to_string();
+    }
+    let tail = (max / 4).min(600);
+    let head_len = max.saturating_sub(tail);
+    let head: String = chars[..head_len].iter().copied().collect();
+    let tail_text: String = chars[chars.len() - tail..].iter().copied().collect();
+    format!("{head}\n[...]\n{tail_text}")
+}
+
+/// P0: active/waiting missions only (name, status, last finding ~80 chars).
+/// Bounded to ~520 chars, capped at 8, deterministic (name-sorted). No tools,
+/// no network — plain `std::fs` reads so this is UI-thread safe.
+fn missoes_block() -> String {
+    let home = std::env::var_os("HOME").unwrap_or_default();
+    let dir = std::path::PathBuf::from(home).join("Library/Application Support/FridayOS");
+    let mut missions: Vec<serde_json::Value> = std::fs::read_dir(dir.join("missions"))
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+        .filter_map(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .filter(|value| {
+            let status = value.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            status == "active" || status.contains("wait")
+        })
+        .take(8)
+        .collect();
+    missions.sort_by(|a, b| {
+        a.get("name").and_then(|v| v.as_str()).unwrap_or("")
+            .cmp(b.get("name").and_then(|v| v.as_str()).unwrap_or(""))
+    });
+    if missions.is_empty() {
+        return String::new();
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut budget: usize = 520;
+    push_bounded_line(&mut lines, &mut budget, "MISSÕES ATIVAS (disco local):".to_string());
+    for mission in missions.iter().take(8) {
+        let name = mission.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+        let status = mission.get("status").and_then(|v| v.as_str()).unwrap_or("active");
+        let finding = mission.get("findings")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.last())
+            .and_then(|f| f.get("text").and_then(|v| v.as_str()))
+            .unwrap_or("");
+        let finding: String = finding.chars().take(80).collect();
+        let line = if finding.is_empty() {
+            format!("  - {name} [{status}]")
+        } else {
+            format!("  - {name} [{status}]: {finding}")
+        };
+        push_bounded_line(&mut lines, &mut budget, line);
+    }
+    if lines.len() < 2 {
+        return String::new(); // header only: not worth a section
+    }
+    let mut out = String::new();
+    for line in lines {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
+}
+
+/// P1: compact "ESTADO ATUAL" block (mode, autonomy, errors, briefing) built
+/// from local files only. No tools, no network, bounded `std::fs` reads so it is
+/// UI-thread safe and cannot panic. Deterministic (log errors newest-first) and
+/// capped at ~900 chars. Also used to re-anchor after a thread compaction.
+fn estado_atual_block() -> String {
+    let home = std::env::var_os("HOME").unwrap_or_default();
+    let dir = std::path::PathBuf::from(home).join("Library/Application Support/FridayOS");
+    let mut lines: Vec<String> = Vec::new();
+    let mut budget: usize = 900;
+
+    // Active mode: top-level `mode` string, or nested under `mode`/`state`.
+    let mode = std::fs::read_to_string(dir.join("mode.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|value| {
+            value.get("mode").and_then(|m| {
+                m.as_str()
+                    .map(str::to_string)
+                    .or_else(|| m.get("mode").and_then(|v| v.as_str()).map(str::to_string))
+            }).or_else(|| {
+                value.get("state").and_then(|s| s.get("mode")).and_then(|v| v.as_str()).map(str::to_string)
+            })
+        })
+        .map(|value| value.trim().to_lowercase())
+        .filter(|value| !value.is_empty());
+    if let Some(mode) = mode {
+        push_bounded_line(&mut lines, &mut budget, format!("- Modo: {mode}"));
+    }
+
+    // Autonomy level.
+    let autonomy = std::fs::read_to_string(dir.join("autonomy.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|value| value.get("level").and_then(|v| v.as_str()).map(str::to_string))
+        .filter(|value| !value.is_empty());
+    if let Some(level) = autonomy {
+        push_bounded_line(&mut lines, &mut budget, format!("- Autonomia: {level}"));
+    }
+
+    // Last 3 error lines from the log, plus the total count.
+    let log_path = dir.join("Library/Logs/FridayOS.log");
+    if let Ok(text) = std::fs::read_to_string(log_path) {
+        let errors: Vec<&str> = text.lines().filter(|line| {
+            line.contains("Err(") || line.contains("falhou")
+                || line.contains("Broken pipe") || line.contains("indisponível")
+        }).collect();
+        if !errors.is_empty() {
+            push_bounded_line(&mut lines, &mut budget, format!("- Erros recentes ({}):", errors.len()));
+            for line in errors.iter().rev().take(3) {
+                let short: String = line.chars().take(160).collect();
+                push_bounded_line(&mut lines, &mut budget, format!("  - {short}"));
             }
         }
     }
 
-    let memories = if memories.is_empty() {
-        String::new()
-    } else {
-        format!("\nMEMÓRIAS PERSISTENTES:\n{memories}")
-    };
+    // Last digest/briefing marker, if present (first 120 chars).
+    if let Ok(text) = std::fs::read_to_string(dir.join("briefing.md")) {
+        let first = text.lines().find(|line| !line.trim().is_empty()).unwrap_or("");
+        let short: String = first.chars().take(120).collect();
+        if !short.trim().is_empty() {
+            push_bounded_line(&mut lines, &mut budget, format!("- Último briefing: {short}"));
+        }
+    }
+
+    if lines.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\nESTADO ATUAL (disco local):\n");
+    for line in lines {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Builds the assembled prompt plus its stats in a single pass over local
+/// files. Sections are grouped in priority tiers: over budget we drop P2 first,
+/// then P1; P0 is never dropped. Both `persona()` and `persona_stats()` call
+/// this so the numbers always describe the actual prompt. No logging of the
+/// full prompt, no timestamps, no randomness — deterministic for given files.
+fn build_persona() -> (String, serde_json::Value) {
+    let config = read_harness_config();
+    let budget = harness_level(&config, "context_budget", 12000).max(1000) as usize;
+
+    // ---- P0: always kept -------------------------------------------------
+    let base = bounded_persona_base(3500);
 
     // Metacognition: she starts every session knowing who she is and who the
     // user is. These files are local, private and updated by self_update /
     // user_update when the user states a durable fact or corrects her.
-    let mut identity = String::new();
+    let mut who_you_are = String::new();
+    let mut who_user_is = String::new();
     if let Some(home) = std::env::var_os("HOME") {
         let dir = std::path::PathBuf::from(home).join("Library/Application Support/FridayOS");
         for (label, file) in [("QUEM VOCÊ É", "self.json"), ("QUEM É O USUÁRIO", "user.json")] {
+            let target = if file == "self.json" {
+                &mut who_you_are
+            } else {
+                &mut who_user_is
+            };
             if let Some(value) = std::fs::read_to_string(dir.join(file))
                 .ok()
                 .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
@@ -3570,16 +3888,158 @@ fn persona() -> String {
                         }
                     }
                 }
-                identity.push_str(&block);
+                target.push_str(&block);
             }
         }
     }
 
+    let missions = missoes_block();
+
+    // ---- P1: dropped after P2 -------------------------------------------
+    // Live state from local files, so Friday starts each session already aware
+    // of mode, autonomy and recent errors without calling any tool.
+    let state = estado_atual_block();
+
+    // Recent durable memories, so she starts every session already knowing
+    // them. Bounded to the 10 newest entries.
+    let mut memories = String::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        let path = std::path::PathBuf::from(home)
+            .join("Library/Application Support/FridayOS/memory.jsonl");
+        if let Ok(text) = std::fs::read_to_string(path) {
+            let lines: Vec<&str> = text.lines().filter(|line| !line.trim().is_empty()).collect();
+            let start = lines.len().saturating_sub(10);
+            for line in &lines[start..] {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+                    if let Some(content) = value.get("content").and_then(|v| v.as_str()) {
+                        memories.push_str(&format!("- {content}\n"));
+                    }
+                }
+            }
+        }
+    }
+    let memories = if memories.is_empty() {
+        String::new()
+    } else {
+        format!("\nMEMÓRIAS PERSISTENTES:\n{memories}")
+    };
+
+    // ---- P2: dropped first ------------------------------------------------
+    // Keep the prompt small: tools are discoverable through the MCP server
+    // (`tools/summary` and `tools/search`) instead of listing all of them here.
+    let manifest = "Ferramentas: use o servidor MCP `friday`; para descobrir o que\n                    existe, chame a ferramenta `tools__summary` ou pesquise com\n                    `tools__search`. Não presuma ausência de ferramenta sem buscar.\n".to_string();
     let learning = "\nQuando o usuário disser quem é, o que faz ou uma preferência durável, \
                    registre com `user_update`. Se ele corrigir algo sobre você, use `self_update`. \
-                   Use `metacognition` para recuperar esse contexto antes de responder sobre vocês dois.\n";
+                   Use `metacognition` para recuperar esse contexto antes de responder sobre vocês dois.\n".to_string();
 
-    format!("{PERSONA_BASE}\n\n{manifest}{identity}{learning}{memories}")
+    let tiers: [(&str, Vec<String>); 3] = [
+        ("p0", vec![base, who_you_are, who_user_is, missions]),
+        ("p1", vec![state, memories]),
+        ("p2", vec![manifest, learning]),
+    ];
+    let tier_cost: Vec<usize> = tiers
+        .iter()
+        .map(|(_, parts)| {
+            parts.iter()
+                .filter(|part| !part.is_empty())
+                .map(|part| part.chars().count() + 1) // + separator newline
+                .sum()
+        })
+        .collect();
+
+    let mut keep = [true, true, true];
+    let mut total: usize = tier_cost.iter().sum();
+    let mut dropped: Vec<String> = Vec::new();
+    while total > budget {
+        // Lowest priority still kept goes first. P0 survives even if it alone
+        // is over budget — it is the identity and the safety contract.
+        match (0..3).rev().find(|&index| keep[index]) {
+            Some(index) => {
+                keep[index] = false;
+                total = total.saturating_sub(tier_cost[index]);
+                dropped.push(tiers[index].0.to_string());
+            }
+            None => break,
+        }
+    }
+
+    let mut prompt = String::new();
+    let mut sections = 0usize;
+    for (index, (_, parts)) in tiers.iter().enumerate() {
+        if !keep[index] {
+            continue;
+        }
+        for part in parts {
+            if part.is_empty() {
+                continue;
+            }
+            prompt.push_str(part);
+            if !part.ends_with('\n') {
+                prompt.push('\n');
+            }
+            sections += 1;
+        }
+    }
+
+    let stats = json!({
+        "context_budget_chars": budget,
+        "context_chars": prompt.chars().count(),
+        "context_sections": sections,
+        "dropped_tiers": dropped,
+    });
+    (prompt, stats)
+}
+
+/// Stats for the prompt actually installed at connect time. `persona()` is
+/// called once per connection, so trace reads are O(1) and never re-read the
+/// state files on the turn's hot path.
+static PERSONA_STATS: OnceLock<Mutex<serde_json::Value>> = OnceLock::new();
+
+fn persona_stats_slot() -> &'static Mutex<serde_json::Value> {
+    PERSONA_STATS.get_or_init(|| Mutex::new(json!({})))
+}
+
+/// The assembled developer prompt, budgeted by `harness.json` (default 12000).
+fn persona() -> String {
+    let (prompt, stats) = build_persona();
+    if let Ok(mut slot) = persona_stats_slot().lock() {
+        *slot = stats;
+    }
+    prompt
+}
+
+/// Companion for `turn_done` / `value_metrics` traces. Describes the exact
+/// prompt installed by `persona()`, without repeating any of its file reads.
+pub fn persona_stats() -> serde_json::Value {
+    persona_stats_slot()
+        .lock()
+        .map(|slot| slot.clone())
+        .unwrap_or_default()
+}
+
+/// Last verification status for the `verified` value metric.
+///
+/// `friday_tools::registry::recent_verifications` is not available in this
+/// build, so read the append-only verification log directly when present.
+/// A missing or empty log yields `null` — never a guessed "pass".
+fn recent_verification_status(limit: usize) -> serde_json::Value {
+    let home = std::env::var_os("HOME").unwrap_or_default();
+    let path = std::path::PathBuf::from(home)
+        .join("Library/Application Support/FridayOS/verify.jsonl");
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return serde_json::Value::Null;
+    };
+    text.lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .take(limit.max(1))
+        .find_map(|entry| {
+            entry
+                .get("status")
+                .or_else(|| entry.get("decision"))
+                .cloned()
+        })
+        .unwrap_or(serde_json::Value::Null)
 }
 
 fn approval_path() -> std::path::PathBuf {

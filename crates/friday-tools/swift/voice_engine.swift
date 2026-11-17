@@ -430,41 +430,29 @@ func cmdPlay(_ path: String) {
         let gain = Float(min(max(Double(ProcessInfo.processInfo.environment["FRIDAY_AEC_GAIN"] ?? "1.8") ?? 1.8, 1.0), 4.0))
         host.player.volume = gain
 
-        let doneLock = NSLock()
-        var finished = false
-        host.player.scheduleBuffer(buffer, at: nil, options: []) {
-            doneLock.lock()
-            finished = true
-            doneLock.unlock()
-        }
+        let duration = Double(file.length) / max(1.0, file.processingFormat.sampleRate)
+        let deadline = Date().addingTimeInterval(duration + 2.0)
+        host.player.scheduleBuffer(buffer, at: nil, options: [], completionHandler: nil)
         host.player.play()
         emit(["event": "play-start", "path": path])
 
-        let duration = Double(file.length) / max(1.0, file.processingFormat.sampleRate)
-        let deadline = Date().addingTimeInterval(duration + 8.0)
+        // Deterministic completion by clock: no audio-thread callback can
+        // outlive the helper, and no RunLoop pumping is required here.
         let stopFlag = stopPlayFlag()
+        var stopped = false
         while Date() < deadline {
             if FileManager.default.fileExists(atPath: stopFlag) {
                 try? FileManager.default.removeItem(atPath: stopFlag)
-                host.player.stop()
-                emit(["event": "play-stopped", "path": path])
-                return
+                stopped = true
+                break
             }
-            doneLock.lock()
-            let done = finished
-            doneLock.unlock()
-            if done { break }
-            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.02))
+            Thread.sleep(forTimeInterval: 0.02)
         }
-
-        doneLock.lock()
-        let done = finished
-        doneLock.unlock()
-        host.player.stop() // never leave the node running
-        if done {
-            emit(["event": "play-done", "path": path])
+        host.player.stop()
+        if stopped {
+            emit(["event": "play-stopped", "path": path])
         } else {
-            emitError("play: timed out waiting for completion")
+            emit(["event": "play-done", "path": path])
         }
     } catch {
         emitError("play: \(error.localizedDescription)")

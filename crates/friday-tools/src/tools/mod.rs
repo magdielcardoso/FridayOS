@@ -15,6 +15,7 @@ pub mod assistants;
 pub mod ax;
 pub mod files;
 pub mod forensics;
+pub mod harness;
 pub mod input;
 pub mod knowledge;
 pub mod net;
@@ -55,6 +56,7 @@ pub fn register_all(registry: &mut Registry) {
     screen::register(registry);
     files::register(registry);
     forensics::register(registry);
+    harness::register(registry);
     net::register(registry);
     overlay::register(registry);
     voice::register(registry);

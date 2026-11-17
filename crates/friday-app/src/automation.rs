@@ -92,6 +92,7 @@ pub fn start(port: u16, push: Arc<dyn Fn(Trigger) + Send + Sync>) {
             run_due_watchers(&push);
             run_self_heal(&push);
             run_nightly_digest(&push);
+            run_morning_briefing(&push);
         })
         .ok();
 }
@@ -1208,9 +1209,16 @@ fn run_nightly_digest(push: &Arc<dyn Fn(Trigger) + Send + Sync>) {
     let briefing = data_dir().join("briefing.md").to_string_lossy().to_string();
 
     let prompt = format!(
-        "Resumo noturno de {date}. Escreva um briefing markdown curto em `{briefing}` com o que \
-         aconteceu hoje, o estado das missões e os próximos passos. Depois, atualize as missões \
-         relevantes com `mission_update` (use `needs_approval` só se precisar de decisão humana). \
+        "Resumo noturno de {date}. Você DEVE seguir estes passos, nesta ordem:\n\
+         1. Chame `mission_sweep` e `timeline_query` PRIMEIRO para levantar o estado real das \
+         missões e a linha do tempo de hoje.\n\
+         2. Para cada missão ativa, chame `mission_update` com os achados encontrados (texto + \
+         `state` mesclado). Se a missão estiver bloqueada ou precisar de decisão humana, chame \
+         `mission_update` com `needs_approval`: true.\n\
+         3. Quando a condição de conclusão de uma missão for satisfeita, chame `mission_complete` \
+         com um achado final. Nunca deixe a missão ativa depois que a condição for atendida.\n\
+         4. Escreva um briefing markdown curto em `{briefing}` com exatamente estas seções: \
+         `## Missões`, `## Pendências`, `## Próximos passos`.\n\
          Não reinicie nem mate processos.\n\n\
          Missões ativas (máx. 30):\n{missions}\n\n\
          Diário de ações (últimas 200 linhas):\n{journal}\n\n\
@@ -1219,6 +1227,45 @@ fn run_nightly_digest(push: &Arc<dyn Fn(Trigger) + Send + Sync>) {
     // `source` is the delivery name: routine:digest.
     push(Trigger {
         source: "routine:digest".into(),
+        prompt,
+    });
+    write_json(
+        state_path,
+        &json!({ "last_date": date, "ran_at": now_secs() }),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Morning briefing (07:00-08:00 local, once per day). Same bounded pattern as
+// the nightly digest, with its own state file. It only feeds a prompt to the
+// agent — it never spawns a UI window or touches user state.
+// ---------------------------------------------------------------------------
+
+fn run_morning_briefing(push: &Arc<dyn Fn(Trigger) + Send + Sync>) {
+    let hour = date_part("+%H");
+    if hour != "07" {
+        return;
+    }
+    let date = date_part("+%Y-%m-%d");
+    if date.is_empty() {
+        return;
+    }
+    let state_path = data_dir().join("briefing-morning-state.json");
+    let state = read_json(state_path.clone(), json!({}));
+    if state.get("last_date").and_then(Value::as_str) == Some(date.as_str()) {
+        return;
+    }
+
+    let briefing = data_dir().join("briefing.md").to_string_lossy().to_string();
+    let prompt = format!(
+        "Briefing matinal de {date}. Chame `mission_sweep` para levantar o estado das missões, \
+         leia o briefing noturno em `{briefing}` e consulte `calendar_today` para ver a agenda de \
+         hoje. Então fale/mostre um resumo curto: missões ativas, pendências e os primeiros \
+         compromissos do dia. Não abra janelas de UI, não reinicie nem mate processos."
+    );
+    // `source` is the delivery name: routine:briefing_morning.
+    push(Trigger {
+        source: "routine:briefing_morning".into(),
         prompt,
     });
     write_json(

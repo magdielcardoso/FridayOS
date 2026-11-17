@@ -51,6 +51,10 @@ fn ensure_engine<'a>(
         }
     }
     if guard.is_none() {
+        let home = std::env::var_os("HOME").unwrap_or_default();
+        let flag = std::path::PathBuf::from(home)
+            .join("Library/Caches/FridayOS/voice-engine-stop-play");
+        let _ = std::fs::remove_file(&flag);
         let binary = crate::swift::helper("voice_engine").map_err(|e| e.to_string())?;
         let mut child = Command::new(&binary)
             .stdin(Stdio::piped())

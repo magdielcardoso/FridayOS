@@ -7,9 +7,10 @@
 //! shares a ~2 s budget: if a probe is slow or lacks a macOS permission, that
 //! field degrades to an empty value plus a note instead of blocking Friday.
 
-use std::io::Read;
-use std::path::PathBuf;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -31,6 +32,65 @@ const DATE_CAP: Duration = Duration::from_millis(300);
 
 const CLIPBOARD_CHARS: usize = 300;
 const EVENT_SUMMARY_CHARS: usize = 120;
+/// Só um preview curto e redacionado vai para o disco (nunca o clipboard cheio).
+const CONTEXT_PREVIEW_CHARS: usize = 60;
+static CONTEXT_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn friday_data_dir() -> PathBuf {
+    let home = std::env::var_os("HOME").unwrap_or_default();
+    PathBuf::from(home).join("Library/Application Support/FridayOS")
+}
+
+/// Escreve `bytes` em `path` via arquivo temporário + rename atômico.
+fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let unique = CONTEXT_WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = parent.join(format!(
+        ".context-{}-{}-{}.tmp",
+        std::process::id(),
+        nanos,
+        unique
+    ));
+    let result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Persiste o mínimo de contexto que o motor de decisão local precisa ler.
+/// Nada é logado; o clipboard é reduzido a um preview redacionado de 60 chars.
+fn write_context_facts(active_app: &str, mode: &str, clipboard_text: &str) {
+    let dir = friday_data_dir();
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let snapshot = serde_json::to_string(&json!({
+        "active_app": active_app,
+        "mode": mode,
+        "ts": ts,
+    }))
+    .unwrap_or_default();
+    if !snapshot.is_empty() {
+        let _ = atomic_write(&dir.join("context-snapshot.json"), snapshot.as_bytes());
+    }
+    let preview: String = clipboard_text.chars().take(CONTEXT_PREVIEW_CHARS).collect();
+    let _ = atomic_write(&dir.join("clipboard-preview.txt"), preview.as_bytes());
+}
 
 // ---------------------------------------------------------------------------
 // Mode persistence
@@ -200,6 +260,12 @@ fn context_snapshot(ctx: &ToolCtx) -> ToolResult {
     let (clipboard_text, clipboard_truncated) = clipboard_text(&deadline, &mut notes);
     let (events, calendar_note) = today_events(&deadline, &mut notes);
     let (captured_at, epoch) = local_now(&deadline, &mut notes);
+    let mode = current_mode();
+
+    // Em dry_run a função já retornou no início; nunca gravamos nesse caso.
+    if !ctx.dry_run {
+        write_context_facts(&active_app, &mode, &clipboard_text);
+    }
 
     Ok(json!({
         "ok": true,
@@ -215,7 +281,7 @@ fn context_snapshot(ctx: &ToolCtx) -> ToolResult {
             "events": events,
             "note": calendar_note,
         },
-        "friday_mode": current_mode(),
+        "friday_mode": mode,
         "notes": notes,
     }))
 }

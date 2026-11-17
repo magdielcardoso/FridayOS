@@ -7,6 +7,7 @@
 //! The same registry powers the in-app assistant and the MCP server that Codex
 //! consumes, so there is exactly one implementation of "what Friday can do".
 
+pub mod artifact;
 pub mod audit;
 pub mod policy;
 pub mod mcp;

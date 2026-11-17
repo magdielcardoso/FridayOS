@@ -215,6 +215,15 @@ fn append_finding(mission: &mut Value, text: &str) -> Value {
     finding
 }
 
+/// Mirror a mission finding + verification into the linked run artifact.
+/// Best-effort: a missing/corrupt run never breaks the mission itself.
+fn mirror_to_run(run_id: &str, text: &str, verification: &str) {
+    if let Some(run) = crate::artifact::load_run(run_id) {
+        let _ = run.append_finding(text);
+        let _ = run.set_verification(verification, text);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Watcher handoff (shared watchers.json, merged safely)
 // ---------------------------------------------------------------------------
@@ -258,7 +267,11 @@ fn handoff_prompt(id: &str, goal: &str, condition: &str, assistant: Option<&str>
          Se precisar de uma decisão ou aprovação do usuário, chame `mission_update` com \
          `id`: \"{id}\", `needs_approval`: true e um `text` claro: a Friday irá perguntar \
          ao usuário (sim/não). Trabalhe de forma autônoma e só chame o usuário quando \
-         realmente precisar."
+         realmente precisar.\n\
+         REGRA DE CONCLUSÃO (execute sempre): Call `mission_update` with what you found \
+         (text + state merged). If you need the user, set needs_approval=true. When the \
+         completion condition is met, call `mission_complete` with a final finding. Never \
+         leave the mission active after the condition is satisfied."
     );
     if let Some(assistant) = assistant {
         prompt.push_str(&format!(
@@ -387,7 +400,8 @@ pub fn register(registry: &mut Registry) {
                 "source": { "type": "string", "enum": ["file", "shell", "url", "clipboard", "imessage", "mail"], "description": "Fonte do watcher a instalar (opcional)." },
                 "params": { "type": "object", "description": "Parâmetros do watcher (path, command, url, contains...)." },
                 "interval_secs": { "type": "integer", "minimum": 15, "default": 60 },
-                "assistant": { "type": "string", "description": "Nome de um assistente permanente para delegar investigações." }
+                "assistant": { "type": "string", "description": "Nome de um assistente permanente para delegar investigações." },
+                "run_id": { "type": "string", "description": "Id de uma execução (run) cujos artefatos recebem achados e verificação desta missão." }
             }
         }),
     ));
@@ -493,6 +507,7 @@ fn mission_start(args: &Value, ctx: &ToolCtx) -> ToolResult {
         }
     }
     let assistant = arg(args, "assistant").map(str::to_string);
+    let run_id = arg(args, "run_id").map(str::to_string);
     let interval_secs = args.get("interval_secs").and_then(Value::as_u64).unwrap_or(60).max(15);
 
     let id = unique_slug(name);
@@ -512,6 +527,7 @@ fn mission_start(args: &Value, ctx: &ToolCtx) -> ToolResult {
         "state": {},
         "assistant": assistant,
         "watcher": watcher,
+        "run_id": run_id,
         "created_at": timestamp,
         "updated_at": timestamp,
         "last_check": 0,
@@ -527,6 +543,10 @@ fn mission_start(args: &Value, ctx: &ToolCtx) -> ToolResult {
             "watcher": watcher,
             "source": source,
             "interval_secs": interval_secs,
+            "handoff_contract": "A cada achado chame `mission_update` (text + state mesclados); \
+             se precisar do usuário use `needs_approval`: true; quando a condição for satisfeita \
+             chame `mission_complete` com um achado final — nunca deixe a missão ativa após a \
+             condição.",
         }));
     }
 
@@ -549,6 +569,10 @@ fn mission_start(args: &Value, ctx: &ToolCtx) -> ToolResult {
         "mission": mission,
         "watcher": watcher,
         "watcher_installed": installed,
+        "handoff_contract": "A cada achado chame `mission_update` (text + state mesclados); \
+         se precisar do usuário use `needs_approval`: true; quando a condição for satisfeita \
+         chame `mission_complete` com um achado final — nunca deixe a missão ativa após a \
+         condição.",
     });
     if let Some(warning) = warning {
         result["warning"] = json!(warning);
@@ -617,6 +641,10 @@ fn mission_update(args: &Value, ctx: &ToolCtx) -> ToolResult {
     }
 
     write_json_atomic(&path, &mission)?;
+
+    if let Some(run_id) = field(&mission, "run_id") {
+        mirror_to_run(run_id, text, "unknown");
+    }
 
     let mut result = json!({
         "ok": true,
@@ -732,6 +760,10 @@ fn close_mission(args: &Value, ctx: &ToolCtx, cancelled: bool) -> ToolResult {
         mission["completed_at"] = json!(timestamp);
     }
     write_json_atomic(&path, &mission)?;
+
+    if let Some(run_id) = field(&mission, "run_id") {
+        mirror_to_run(run_id, text, if cancelled { "fail" } else { "pass" });
+    }
 
     let recorded_name = field(&mission, "watcher");
     let watcher_removed = remove_watcher(&mission_id, recorded_name).unwrap_or(false);
