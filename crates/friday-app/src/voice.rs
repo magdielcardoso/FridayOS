@@ -283,6 +283,8 @@ pub fn stop_speaking() {
             let _ = child.wait();
         }
     }
+    // Stop the AVAudioEngine player node immediately (AEC path).
+    let _ = friday_tools::voice_engine::stop_play();
 }
 
 // ---------------------------------------------------------------------------

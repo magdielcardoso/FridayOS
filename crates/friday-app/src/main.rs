@@ -409,6 +409,9 @@ struct FridayApp {
     speech_sent_first: bool,
     /// Set when the user hushes her: no new audio may start until the next turn.
     speech_muted: bool,
+    /// User spoke while she was talking: keep the old audio until the new answer is ready.
+    replace_speech_on_next_answer: bool,
+    barge_at: Option<std::time::Instant>,
     transcript: String,
     external_pending: VecDeque<(String, String)>,
     notify_on_done: bool,
@@ -491,6 +494,8 @@ impl FridayApp {
             speech_batch: String::new(),
             speech_sent_first: false,
             speech_muted: false,
+            replace_speech_on_next_answer: false,
+            barge_at: None,
             transcript: String::new(),
             external_pending: VecDeque::new(),
             notify_on_done: false,
@@ -730,8 +735,11 @@ impl FridayApp {
                                     return;
                                 }
                                 if steering {
-                                    if app.voice_phase == voice::VoicePhase::Speaking {
-                                        app.stop_speech_now();
+                                    if app.replace_speech_on_next_answer {
+                                        app.replace_speech_on_next_answer = false;
+                                        app.barge_at = None;
+                                        app.speech_muted = false;
+                                        log("barge-in: orientação registrada; áudio será trocado quando a resposta chegar");
                                     }
                                     mobile::user_message(&format!("[orientação] {text}"));
                                     app.messages.push(Line {
@@ -789,11 +797,14 @@ impl FridayApp {
                 );
             }
             voice::MicEvent::BargeIn => {
-                // Stop the audio, but keep the turn alive: what the user says
-                // next is guidance for it, not a cancellation.
-                self.stop_speech_now();
+                // Keep the current audio playing. The user's next words are a
+                // new prompt; her answer will replace this audio when ready.
+                self.replace_speech_on_next_answer = true;
+                self.barge_at = Some(std::time::Instant::now());
+                self.speech_muted = false;
                 self.voice_phase = voice::VoicePhase::Listening;
-                self.push_activity("barge-in · capturando orientação", StepState::Started);
+                self.push_activity("barge-in · preparando nova resposta", StepState::Started);
+                log("barge-in: mantendo áudio atual até a nova resposta");
                 cx.notify();
             }
             voice::MicEvent::Error(error) => {
@@ -926,6 +937,12 @@ impl FridayApp {
             self.speech_tx = None;
             return;
         }
+        if self.replace_speech_on_next_answer {
+            self.replace_speech_on_next_answer = false;
+            self.barge_at = None;
+            voice::stop_speaking();
+            log("barge-in: nova resposta pronta — pausando áudio anterior");
+        }
         if !self.tts_stream {
             let text = self.speech_pending.trim().to_string();
             self.speech_pending.clear();
@@ -965,6 +982,8 @@ impl FridayApp {
     /// over the user right after being interrupted.
     fn stop_speech_now(&mut self) {
         self.speech_muted = true;
+        self.replace_speech_on_next_answer = false;
+        self.barge_at = None;
         self.halt_audio();
     }
 
@@ -1195,6 +1214,16 @@ impl FridayApp {
                         .detach();
                         voice::speak_quick_async(text);
                     }
+                }
+                if app.replace_speech_on_next_answer
+                    && app
+                        .barge_at
+                        .map(|at| at.elapsed() > Duration::from_secs(8))
+                        .unwrap_or(false)
+                {
+                    log("barge-in: orientação não chegou; liberando flag");
+                    app.replace_speech_on_next_answer = false;
+                    app.barge_at = None;
                 }
                 if app.mic.is_some()
                     && !app.mic_starting

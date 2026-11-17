@@ -146,7 +146,7 @@ pub fn play(path: &Path) -> Result<(), String> {
     let mut guard = lock_engine()?;
     let proc = ensure_engine(&mut guard)?;
     send(proc, &command)?;
-    wait_for_event(proc, &["play-done"])?;
+    wait_for_event(proc, &["play-done", "play-stopped"])?;
     Ok(())
 }
 
@@ -174,14 +174,15 @@ pub fn stop_stream() -> Result<(), String> {
 
 /// Stops playback immediately (used by barge-in).
 pub fn stop_play() -> Result<(), String> {
-    let mut guard = lock_engine()?;
-    let proc = match guard.as_mut() {
-        Some(proc) => proc,
-        None => return Ok(()),
-    };
-    send(proc, "stop-play")?;
-    wait_for_event(proc, &["play-stopped"])?;
-    Ok(())
+    // A plain flag file: no engine lock, so this works while `play()` is
+    // blocked waiting for its terminal event.
+    let home = std::env::var_os("HOME").unwrap_or_default();
+    let path = std::path::PathBuf::from(home)
+        .join("Library/Caches/FridayOS/voice-engine-stop-play");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(&path, b"1").map_err(|error| error.to_string())
 }
 
 /// Plays one of the locally synthesized UI sounds: wake, confirm, error,

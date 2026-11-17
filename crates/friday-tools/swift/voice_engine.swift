@@ -363,8 +363,19 @@ func cmdStreamStop() {
     emit(["event": "stream-stopped"])
 }
 
+private func stopPlayFlag() -> String {
+    let home = NSHomeDirectory()
+    return home + "/Library/Caches/FridayOS/voice-engine-stop-play"
+}
+
 func cmdStopPlay() {
-    host.player.stop()
+    // Written by Rust without taking the engine lock, so it works even while
+    // the wrapper is blocked waiting for `play-done`.
+    let flag = stopPlayFlag()
+    try? FileManager.default.createDirectory(
+        at: URL(fileURLWithPath: (flag as NSString).deletingLastPathComponent),
+        withIntermediateDirectories: true)
+    FileManager.default.createFile(atPath: flag, contents: nil)
     emit(["event": "play-stopped"])
 }
 
@@ -393,6 +404,8 @@ func cmdPlay(_ path: String) {
         return
     }
     do {
+        // Clear a stale stop request left by a cancel with no active playback.
+        try? FileManager.default.removeItem(atPath: stopPlayFlag())
         try host.prepare()
         let file = try AVAudioFile(forReading: URL(fileURLWithPath: path))
         guard file.length > 0 else {
@@ -426,7 +439,14 @@ func cmdPlay(_ path: String) {
 
         let duration = Double(file.length) / max(1.0, file.processingFormat.sampleRate)
         let deadline = Date().addingTimeInterval(duration + 8.0)
+        let stopFlag = stopPlayFlag()
         while Date() < deadline {
+            if FileManager.default.fileExists(atPath: stopFlag) {
+                try? FileManager.default.removeItem(atPath: stopFlag)
+                host.player.stop()
+                emit(["event": "play-stopped", "path": path])
+                return
+            }
             doneLock.lock()
             let done = finished
             doneLock.unlock()
