@@ -524,11 +524,20 @@ impl VadState {
         let rms = rms(frame);
         let _ = tx.send(VoiceEvent::Level(rms));
 
+        // Light floor estimate for endpointing only: it sets WHERE a sentence
+        // ends, it never filters or attenuates the captured audio.
+        let target = rms.clamp(0.002, 0.08);
+        if rms <= self.noise {
+            self.noise = target;
+        } else {
+            self.noise += (target - self.noise) * 0.02;
+        }
+
         // Learn the room for ~1.5 s before trusting the gate: mics differ a lot
         // and a noisy fan would otherwise look like non-stop speech.
         // Absolute, low gate. No room-noise estimate: it was raising the
         // threshold exactly when the user spoke quietly.
-        let gate = SPEECH_THRESHOLD;
+        let gate = (self.noise * 1.35).max(SPEECH_THRESHOLD).min(0.12);
 
         // While Friday speaks, the microphone also hears her. Never treat that
         // as an utterance: only a much louder voice after a short grace period
@@ -589,7 +598,7 @@ impl VadState {
         // still count as speech. The sustain threshold must stay above the room
         // noise, otherwise a loud room (mic at 100%) keeps the utterance open
         // until the 30 s cap and sends noise to STT.
-        let sustain = (gate * 0.70).min(0.45);
+        let sustain = (self.noise * 1.12).max(gate * 0.70).min(0.30);
         let voiced = rms >= if self.in_speech { sustain } else { gate };
 
         self.pre_roll.push_back(frame.to_vec());

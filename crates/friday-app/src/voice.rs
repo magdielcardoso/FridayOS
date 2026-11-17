@@ -203,21 +203,56 @@ fn siri_transcribe_file(path: &Path) -> Result<String, String> {
     match run(path) {
         Ok(text) => return Ok(text),
         Err(first) => {
-            // SFSpeechRecognizer on macOS returns no text for long files.
-            // Retry on a short leading window, where it is reliable.
+            // SFSpeechRecognizer silently returns no text for long files.
+            // Split into overlapping 5 s windows and stitch the transcripts,
+            // so the END of the sentence is not lost.
             if let Ok(bytes) = std::fs::read(path) {
                 if let Ok(pcm) = friday_core::wav::parse_wav(&bytes) {
-                    let keep = (pcm.sample_rate as usize * 6).min(pcm.samples.len());
-                    if keep > 0 {
-                        let trimmed = temp_dir().join(format!("stt-short-{}-{}.wav", std::process::id(), stamp()));
-                        let wav = encode_pcm16_wav(&pcm.samples[..keep], pcm.sample_rate);
-                        if std::fs::write(&trimmed, wav).is_ok() {
-                            let result = run(&trimmed);
-                            let _ = std::fs::remove_file(&trimmed);
-                            if let Ok(text) = result {
-                                return Ok(text);
+                    let rate = pcm.sample_rate.max(8000) as usize;
+                    let window = rate * 5;
+                    let overlap = rate / 2;
+                    let mut offset = 0usize;
+                    let mut parts: Vec<String> = Vec::new();
+                    while offset < pcm.samples.len() {
+                        let end = (offset + window).min(pcm.samples.len());
+                        let slice = &pcm.samples[offset..end];
+                        let chunk = temp_dir().join(format!(
+                            "stt-chunk-{}-{}-{}.wav",
+                            std::process::id(),
+                            stamp(),
+                            parts.len()
+                        ));
+                        if std::fs::write(&chunk, encode_pcm16_wav(slice, pcm.sample_rate)).is_ok() {
+                            if let Ok(text) = run(&chunk) {
+                                parts.push(text);
+                            }
+                            let _ = std::fs::remove_file(&chunk);
+                        }
+                        if end >= pcm.samples.len() {
+                            break;
+                        }
+                        offset = end.saturating_sub(overlap);
+                    }
+                    if !parts.is_empty() {
+                        // Deduplicate overlap text by keeping the longest tail
+                        // that is already present at the start of the next part.
+                        let mut combined = parts[0].clone();
+                        for part in parts.iter().skip(1) {
+                            let mut add = part.as_str();
+                            for n in (1..part.chars().count().min(40)).rev() {
+                                let tail: String = combined.chars().rev().take(n).collect();
+                                let needle: String = tail.chars().rev().collect();
+                                if part.starts_with(&needle) {
+                                    add = &part[needle.len()..];
+                                    break;
+                                }
+                            }
+                            if !add.trim().is_empty() {
+                                combined.push(' ');
+                                combined.push_str(add.trim());
                             }
                         }
+                        return Ok(combined.trim().to_string());
                     }
                 }
             }
@@ -479,6 +514,25 @@ fn prune_cache() {
 /// beyond the newest 200 (30 s captures made this grow by ~100 MB).
 pub fn prune_utterances() {
     prune_cache();
+    // Also clear old synthesized temp WAVs (piper/speech/stt chunks).
+    let temp = temp_dir();
+    if let Ok(entries) = std::fs::read_dir(&temp) {
+        let cutoff = SystemTime::now() - Duration::from_secs(3600);
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("wav") {
+                continue;
+            }
+            let old = entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .map(|m| m < cutoff)
+                .unwrap_or(false);
+            if old {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
     let Ok(entries) = std::fs::read_dir(voice_dir()) else {
         return;
     };
@@ -500,11 +554,11 @@ pub fn prune_utterances() {
         }
         files.push((modified, path));
     }
-    if files.len() <= 200 {
+    if files.len() <= 60 {
         return;
     }
     files.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
-    for (_, path) in files.iter().skip(200) {
+    for (_, path) in files.iter().skip(60) {
         let _ = std::fs::remove_file(path);
     }
 }

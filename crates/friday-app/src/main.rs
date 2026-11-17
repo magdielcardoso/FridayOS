@@ -1170,6 +1170,9 @@ impl FridayApp {
                 if app.agent_view.is_some() && app.tick % 4 == 0 {
                     app.poll_agent_log();
                 }
+                if app.tick % 100 == 0 {
+                    std::thread::spawn(voice::prune_utterances);
+                }
                 let mode = app.presence.mode().to_string();
                 // `app.level` comes from the MICROPHONE. `voice::speech_level()`
                 // is the amplitude of OUR OWN synthesized voice; using it here
@@ -1411,10 +1414,12 @@ impl FridayApp {
                     if voice::speech_level() > 0.01 {
                         app.speaking_since = Some(std::time::Instant::now());
                     }
+                    // 25 s was shorter than some legitimate long, quiet TTS
+                    // streaks; it reset healthy playback (45 log hits).
                     let stale = app
                         .speaking_since
-                        .map(|since| since.elapsed() > Duration::from_secs(25))
-                        .unwrap_or(true);
+                        .map(|since| since.elapsed() > Duration::from_secs(60))
+                        .unwrap_or(false);
                     if stale {
                         log("watchdog: fala travada, resetando");
                         app.halt_audio();

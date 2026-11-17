@@ -1001,6 +1001,14 @@ fn mlog(message: &str) {
     }
 }
 
+fn is_local_address(addr: IpAddr) -> bool {
+    let Ok(output) = std::process::Command::new("/sbin/ifconfig").output() else {
+        return false;
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.contains(&addr.to_string())
+}
+
 pub fn start(port: u16) -> Option<String> {
     let (pair_code, session_token) = load_config();
     let Some((vapid_public, vapid_private)) = ensure_vapid() else {
@@ -1044,9 +1052,14 @@ pub fn start(port: u16) -> Option<String> {
             runtime.block_on(async move {
                 // Localhost by default. FRIDAY_MOBILE_BIND may point at the
                 // Tailscale IP for direct (non-Serve) access during setup.
-                let ip: IpAddr = std::env::var("FRIDAY_MOBILE_BIND")
+                // Only honour an explicit bind when it is a local address.
+                // Tailscale's own IP is not bindable unless Tailscale Serve is
+                // active; trying it on every launch produced 74 log errors.
+                let configured: Option<IpAddr> = std::env::var("FRIDAY_MOBILE_BIND")
                     .ok()
-                    .and_then(|value| value.parse().ok())
+                    .and_then(|value| value.parse().ok());
+                let ip = configured
+                    .filter(|addr| addr.is_loopback() || is_local_address(*addr))
                     .unwrap_or(IpAddr::from([127, 0, 0, 1]));
                 let address = SocketAddr::new(ip, port);
                 let mut listener = match tokio::net::TcpListener::bind(address).await {

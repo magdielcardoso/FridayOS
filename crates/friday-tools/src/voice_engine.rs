@@ -39,6 +39,17 @@ fn lock_engine() -> Result<MutexGuard<'static, Option<EngineProcess>>, String> {
 fn ensure_engine<'a>(
     guard: &'a mut MutexGuard<'static, Option<EngineProcess>>,
 ) -> Result<&'a mut EngineProcess, String> {
+    // Respawn if the helper died (broken pipe / EOF from a previous command).
+    let dead = guard
+        .as_mut()
+        .map(|proc| matches!(proc.child.try_wait(), Ok(Some(_))))
+        .unwrap_or(true);
+    if dead {
+        if let Some(mut proc) = guard.take() {
+            let _ = proc.child.kill();
+            let _ = proc.child.wait();
+        }
+    }
     if guard.is_none() {
         let binary = crate::swift::helper("voice_engine").map_err(|e| e.to_string())?;
         let mut child = Command::new(&binary)

@@ -344,7 +344,9 @@ func cmdStreamStart(_ path: String) {
                 for i in 0..<samples.count {
                     pcm[i] = Int16(max(-1.0, min(1.0, samples[i])) * 32_767.0)
                 }
-                handle.write(Data(bytes: pcm, count: pcm.count * MemoryLayout<Int16>.size))
+                // Throwing writer never raises an ObjC exception if the
+                // handle was closed by a concurrent stream-stop.
+                try? handle.write(contentsOf: Data(bytes: pcm, count: pcm.count * MemoryLayout<Int16>.size))
             }
         }
         host.tapInstalled = true
@@ -358,7 +360,8 @@ func cmdStreamStart(_ path: String) {
 func cmdStreamStop() {
     host.lock.lock(); host.capturing = false; host.lock.unlock()
     if host.tapInstalled { host.engine.inputNode.removeTap(onBus: 0); host.tapInstalled = false }
-    host.streamHandle?.closeFile()
+    // Do not close from the command thread: an in-flight tap callback may
+    // still hold the handle. Deallocation closes it safely on the next drain.
     host.streamHandle = nil
     emit(["event": "stream-stopped"])
 }
