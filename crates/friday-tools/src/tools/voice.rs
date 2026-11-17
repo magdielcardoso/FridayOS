@@ -5,6 +5,13 @@
 //! and `say` for playback, and one tiny Swift helper (`swift/speech.swift`)
 //! for on-device recognition used by the wake-word loop.
 //!
+//! Validated full-duplex design: capture runs continuously through AVAudioEngine
+//! voice processing (AEC), so Friday's own playback is cancelled at the source.
+//! A low-latency RMS VAD here fires `BargeIn` on the first voiced frame of a
+//! double-talk turn; live ASR partials belong to the separate streaming STT
+//! layer (no raw-audio polling here). This module only emits the final
+//! `SpeechEnd` WAV, which batch STT transcribes for maximum fidelity.
+//!
 //! Caveats that the app must handle:
 //! - macOS TCC needs `NSMicrophoneUsageDescription` (and
 //!   `NSSpeechRecognitionUsageDescription` for the Swift helper) in the host
@@ -75,6 +82,12 @@ pub const SILENCE_FRAMES_TO_END: u32 = SHORT_HANGOVER_FRAMES;
 /// Hard cap on an utterance (~8 s). Longer clips make the on-device
 /// recognizer silently return no text and were almost always speaker echo.
 pub const MAX_FRAMES: usize = 24;
+/// A barge-in turn must get its final transcript back fast, so it closes after
+/// only two silent frames (~0.5 s) instead of the normal hangover.
+pub const BARGE_HANGOVER_FRAMES: u32 = 2;
+/// ~4 s cap for a barge-in utterance, so the user is not kept waiting while
+/// Friday is still talking and STT cannot start on the final WAV.
+pub const BARGE_MAX_FRAMES: usize = 16;
 /// Samples per VAD frame.
 pub const FRAME_SIZE: usize = 4096;
 /// Rate we hand to the STT layer.
@@ -622,12 +635,18 @@ impl VadState {
             self.speaking_frames = 0;
         }
 
-        // Full-duplex barge-in: with AEC, a normal voiced frame while Friday is
-        // speaking is the start of a user turn. Notify immediately; the frames
-        // continue into the normal capture path below so STT gets the words.
+        // Double-talk barge-in with AEC: Friday's own voice is cancelled at the
+        // source, so the FIRST voiced frame is the user's turn. Fire `BargeIn`
+        // once, immediately — no loud threshold and no sustained-frame rule.
+        // The frame still flows into the normal capture path below, so the
+        // user's words land in `captured` and go out with the final `SpeechEnd`.
+        // `barge_sent` is cleared only when the utterance ends, keeping this
+        // single-shot for the whole turn.
         if speaking && !self.barge_capturing && aec_active() && rms >= gate {
             if !self.barge_sent {
                 self.barge_sent = true;
+                // Tag the turn so endpointing closes it quickly.
+                self.barge_capturing = true;
                 let _ = tx.send(VoiceEvent::BargeIn);
             }
         }
@@ -675,17 +694,24 @@ impl VadState {
             self.silence_frames += 1;
         }
 
-        // Short commands close quickly; longer thoughts get room for a natural
-        // pause before the endpoint. A fixed value can be forced with
-        // FRIDAY_VAD_HANGOVER_MS (e.g. 1200).
-        let hangover = self.hangover_override.unwrap_or_else(|| {
-            if self.frames_captured >= LONG_UTTERANCE_FRAMES {
-                LONG_HANGOVER_FRAMES
-            } else {
-                SHORT_HANGOVER_FRAMES
-            }
-        });
-        if self.silence_frames >= hangover || self.frames_captured >= MAX_FRAMES {
+        // A barge-in turn needs its final transcript fast: close it after only
+        // two silent frames (~0.5 s) with a shorter cap (~4 s) instead of the
+        // normal hangover. Normal utterances keep their tuning, including the
+        // FRIDAY_VAD_HANGOVER_MS override.
+        let barge = self.barge_capturing;
+        let hangover = if barge {
+            BARGE_HANGOVER_FRAMES
+        } else {
+            self.hangover_override.unwrap_or_else(|| {
+                if self.frames_captured >= LONG_UTTERANCE_FRAMES {
+                    LONG_HANGOVER_FRAMES
+                } else {
+                    SHORT_HANGOVER_FRAMES
+                }
+            })
+        };
+        let max_frames = if barge { BARGE_MAX_FRAMES } else { MAX_FRAMES };
+        if self.silence_frames >= hangover || self.frames_captured >= max_frames {
             let captured = std::mem::take(&mut self.captured);
             let frames = self.frames_captured;
             self.in_speech = false;

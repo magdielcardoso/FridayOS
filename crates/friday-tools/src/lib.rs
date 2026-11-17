@@ -18,6 +18,7 @@ pub mod voice_engine;
 pub mod delivery;
 pub mod decision;
 pub mod watcher_events;
+pub mod stt_stream;
 
 pub use audit::AuditLog;
 pub use policy::{Autonomy, Risk};

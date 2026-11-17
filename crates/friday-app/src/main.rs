@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use friday_core::codex::{Codex, CodexConfig, CodexEvent, StepState};
+use friday_tools::stt_stream::{self, SttEvent};
 use gpui::prelude::*;
 use gpui::{
     canvas, div, point, px, rgb, rgba, size, App, Application, Bounds, Context, FocusHandle,
@@ -428,6 +429,11 @@ struct FridayApp {
     replace_speech_on_next_answer: bool,
     barge_at: Option<std::time::Instant>,
     transcript: String,
+    /// Latest streamed partial already pushed as turn guidance. Used to dedupe
+    /// the authoritative batch (Codex) transcript against the partials that
+    /// steered the running turn, so the same words are not sent twice.
+    last_partial_steer: Option<String>,
+    last_partial_steer_at: Option<std::time::Instant>,
     external_pending: VecDeque<(String, String)>,
     notify_on_done: bool,
     active_app: String,
@@ -513,6 +519,8 @@ impl FridayApp {
             replace_speech_on_next_answer: false,
             barge_at: None,
             transcript: String::new(),
+            last_partial_steer: None,
+            last_partial_steer_at: None,
             external_pending: VecDeque::new(),
             notify_on_done: false,
             active_app: String::new(),
@@ -707,6 +715,12 @@ impl FridayApp {
     fn on_mic(&mut self, event: voice::MicEvent, cx: &mut Context<Self>) {
         match event {
             voice::MicEvent::SpeechStarted => {
+                // Full-duplex: start low-latency streaming dictation for this
+                // utterance (no-op if it is already running). Reset the partial
+                // throttle so the first words steer the running turn at once.
+                let _ = stt_stream::start();
+                self.last_partial_steer = None;
+                self.last_partial_steer_at = None;
                 log("mic: fala detectada");
                 self.speech_started_at = Some(std::time::Instant::now());
                 self.first_audio_ms = None;
@@ -729,6 +743,11 @@ impl FridayApp {
                     "stage": "speech_end",
                     "speech_ms": speech_ms,
                 }));
+                // The batch recognizer now owns this utterance: close the
+                // streaming recognizer before running Codex STT. The batch
+                // transcript stays authoritative; streamed partials only
+                // steered the turn while the user was still talking.
+                let _ = stt_stream::stop();
                 self.stt_started_at = Some(std::time::Instant::now());
                 self.level = 0.0;
                 self.voice_phase = voice::VoicePhase::Transcribing;
@@ -747,8 +766,14 @@ impl FridayApp {
                         match result {
                             Ok(text) if !text.trim().is_empty() => {
                                 app.transcript = text.clone();
+                                // A barge-in during playback flips voice_phase
+                                // to Listening before STT finishes. Treat a
+                                // pending replacement as an active turn too,
+                                // otherwise the guidance becomes a NEW prompt
+                                // and Friday answers the words literally.
                                 let steering = app.status == Status::Thinking
-                                    || app.voice_phase == voice::VoicePhase::Speaking;
+                                    || app.voice_phase == voice::VoicePhase::Speaking
+                                    || app.replace_speech_on_next_answer;
                                 if app.warming {
                                     app.external_pending.push_back(("orientação".into(), text));
                                     return;
@@ -769,8 +794,31 @@ impl FridayApp {
                                         "orientação enviada ao turno",
                                         StepState::Completed,
                                     );
-                                    if let Some(codex) = app.codex.as_ref() {
-                                        codex.steer(text);
+                                    // The batch transcript is normally the same
+                                    // words the streamed partials already used
+                                    // to steer this turn. Skip the duplicate
+                                    // steer when it equals/contains the last
+                                    // partial (or vice versa); the transcript
+                                    // above is the only thing that must update.
+                                    let final_norm = text.trim().to_lowercase();
+                                    let duplicate = app
+                                        .last_partial_steer
+                                        .as_ref()
+                                        .map(|partial| {
+                                            let partial_norm = partial.trim().to_lowercase();
+                                            !partial_norm.is_empty()
+                                                && !final_norm.is_empty()
+                                                && (partial_norm == final_norm
+                                                    || partial_norm.contains(&final_norm)
+                                                    || final_norm.contains(&partial_norm))
+                                        })
+                                        .unwrap_or(false);
+                                    if !duplicate {
+                                        if let Some(codex) = app.codex.as_ref() {
+                                            codex.steer(text.clone());
+                                        }
+                                    } else {
+                                        log("stt: final equivale à orientação parcial; steer duplicado evitado");
                                     }
                                     app.voice_phase = if app.mic.is_some() {
                                         voice::VoicePhase::Listening
@@ -816,8 +864,12 @@ impl FridayApp {
                 );
             }
             voice::MicEvent::BargeIn => {
-                // Keep the current audio playing. The user's next words are a
-                // new prompt; her answer will replace this audio when ready.
+                // Capture the interruption immediately for partial steering,
+                // but do NOT stop the current audio: the queued replacement
+                // still plays until the new answer is ready.
+                if !stt_stream::is_running() {
+                    let _ = stt_stream::start();
+                }
                 self.replace_speech_on_next_answer = true;
                 self.barge_at = Some(std::time::Instant::now());
                 self.speech_muted = false;
@@ -840,6 +892,9 @@ impl FridayApp {
 
     fn begin_speech(&mut self, cx: &mut Context<Self>) {
         self.halt_audio();
+        // Full-duplex: capture barge-in dictation from the instant she starts
+        // speaking, instead of waiting for the VAD to fire SpeechStarted.
+        let _ = stt_stream::start();
         self.speech_muted = false;
         self.set_duck(true);
         let cancel = Arc::new(AtomicBool::new(false));
@@ -885,14 +940,35 @@ impl FridayApp {
                     app.speaking_since = None;
                     // Keep the VAD's echo guard up briefly after playback ends:
                     // the speakers/reverb were still feeding the mic and the
-                    // capture opened a 30 s "utterance" of her own voice.
+                    // capture opened a 30 s "utterance" of her own voice. With
+                    // AEC the speaker is cancelled at capture already, so a
+                    // 200 ms guard is enough; otherwise keep the full 1200 ms.
+                    let echo_guard_ms = if friday_tools::tools::voice::aec_active() {
+                        200
+                    } else {
+                        1200
+                    };
                     cx.spawn(async move |this, cx| {
                         cx.background_executor()
-                            .timer(Duration::from_millis(1200))
+                            .timer(Duration::from_millis(echo_guard_ms))
                             .await;
                         let _ = this.update(cx, |app, _| {
                             if let Some(mic) = app.mic.as_ref() {
                                 mic.set_speaking(false);
+                            }
+                        });
+                    })
+                    .detach();
+                    // Stop streaming dictation shortly after playback ends. A
+                    // fresh SpeechStarted (barge-in / next turn) restarts it, so
+                    // only stop when she has not begun speaking again.
+                    cx.spawn(async move |this, cx| {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(200))
+                            .await;
+                        let _ = this.update(cx, |app, _| {
+                            if app.voice_phase != voice::VoicePhase::Speaking {
+                                let _ = stt_stream::stop();
                             }
                         });
                     })
@@ -1178,6 +1254,50 @@ impl FridayApp {
             let _ = this.update(cx, |app, cx| {
                 app.tick = app.tick.wrapping_add(1);
                 app.blink = (app.tick / 12) % 2 == 0;
+                // Full-duplex dictation: drain low-latency streaming ASR events.
+                // Partials paint the live HUD transcript and (throttled) steer
+                // the running turn. The final only refreshes the transcript —
+                // the batch Codex transcript stays authoritative.
+                for event in stt_stream::poll_events(5) {
+                    match event {
+                        SttEvent::Partial(text) => {
+                            app.transcript = text.clone();
+                            trace(json!({
+                                "event": "stt_partial",
+                                "chars": text.chars().count(),
+                            }));
+                            let active = app.status == Status::Thinking
+                                || app.voice_phase == voice::VoicePhase::Speaking
+                                || app.replace_speech_on_next_answer;
+                            let words = text.split_whitespace().count();
+                            let throttled = app
+                                .last_partial_steer_at
+                                .map(|at| at.elapsed() < Duration::from_millis(800))
+                                .unwrap_or(false);
+                            if active && words >= 2 && !throttled {
+                                if let Some(codex) = app.codex.as_ref() {
+                                    codex.steer(format!("[orientação parcial] {text}"));
+                                }
+                                app.push_activity(
+                                    format!("orientação parcial: {text}"),
+                                    StepState::Started,
+                                );
+                                app.last_partial_steer = Some(text);
+                                app.last_partial_steer_at = Some(std::time::Instant::now());
+                            }
+                        }
+                        SttEvent::Final(text) => {
+                            app.transcript = text;
+                            trace(json!({ "event": "stt_partial_final" }));
+                        }
+                        SttEvent::Error(error) => {
+                            trace(json!({
+                                "event": "stt_partial_error",
+                                "message": error,
+                            }));
+                        }
+                    }
+                }
                 // ~2 s cadence (90 ms * 22): keep mode + delivery context in sync
                 // with the local files without doing IO on every frame.
                 if app.tick % 22 == 0 {
