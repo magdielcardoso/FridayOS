@@ -99,6 +99,7 @@ final class VoiceEngineHost {
     var capturing = false
     var tapInstalled = false
     var started = false
+    var streamHandle: FileHandle?
 
     init() {
         engine.attach(player)
@@ -141,6 +142,8 @@ final class VoiceEngineHost {
             tapInstalled = false
         }
         player.stop()
+        streamHandle?.closeFile()
+        streamHandle = nil
         if engine.isRunning {
             engine.stop()
         }
@@ -306,6 +309,65 @@ func cmdCaptureStop() {
     }
 }
 
+// MARK: - Streaming capture (raw 16 kHz mono PCM16 appended to a file)
+
+func cmdStreamStart(_ path: String) {
+    guard !path.isEmpty else { emitError("stream-start: missing path"); return }
+    do {
+        try host.prepare()
+        let input = host.engine.inputNode
+        if host.tapInstalled { input.removeTap(onBus: 0); host.tapInstalled = false }
+        let url = URL(fileURLWithPath: path)
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                                withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: path, contents: nil)
+        host.streamHandle = try FileHandle(forWritingTo: url)
+        host.lock.lock(); host.capturing = true; host.resampler.reset(); host.lock.unlock()
+
+        input.installTap(onBus: 0, bufferSize: 4096, format: nil) { buffer, _ in
+            guard host.capturing, let handle = host.streamHandle else { return }
+            guard let channels = buffer.floatChannelData else { return }
+            let frames = Int(buffer.frameLength)
+            guard frames > 0 else { return }
+            let channelCount = Int(buffer.format.channelCount)
+            var mono = [Float](repeating: 0, count: frames)
+            for c in 0..<channelCount {
+                let ptr = channels[c]
+                for i in 0..<frames { mono[i] += ptr[i] }
+            }
+            if channelCount > 1 {
+                let inv = 1.0 / Float(channelCount)
+                for i in 0..<frames { mono[i] *= inv }
+            }
+            host.resampler.process(mono, srcRate: buffer.format.sampleRate) { samples in
+                var pcm = [Int16](repeating: 0, count: samples.count)
+                for i in 0..<samples.count {
+                    pcm[i] = Int16(max(-1.0, min(1.0, samples[i])) * 32_767.0)
+                }
+                handle.write(Data(bytes: pcm, count: pcm.count * MemoryLayout<Int16>.size))
+            }
+        }
+        host.tapInstalled = true
+        emit(["event": "stream-started", "path": path,
+              "voice_processing": host.voiceProcessing, "sample_rate": 16_000])
+    } catch {
+        emitError("stream-start: \(error.localizedDescription)")
+    }
+}
+
+func cmdStreamStop() {
+    host.lock.lock(); host.capturing = false; host.lock.unlock()
+    if host.tapInstalled { host.engine.inputNode.removeTap(onBus: 0); host.tapInstalled = false }
+    host.streamHandle?.closeFile()
+    host.streamHandle = nil
+    emit(["event": "stream-stopped"])
+}
+
+func cmdStopPlay() {
+    host.player.stop()
+    emit(["event": "play-stopped"])
+}
+
 /// 20 ms linear fades at both ends, applied in the sample domain. This is a
 /// deterministic form of gain automation and avoids the fragile AVAudioNode
 /// parameter-automation API. It also guarantees the node ends at silence.
@@ -399,6 +461,12 @@ func handle(_ line: String) -> Bool {
         cmdCaptureStop()
     case "play":
         cmdPlay(rest)
+    case "stream-start":
+        cmdStreamStart(rest)
+    case "stream-stop":
+        cmdStreamStop()
+    case "stop-play":
+        cmdStopPlay()
     case "quit":
         host.stopAll()
         emit(["event": "quit"])

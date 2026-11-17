@@ -226,7 +226,73 @@ impl VoiceEngine {
     }
 }
 
-/// Starts capture on the default input device.
+/// Starts capture through AVAudioEngine with voice processing (AEC) enabled.
+/// Friday's playback goes through the same engine, so her own voice is
+/// subtracted from the microphone before the VAD sees it.
+pub fn start_aec() -> Result<VoiceHandle, String> {
+    let (tx, rx) = mpsc::channel();
+    let running = Arc::new(AtomicBool::new(true));
+    let speaking = Arc::new(AtomicBool::new(false));
+    let running_thread = Arc::clone(&running);
+    let speaking_thread = Arc::clone(&speaking);
+    let raw = std::env::temp_dir().join(format!(
+        "friday-aec-{}-{}.raw",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    ));
+    crate::voice_engine::start_stream(&raw)?;
+    let join = thread::Builder::new()
+        .name("friday-voice-aec".into())
+        .spawn(move || {
+            let mut vad = VadState::new();
+            let mut agc = Agc::new();
+            let mut offset = 0u64;
+            while running_thread.load(Ordering::Relaxed) {
+                let Ok(meta) = std::fs::metadata(&raw) else { break };
+                let len = meta.len();
+                if len > offset {
+                    if let Ok(mut file) = std::fs::File::open(&raw) {
+                        use std::io::{Read, Seek, SeekFrom};
+                        if file.seek(SeekFrom::Start(offset)).is_ok() {
+                            let mut bytes = Vec::new();
+                            if file.read_to_end(&mut bytes).is_ok() {
+                                offset = len;
+                                let usable = (bytes.len() / 2) * 2;
+                                let samples: Vec<f32> = bytes[..usable]
+                                    .chunks_exact(2)
+                                    .map(|pair| {
+                                        i16::from_le_bytes([pair[0], pair[1]]) as f32 / 32_768.0
+                                    })
+                                    .collect();
+                                let mut resampled = samples;
+                                agc.apply(&mut resampled);
+                                vad.push(
+                                    &resampled,
+                                    speaking_thread.load(Ordering::Relaxed),
+                                    &tx,
+                                );
+                            }
+                        }
+                    }
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            let _ = crate::voice_engine::stop_stream();
+            let _ = std::fs::remove_file(&raw);
+        })
+        .map_err(|error| format!("aec voice thread: {error}"))?;
+    Ok(VoiceHandle {
+        events: Some(rx),
+        running,
+        speaking,
+        join: Some(join),
+    })
+}
+
+/// Starts capture on the default input device (fallback without AEC).
 pub fn start() -> Result<VoiceHandle, String> {
     let engine = VoiceEngine::new()?;
     let (tx, rx) = mpsc::channel();

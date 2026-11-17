@@ -150,6 +150,40 @@ pub fn play(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Starts streaming voice-processed (AEC) microphone PCM16 into `path`.
+pub fn start_stream(path: &Path) -> Result<(), String> {
+    let command = format!("stream-start {}", path.display());
+    let mut guard = lock_engine()?;
+    let proc = ensure_engine(&mut guard)?;
+    send(proc, &command)?;
+    wait_for_event(proc, &["stream-started"])?;
+    Ok(())
+}
+
+/// Stops the streaming tap.
+pub fn stop_stream() -> Result<(), String> {
+    let mut guard = lock_engine()?;
+    let proc = match guard.as_mut() {
+        Some(proc) => proc,
+        None => return Ok(()),
+    };
+    send(proc, "stream-stop")?;
+    wait_for_event(proc, &["stream-stopped"])?;
+    Ok(())
+}
+
+/// Stops playback immediately (used by barge-in).
+pub fn stop_play() -> Result<(), String> {
+    let mut guard = lock_engine()?;
+    let proc = match guard.as_mut() {
+        Some(proc) => proc,
+        None => return Ok(()),
+    };
+    send(proc, "stop-play")?;
+    wait_for_event(proc, &["play-stopped"])?;
+    Ok(())
+}
+
 /// Plays one of the locally synthesized UI sounds: wake, confirm, error,
 /// thinking or done. Uses the one-shot `sound` helper.
 pub fn ui_sound(name: &str) -> Result<(), String> {

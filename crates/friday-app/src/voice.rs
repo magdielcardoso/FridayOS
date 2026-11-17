@@ -26,7 +26,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use friday_core::auth::CodexAuth;
 use friday_core::wav::{encode_pcm16_wav, parse_wav};
 use friday_core::tts;
-use friday_tools::tools::voice::{start as start_capture, write_wav, VoiceEvent, VoiceHandle};
+use friday_tools::tools::voice::{
+    start as start_capture, start_aec, write_wav, VoiceEvent, VoiceHandle,
+};
 
 // ---------------------------------------------------------------------------
 // API pública
@@ -66,7 +68,21 @@ pub struct Mic {
 impl Mic {
     /// Abre o microfone padrão. Falha de permissão/dispositivo vira `Err`.
     pub fn start() -> Result<Mic, String> {
-        let mut handle = start_capture()?;
+        // Prefer AVAudioEngine voice processing (AEC). Falls back to cpal.
+        let mut handle = if std::env::var("FRIDAY_AEC").map(|v| v != "0").unwrap_or(true) {
+            match start_aec() {
+                Ok(handle) => {
+                    vlog("mic: captura com AEC ativa");
+                    handle
+                }
+                Err(error) => {
+                    vlog(format!("mic: AEC indisponível ({error}); usando cpal"));
+                    start_capture()?
+                }
+            }
+        } else {
+            start_capture()?
+        };
         let events = handle.recv_events();
         Ok(Mic {
             handle: Some(handle),
