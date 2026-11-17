@@ -390,6 +390,8 @@ struct FridayApp {
     approvals: approval_queue::ApprovalQueue,
     decision_engine: friday_tools::decision::DecisionEngine,
     presence: presence::Presence,
+    /// Rate limit independent from the presence module's internal cooldown.
+    last_backchannel_at: Option<std::time::Instant>,
     thread: Option<String>,
     tools: usize,
     mic: Option<voice::Mic>,
@@ -474,6 +476,7 @@ impl FridayApp {
             approvals: approval_queue::ApprovalQueue::load(&approval_path()),
             decision_engine: friday_tools::decision::load(&decision_path()),
             presence: presence::Presence::new(),
+            last_backchannel_at: None,
             thread: None,
             tools: friday_tools::Registry::with_defaults().specs().len(),
             mic: None,
@@ -1152,14 +1155,48 @@ impl FridayApp {
                     app.poll_agent_log();
                 }
                 let mode = app.presence.mode().to_string();
+                // `app.level` comes from the MICROPHONE. `voice::speech_level()`
+                // is the amplitude of OUR OWN synthesized voice; using it here
+                // made her hear her own "certo/entendo" and start a feedback
+                // loop that fed every backchannel back as user guidance.
                 let active = app.voice_phase == voice::VoicePhase::Listening
-                    && voice::speech_level() > 0.01;
+                    && app.level > 0.02
+                    && voice::speech_level() < 0.01;
                 app.presence.update(90, app.level, active, &mode);
                 let (rate, pitch) = app.presence.prosody();
                 voice::set_prosody(rate, pitch);
-                if app.presence.state() == presence::PresenceState::HearingUser {
+                // Backchannels are opt-in and never fire while she is speaking,
+                // thinking, or when her own audio is audible.
+                if std::env::var("FRIDAY_BACKCHANNEL")
+                    .map(|value| value == "1")
+                    .unwrap_or(false)
+                    && app.voice_phase != voice::VoicePhase::Speaking
+                    && app.status != Status::Thinking
+                    && voice::speech_level() < 0.01
+                    && app
+                        .last_backchannel_at
+                        .map(|at| at.elapsed() > Duration::from_secs(8))
+                        .unwrap_or(true)
+                    && app.presence.state() == presence::PresenceState::HearingUser
+                {
                     if let Some(backchannel) = app.presence.backchannel() {
-                        voice::speak_quick_async(backchannel);
+                        app.last_backchannel_at = Some(std::time::Instant::now());
+                        if let Some(mic) = app.mic.as_ref() {
+                            mic.set_speaking(true);
+                        }
+                        let text = backchannel.to_string();
+                        cx.spawn(async move |this, cx| {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(1800))
+                                .await;
+                            let _ = this.update(cx, |app, _| {
+                                if let Some(mic) = app.mic.as_ref() {
+                                    mic.set_speaking(false);
+                                }
+                            });
+                        })
+                        .detach();
+                        voice::speak_quick_async(text);
                     }
                 }
                 if app.mic.is_some()
