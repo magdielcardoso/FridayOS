@@ -1,7 +1,9 @@
 //! Persistent, long-running "missions" (JARVIS-style objectives).
 //!
 //! A mission is created with [`mission_start`] with a goal and a completion
-//! condition. If a watcher source is supplied, a matching entry is installed in
+//! condition, or proactively from natural language with `mission_from_request`
+//! (deterministic PT/EN parser; `reason::mission_auto` is its dry preview).
+//! If a watcher source is supplied, a matching entry is installed in
 //! `watchers.json`; when that watcher fires, the app injects a prompt that tells
 //! the agent to record evidence with [`mission_update`] and to close the
 //! objective with [`mission_complete`] once the condition is satisfied.
@@ -91,6 +93,272 @@ fn write_json_atomic(path: &Path, value: &Value) -> Result<(), ToolError> {
         return Err(ToolError::failed(error.to_string()));
     }
     Ok(())
+}
+
+/// Contract embedded in every auto-created mission. The watcher prompt and the
+/// deterministic loop in `friday-app` both honor it.
+const HANDOFF_CONTRACT: &str = "A cada achado chame `mission_update` (text + state mesclados); \
+ se precisar do usuário use `needs_approval`: true; quando a condição for satisfeita \
+ chame `mission_complete` com um achado final — nunca deixe a missão ativa após a \
+ condição.";
+
+// ---------------------------------------------------------------------------
+// Deterministic intent parser (no network, no model call)
+// ---------------------------------------------------------------------------
+
+/// Accent folding, one input char to one output char, so byte indices in the
+/// folded string can be mapped back onto the original request.
+fn fold_char(ch: char) -> char {
+    match ch {
+        'á' | 'à' | 'â' | 'ã' | 'ä' | 'Á' | 'À' | 'Â' | 'Ã' | 'Ä' => 'a',
+        'é' | 'è' | 'ê' | 'ë' | 'É' | 'È' | 'Ê' | 'Ë' => 'e',
+        'í' | 'ì' | 'î' | 'ï' | 'Í' | 'Ì' | 'Î' | 'Ï' => 'i',
+        'ó' | 'ò' | 'ô' | 'õ' | 'ö' | 'Ó' | 'Ò' | 'Ô' | 'Õ' | 'Ö' => 'o',
+        'ú' | 'ù' | 'û' | 'ü' | 'Ú' | 'Ù' | 'Û' | 'Ü' => 'u',
+        'ç' | 'Ç' => 'c',
+        'ñ' | 'Ñ' => 'n',
+        other => other.to_ascii_lowercase(),
+    }
+}
+
+fn fold_request(raw: &str) -> (String, Vec<char>) {
+    let chars: Vec<char> = raw.chars().collect();
+    let folded: String = chars.iter().map(|ch| fold_char(*ch)).collect();
+    (folded, chars)
+}
+
+fn slice_chars(chars: &[char], from: usize, to: usize) -> String {
+    if from >= chars.len() {
+        return String::new();
+    }
+    chars[from..to.min(chars.len())].iter().collect()
+}
+
+fn cap_chars(text: String, max: usize) -> String {
+    text.chars().take(max).collect()
+}
+
+fn quoted_goal(raw: &str) -> Option<String> {
+    for (open, close) in [('"', '"'), ('\'', '\''), ('“', '”'), ('«', '»')] {
+        if let Some(start) = raw.find(open) {
+            let after = &raw[start + open.len_utf8()..];
+            if let Some(end) = after.find(close) {
+                let inside = after[..end].trim();
+                if !inside.is_empty() {
+                    return Some(inside.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Subject/goal: quoted text wins; otherwise the text after a watch trigger up
+/// to the first stop word; otherwise the whole request (bounded).
+fn extract_goal(raw: &str) -> String {
+    if let Some(goal) = quoted_goal(raw) {
+        return cap_chars(goal, 200);
+    }
+    let (folded, chars) = fold_request(raw);
+    let triggers = [
+        "acompanha", "acompanhe", "monitora", "monitore", "vigia", "vigie", "watch", "track",
+    ];
+    let mut from_char = 0usize;
+    for trigger in triggers {
+        if let Some(byte_end) = folded.find(trigger) {
+            from_char = folded[..byte_end].chars().count() + trigger.chars().count();
+            break;
+        }
+    }
+    let byte_from = folded
+        .char_indices()
+        .nth(from_char)
+        .map(|(index, _)| index)
+        .unwrap_or(folded.len());
+    let rest = &folded[byte_from..];
+    let mut end_bytes = rest.len();
+    for stop in [",", ".", ";", " se ", " quando ", " só "] {
+        if let Some(pos) = rest.find(stop) {
+            end_bytes = end_bytes.min(pos);
+        }
+    }
+    let to_char = from_char + rest[..end_bytes].chars().count();
+    let mut goal = slice_chars(&chars, from_char, to_char).trim().to_string();
+    for prefix in ["a ", "o ", "as ", "os ", "the ", "de ", "do ", "da "] {
+        if goal.to_lowercase().starts_with(prefix) && goal.len() > prefix.len() {
+            goal = goal[prefix.len()..].trim().to_string();
+            break;
+        }
+    }
+    if goal.is_empty() {
+        goal = raw.trim().to_string();
+    }
+    cap_chars(goal, 200)
+}
+
+fn extract_command(raw: &str) -> Option<String> {
+    if let Some(start) = raw.find('`') {
+        let after = &raw[start + 1..];
+        if let Some(end) = after.find('`') {
+            let command = after[..end].trim();
+            if !command.is_empty() {
+                return Some(command.to_string());
+            }
+        }
+    }
+    let lower = raw.to_lowercase();
+    for marker in ["comando:", "comando ", "rode ", "execute ", "run "] {
+        if let Some(pos) = lower.find(marker) {
+            let rest = &raw[pos + marker.len()..];
+            let command = rest
+                .split(|ch| ch == ',' || ch == '.' || ch == ';')
+                .next()
+                .unwrap_or("")
+                .trim();
+            if !command.is_empty() {
+                return Some(command.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn extract_url(raw: &str) -> Option<String> {
+    for scheme in ["https://", "http://"] {
+        if let Some(pos) = raw.find(scheme) {
+            let rest = &raw[pos..];
+            let end = rest
+                .find(|ch: char| ch.is_whitespace() || matches!(ch, ',' | '"' | '\'' | ')' | ';'))
+                .unwrap_or(rest.len());
+            let url = rest[..end].trim_end_matches(['.', ',', ';']).to_string();
+            if !url.is_empty() {
+                return Some(url);
+            }
+        }
+    }
+    None
+}
+
+/// Placeholder lives under the FridayOS data dir: it exists (missions create
+/// the dir) and is never a guessed destructive command.
+fn placeholder_path() -> String {
+    data_dir().to_string_lossy().into_owned()
+}
+
+/// Source + params. Unknown/uncertain requests fall back to a `file` watcher
+/// pointing at the data dir rather than guessing a shell command.
+fn detect_source(raw: &str, folded: &str) -> (String, Value) {
+    let has = |words: &[&str]| words.iter().any(|word| folded.contains(*word));
+
+    if has(&["build", "ci", "compilacao", "pipeline"]) {
+        let command = extract_command(raw)
+            .unwrap_or_else(|| "echo \"Monitorando build — configure o comando real\"".to_string());
+        return ("shell".into(), json!({ "command": command }));
+    }
+    if has(&["http://", "https://", "url", "site", "pagina", "web"]) {
+        let url = extract_url(raw).unwrap_or_else(|| "https://example.com/status".into());
+        return ("url".into(), json!({ "url": url }));
+    }
+    if has(&["arquivo", "log", "pasta", "file", "diretorio"]) {
+        return ("file".into(), json!({ "path": placeholder_path() }));
+    }
+    if has(&["clipboard", "area de transferencia", "transferencia"]) {
+        return ("clipboard".into(), json!({}));
+    }
+    if has(&["imessage", "mensagem", "sms"]) {
+        return ("imessage".into(), json!({}));
+    }
+    if has(&["mail", "e-mail", "email", "correio"]) {
+        return ("mail".into(), json!({}));
+    }
+    ("file".into(), json!({ "path": placeholder_path() }))
+}
+
+/// Condition kind plus a human string that carries the same keywords so the
+/// app-side loop can classify it deterministically from the mission JSON.
+fn detect_condition(folded: &str) -> (&'static str, String) {
+    let failure = [
+        "se quebrar", "se falhar", "se der erro", "if fail", "if broken", "quebrar", "falhar",
+        "erro", "failure", "broken", "failed",
+    ];
+    if failure.iter().any(|key| folded.contains(*key)) {
+        return (
+            "failure",
+            "Failure / falha: apurar a causa quando a build quebrar ou falhar e pedir a decisão \
+             do usuário se necessário (failure, quebrar, falhar, erro)."
+                .into(),
+        );
+    }
+    let success = [
+        "se passar", "se ficar verde", "if green", "if success", "passou", "sucesso", "green",
+        "passed", "succeeded", "success",
+    ];
+    if success.iter().any(|key| folded.contains(*key)) {
+        return (
+            "success",
+            "Success / sucesso: concluir quando passar, ficar verde ou sinalizar sucesso \
+             (success, passou, green, passed)."
+                .into(),
+        );
+    }
+    (
+        "change",
+        "Change / mudança: acompanhar e registrar alterações relevantes até atingir o objetivo \
+         (change, mudar, alterar)."
+            .into(),
+    )
+}
+
+fn detect_silence(folded: &str) -> bool {
+    [
+        "so me chama se precisar de mim",
+        "so me chame se precisar de mim",
+        "so me chamar se precisar",
+        "me chama so se precisar",
+        "me chame so se precisar",
+        "so me chama se precisar",
+        "so me chama quando precisar",
+        "only call me if needed",
+        "only call me if you need me",
+        "call me only if needed",
+    ]
+    .iter()
+    .any(|phrase| folded.contains(*phrase))
+}
+
+fn derive_name(goal: &str, source: &str) -> String {
+    let name = goal.split_whitespace().take(3).collect::<Vec<_>>().join(" ");
+    let name = if name.is_empty() {
+        format!("missao {source}")
+    } else {
+        name
+    };
+    cap_chars(name, 40)
+}
+
+/// Public deterministic parser shared by `mission_from_request` (creates) and
+/// `mission_auto` in `reason.rs` (dry preview). Pure: touches no files.
+pub fn parse_mission_request(request: &str) -> Value {
+    let raw = request.trim();
+    let (folded, _) = fold_request(raw);
+    let goal = extract_goal(raw);
+    let (source, params) = detect_source(raw, &folded);
+    let (condition_kind, condition) = detect_condition(&folded);
+    let silent_until_approval = detect_silence(&folded);
+    let name = derive_name(&goal, &source);
+    json!({
+        "request": raw,
+        "name": name,
+        "goal": goal,
+        "condition_kind": condition_kind,
+        "condition": condition,
+        "source": source,
+        "params": params,
+        "silent_until_approval": silent_until_approval,
+        "interval_secs": 60,
+        "budget_minutes": 30,
+        "handoff_contract": HANDOFF_CONTRACT,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -368,6 +636,7 @@ impl Tool for MissionTool {
     fn call(&self, args: &Value, ctx: &ToolCtx) -> ToolResult {
         match self.spec.name {
             "mission_start" => mission_start(args, ctx),
+            "mission_from_request" => mission_from_request(args, ctx),
             "mission_update" => mission_update(args, ctx),
             "mission_query" => mission_query(args),
             "mission_complete" => mission_complete(args, ctx),
@@ -402,6 +671,22 @@ pub fn register(registry: &mut Registry) {
                 "interval_secs": { "type": "integer", "minimum": 15, "default": 60 },
                 "assistant": { "type": "string", "description": "Nome de um assistente permanente para delegar investigações." },
                 "run_id": { "type": "string", "description": "Id de uma execução (run) cujos artefatos recebem achados e verificação desta missão." }
+            }
+        }),
+    ));
+    registry.add(tool(
+        "mission_from_request",
+        "Cria uma missão de forma proativa a partir de um pedido em linguagem natural (PT/EN): interpreta objetivo, fonte, condição, silêncio e orçamento sem chamar modelo ou rede, e instala o watcher.",
+        Risk::Reversible,
+        json!({
+            "type": "object",
+            "required": ["request"],
+            "additionalProperties": false,
+            "properties": {
+                "request": { "type": "string", "description": "Pedido do usuário, ex.: 'acompanha a build do StackWoot. Se quebrar, descobre por quê. Só me chama se precisar de mim.'" },
+                "silent_until_approval": { "type": "boolean", "default": true, "description": "Não incomodar até que a missão precise de uma decisão do usuário." },
+                "interval_secs": { "type": "integer", "minimum": 15, "description": "Intervalo do watcher em segundos (padrão 60)." },
+                "budget_minutes": { "type": "integer", "minimum": 0, "description": "Orçamento de tempo antes de pedir aprovação (padrão 30)." }
             }
         }),
     ));
@@ -478,6 +763,11 @@ pub fn register(registry: &mut Registry) {
 // ---------------------------------------------------------------------------
 
 fn mission_start(args: &Value, ctx: &ToolCtx) -> ToolResult {
+    create_mission(args, ctx)
+}
+
+/// Shared creation path used by `mission_start` and `mission_from_request`.
+fn create_mission(args: &Value, ctx: &ToolCtx) -> ToolResult {
     let name = arg(args, "name").ok_or_else(|| ToolError::invalid("informe `name`"))?;
     let goal = arg(args, "goal").ok_or_else(|| ToolError::invalid("informe `goal`"))?;
     let condition = arg(args, "condition").ok_or_else(|| ToolError::invalid("informe `condition`"))?;
@@ -578,6 +868,88 @@ fn mission_start(args: &Value, ctx: &ToolCtx) -> ToolResult {
         result["warning"] = json!(warning);
     }
     Ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// mission_from_request
+// ---------------------------------------------------------------------------
+
+fn mission_from_request(args: &Value, ctx: &ToolCtx) -> ToolResult {
+    let request = arg(args, "request").ok_or_else(|| ToolError::invalid("informe `request`"))?;
+    let mut parsed = parse_mission_request(request);
+
+    // Explicit args win; documented default for silence is true.
+    parsed["silent_until_approval"] = json!(
+        args.get("silent_until_approval")
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+    );
+    if let Some(value) = args.get("interval_secs").and_then(Value::as_u64) {
+        parsed["interval_secs"] = json!(value.max(15));
+    }
+    if let Some(value) = args.get("budget_minutes").and_then(Value::as_u64) {
+        parsed["budget_minutes"] = json!(value);
+    }
+
+    let goal = field(&parsed, "goal").unwrap_or("").to_string();
+    let condition = field(&parsed, "condition").unwrap_or("change").to_string();
+    let condition_kind = field(&parsed, "condition_kind").unwrap_or("change").to_string();
+    let source = field(&parsed, "source").unwrap_or("file").to_string();
+    let name = field(&parsed, "name").unwrap_or("missao").to_string();
+    let params = parsed.get("params").cloned().unwrap_or_else(|| json!({}));
+    let interval_secs = parsed.get("interval_secs").and_then(Value::as_u64).unwrap_or(60);
+    let silent_until_approval = parsed
+        .get("silent_until_approval")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let budget_minutes = parsed.get("budget_minutes").and_then(Value::as_u64).unwrap_or(30);
+
+    let create_args = json!({
+        "name": name,
+        "goal": goal,
+        "condition": condition,
+        "source": source,
+        "params": params,
+        "interval_secs": interval_secs,
+    });
+    let created = create_mission(&create_args, ctx)?;
+    let mission_id = field(&created, "id")
+        .or_else(|| field(&created, "would_create"))
+        .unwrap_or("?")
+        .to_string();
+
+    // Embed the parsed contract so the app-side watcher loop can close the
+    // mission deterministically without a model round-trip.
+    if !ctx.dry_run {
+        let path = dir().join(format!("{mission_id}.json"));
+        if let Ok(raw) = fs::read_to_string(&path) {
+            if let Ok(mut mission) = serde_json::from_str::<Value>(&raw) {
+                mission["condition_kind"] = json!(condition_kind.clone());
+                mission["silent_until_approval"] = json!(silent_until_approval);
+                mission["budget_minutes"] = json!(budget_minutes);
+                mission["handoff_contract"] = json!(HANDOFF_CONTRACT);
+                mission["request"] = json!(request);
+                mission["updated_at"] = json!(now_secs());
+                let _ = write_json_atomic(&path, &mission);
+            }
+        }
+    }
+
+    Ok(json!({
+        "ok": true,
+        "mission_id": mission_id,
+        "goal": goal,
+        "condition": condition,
+        "condition_kind": condition_kind,
+        "source": source,
+        "watcher": format!("mission:{mission_id}"),
+        "silent_until_approval": silent_until_approval,
+        "budget_minutes": budget_minutes,
+        "interval_secs": interval_secs,
+        "params": params,
+        "handoff_contract": HANDOFF_CONTRACT,
+        "dry_run": ctx.dry_run,
+    }))
 }
 
 // ---------------------------------------------------------------------------

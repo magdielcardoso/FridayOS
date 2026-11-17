@@ -636,6 +636,256 @@ fn read_composite(
     Ok((signature(&combined_sig), detail, sigs))
 }
 
+// ---------------------------------------------------------------------------
+// Mission watcher loop: deterministic, file-backed, no model/network call.
+// A `mission:<id>` watcher closes its own loop instead of waiting for the agent
+// to remember the handoff prompt.
+// ---------------------------------------------------------------------------
+
+/// What the generic watcher code should do after a mission event was probed.
+enum MissionOutcome {
+    /// No mission rule applied: keep the normal watcher prompt/trigger.
+    NotHandled,
+    /// Mission state was updated and a tailored trigger was already pushed.
+    Handled,
+    /// Mission was completed: drop the watcher entry.
+    Completed,
+}
+
+fn fold_text(text: &str) -> String {
+    text.chars()
+        .map(|ch| match ch {
+            'á' | 'à' | 'â' | 'ã' | 'ä' | 'Á' | 'À' | 'Â' | 'Ã' | 'Ä' => 'a',
+            'é' | 'è' | 'ê' | 'ë' | 'É' | 'È' | 'Ê' | 'Ë' => 'e',
+            'í' | 'ì' | 'î' | 'ï' | 'Í' | 'Ì' | 'Î' | 'Ï' => 'i',
+            'ó' | 'ò' | 'ô' | 'õ' | 'ö' | 'Ó' | 'Ò' | 'Ô' | 'Õ' | 'Ö' => 'o',
+            'ú' | 'ù' | 'û' | 'ü' | 'Ú' | 'Ù' | 'Û' | 'Ü' => 'u',
+            'ç' | 'Ç' => 'c',
+            other => other.to_ascii_lowercase(),
+        })
+        .collect()
+}
+
+fn contains_word(norm: &str, word: &str) -> bool {
+    norm.split(|ch: char| !ch.is_alphanumeric())
+        .any(|token| token == word)
+}
+
+/// Numeric exit code after any common "exit code/status" spelling, if present.
+fn exit_code_value(norm: &str) -> Option<u32> {
+    for marker in ["exit code", "exit status", "codigo de saida", "status de saida"] {
+        let mut rest = norm;
+        while let Some(pos) = rest.find(marker) {
+            let after = &rest[pos + marker.len()..];
+            let digits: String = after
+                .chars()
+                .skip_while(|ch| ch.is_whitespace() || matches!(ch, ':' | '=' | '-'))
+                .take_while(|ch| ch.is_ascii_digit())
+                .collect();
+            if let Ok(code) = digits.parse::<u32>() {
+                return Some(code);
+            }
+            let advance = pos + marker.len();
+            if advance >= rest.len() {
+                break;
+            }
+            rest = &rest[advance..];
+        }
+    }
+    None
+}
+
+fn detail_has_failure(norm: &str) -> bool {
+    let words = [
+        "erro", "erros", "error", "errors", "falhou", "falha", "failed", "failure", "broken",
+        "quebrou", "parou", "down", "caiu",
+    ];
+    if words.iter().any(|word| contains_word(norm, word)) {
+        return true;
+    }
+    exit_code_value(norm).map(|code| code >= 1).unwrap_or(false)
+}
+
+fn detail_has_success(norm: &str) -> bool {
+    let words = [
+        "passou", "pass", "sucesso", "success", "ok", "green", "verde", "passed", "succeeded",
+    ];
+    if words.iter().any(|word| contains_word(norm, word)) {
+        return true;
+    }
+    exit_code_value(norm).map(|code| code == 0).unwrap_or(false)
+}
+
+fn detail_chars(detail: &str, max: usize) -> String {
+    detail.trim().chars().take(max).collect()
+}
+
+fn mission_path(id: &str) -> PathBuf {
+    data_dir().join("missions").join(format!("{id}.json"))
+}
+
+fn load_mission_json(id: &str) -> Option<Value> {
+    let value = read_json(mission_path(id), Value::Null);
+    value.is_object().then_some(value)
+}
+
+fn save_mission_json(id: &str, mission: &Value) {
+    write_json(mission_path(id), mission);
+}
+
+fn append_mission_finding(mission: &mut Value, text: &str) {
+    let finding = json!({ "ts": now_secs(), "text": text });
+    match mission.get_mut("findings").and_then(Value::as_array_mut) {
+        Some(findings) => findings.push(finding),
+        None => mission["findings"] = json!([finding]),
+    }
+}
+
+fn mission_last_finding(mission: &Value) -> &str {
+    mission
+        .get("findings")
+        .and_then(Value::as_array)
+        .and_then(|findings| findings.last())
+        .and_then(|finding| finding.get("text").and_then(Value::as_str))
+        .unwrap_or("")
+}
+
+fn mission_condition_kind<'a>(mission: &'a Value) -> &'a str {
+    if let Some(kind) = mission.get("condition_kind").and_then(Value::as_str) {
+        match kind {
+            "failure" | "success" | "change" => return kind,
+            _ => {}
+        }
+    }
+    let condition = fold_text(mission.get("condition").and_then(Value::as_str).unwrap_or(""));
+    if ["failure", "quebr", "falh", "erro"].iter().any(|key| condition.contains(key)) {
+        "failure"
+    } else if ["success", "pass", "verde", "green", "sucesso"]
+        .iter()
+        .any(|key| condition.contains(key))
+    {
+        "success"
+    } else {
+        "change"
+    }
+}
+
+/// Applies failure/success/budget rules for a due `mission:<id>` watcher.
+/// `first` guards against completing a success-condition mission on its very
+/// first baseline observation.
+fn close_mission_loop(
+    name: &str,
+    detail: &str,
+    now: u64,
+    fire: bool,
+    first: bool,
+    push: &Arc<dyn Fn(Trigger) + Send + Sync>,
+) -> MissionOutcome {
+    let Some(id) = name.strip_prefix("mission:") else {
+        return MissionOutcome::NotHandled;
+    };
+    if id.is_empty() {
+        return MissionOutcome::NotHandled;
+    }
+    let Some(mut mission) = load_mission_json(id) else {
+        return MissionOutcome::NotHandled;
+    };
+    let status = mission
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("active")
+        .to_string();
+    if status == "completed" || status == "cancelled" {
+        return MissionOutcome::NotHandled;
+    }
+    let silent = mission
+        .get("silent_until_approval")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let norm = fold_text(detail);
+
+    // Budget: checked on every due tick, but recorded at most once (the prior
+    // "Orçamento" finding is the idempotency guard).
+    let budget = mission.get("budget_minutes").and_then(Value::as_u64).unwrap_or(0);
+    let created = mission.get("created_at").and_then(Value::as_u64).unwrap_or(0);
+    if budget > 0 && created > 0 && now.saturating_sub(created) >= budget.saturating_mul(60) {
+        let previous = mission_last_finding(&mission);
+        if !previous.contains("Orçamento") && !previous.contains("Orcamento") {
+            let text = format!(
+                "Orçamento de {} min esgotado sem desfecho: {}",
+                budget,
+                detail_chars(detail, 300)
+            );
+            append_mission_finding(&mut mission, &text);
+            mission["status"] = json!("waiting_approval");
+            mission["needs_approval"] = json!(true);
+            mission["updated_at"] = json!(now);
+            save_mission_json(id, &mission);
+            push(Trigger {
+                source: format!("mission:{id}"),
+                prompt: format!(
+                    "[missão:{id}] {text} Descubra o que faltou e, se precisar de uma decisão \
+                     do usuário, pergunte em voz alta (sim/não). Não reinicie nem mate processos."
+                ),
+            });
+            return MissionOutcome::Handled;
+        }
+    }
+
+    if !fire {
+        return MissionOutcome::NotHandled;
+    }
+
+    match mission_condition_kind(&mission) {
+        "failure" if detail_has_failure(&norm) => {
+            let text = format!(
+                "Falha detectada pelo watcher `{name}`: {}",
+                detail_chars(detail, 400)
+            );
+            let previous = mission_last_finding(&mission);
+            if !previous.contains(&detail_chars(detail, 120)) {
+                append_mission_finding(&mut mission, &text);
+            }
+            mission["status"] = json!("waiting_approval");
+            mission["needs_approval"] = json!(true);
+            mission["updated_at"] = json!(now);
+            save_mission_json(id, &mission);
+            // Silence holds routine chatter; a failure needs a decision, so ask.
+            if !silent
+                || mission
+                    .get("needs_approval")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            {
+                push(Trigger {
+                    source: format!("mission:{id}"),
+                    prompt: format!(
+                        "[missão:{id}] A condição falhou. Descubra por quê com as ferramentas \
+                         locais e os achados registrados. Se precisar de uma decisão do usuário, \
+                         pergunte em voz alta (sim/não). Detalhe: {}",
+                        detail_chars(detail, 600)
+                    ),
+                });
+            }
+            MissionOutcome::Handled
+        }
+        "success" if !first && detail_has_success(&norm) => {
+            let text = format!(
+                "Condição de sucesso satisfeita em `{name}`: {}",
+                detail_chars(detail, 400)
+            );
+            append_mission_finding(&mut mission, &text);
+            mission["status"] = json!("completed");
+            mission["needs_approval"] = json!(false);
+            mission["completed_at"] = json!(now);
+            mission["updated_at"] = json!(now);
+            save_mission_json(id, &mission);
+            MissionOutcome::Completed
+        }
+        _ => MissionOutcome::NotHandled,
+    }
+}
+
 fn run_due_watchers(push: &Arc<dyn Fn(Trigger) + Send + Sync>) {
     let path = data_dir().join("watchers.json");
     let data = read_json(path.clone(), json!([]));
@@ -648,6 +898,8 @@ fn run_due_watchers(push: &Arc<dyn Fn(Trigger) + Send + Sync>) {
     let now = now_secs();
     let mut updated: Vec<Value> = Vec::new();
     let mut changed = false;
+    // Missions completed on this tick remove their watcher (see merge below).
+    let mut remove_names: Vec<String> = Vec::new();
     // Shared across the whole tick: never more than 4 composite child probes.
     let mut composite_budget = 4usize;
 
@@ -771,17 +1023,36 @@ fn run_due_watchers(push: &Arc<dyn Fn(Trigger) + Send + Sync>) {
                 }
                 fire = fire && contains_ok;
 
+                // Mission watchers close their own loop. Budget can fire on any
+                // due tick; failure/success only on a genuine event.
+                let mut mission_outcome = MissionOutcome::NotHandled;
+                if name.starts_with("mission:") {
+                    mission_outcome = close_mission_loop(&name, &detail, now, fire, first, push);
+                }
+
                 if fire {
-                    let prompt = watcher.get("prompt").and_then(|value| value.as_str()).unwrap_or("");
-                    // `source` is the "name" the app uses to route the trigger;
-                    // mission watchers already carry `watcher:mission:<id>`.
-                    push(Trigger {
-                        source: format!("watcher:{name}"),
-                        prompt: format!(
-                            "{prompt}\n\nMudança detectada em `{name}` ({source}):\n{}",
-                            detail.chars().take(1500).collect::<String>()
-                        ),
-                    });
+                    match mission_outcome {
+                        MissionOutcome::Completed => {
+                            // Success closed the mission: drop the watcher even
+                            // though merge-on-write would otherwise restore it.
+                            remove_names.push(name.clone());
+                        }
+                        MissionOutcome::Handled => {
+                            // Tailored trigger already pushed by the loop.
+                        }
+                        MissionOutcome::NotHandled => {
+                            let prompt = watcher.get("prompt").and_then(|value| value.as_str()).unwrap_or("");
+                            // `source` is the "name" the app uses to route the trigger;
+                            // mission watchers already carry `watcher:mission:<id>`.
+                            push(Trigger {
+                                source: format!("watcher:{name}"),
+                                prompt: format!(
+                                    "{prompt}\n\nMudança detectada em `{name}` ({source}):\n{}",
+                                    detail.chars().take(1500).collect::<String>()
+                                ),
+                            });
+                        }
+                    }
                     watcher["fired_sig"] = json!(sig);
                     watcher["last_fire_ts"] = json!(now);
                     if flap_n.is_some() {
@@ -813,7 +1084,7 @@ fn run_due_watchers(push: &Arc<dyn Fn(Trigger) + Send + Sync>) {
             })
             .collect();
         let current = read_json(path.clone(), json!([]));
-        let merged: Vec<Value> = current
+        let mut merged: Vec<Value> = current
             .as_array()
             .map(|items| {
                 items
@@ -825,6 +1096,12 @@ fn run_due_watchers(push: &Arc<dyn Fn(Trigger) + Send + Sync>) {
                     .collect()
             })
             .unwrap_or_default();
+        if !remove_names.is_empty() {
+            merged.retain(|item| {
+                let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+                !remove_names.iter().any(|removed| removed.as_str() == name)
+            });
+        }
         write_json(path, &Value::Array(merged));
     }
 }
@@ -891,7 +1168,7 @@ fn mobile_port() -> u16 {
     std::env::var("FRIDAY_MOBILE_PORT")
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(3000)
+        .unwrap_or(9999)
 }
 
 fn log_autoheal(message: &str) {
@@ -977,7 +1254,7 @@ fn run_self_heal(push: &Arc<dyn Fn(Trigger) + Send + Sync>) {
         ));
     }
 
-    // 2. Local port (3000 by default) answering — no subprocess needed.
+    // 2. Local PWA port (9999 by default) answering — no subprocess needed.
     let port = mobile_port();
     let address: Option<SocketAddr> = format!("127.0.0.1:{port}").parse().ok();
     let port_ok = address

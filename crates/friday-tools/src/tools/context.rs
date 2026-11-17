@@ -16,7 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
-use crate::policy::Risk;
+use crate::policy::{self, Risk};
 use crate::registry::{Registry, Tool, ToolCtx, ToolError, ToolResult, ToolSpec};
 
 /// Behaviour modes Friday can be in.
@@ -90,6 +90,83 @@ fn write_context_facts(active_app: &str, mode: &str, clipboard_text: &str) {
     }
     let preview: String = clipboard_text.chars().take(CONTEXT_PREVIEW_CHARS).collect();
     let _ = atomic_write(&dir.join("clipboard-preview.txt"), preview.as_bytes());
+}
+
+/// Coarse, dependency-free category for the frontmost app. Derived from the
+/// observed name only (no extra subprocess, no Spotlight query) so it stays
+/// well inside the snapshot's time budget.
+fn categorize_app(name: &str) -> &'static str {
+    let lower = name.to_lowercase();
+    if ["safari", "chrome", "firefox", "arc", "edge", "brave", "opera"]
+        .iter()
+        .any(|key| lower.contains(key))
+    {
+        "browser"
+    } else if ["code", "xcode", "terminal", "iterm", "idea", "vim", "emacs", "sublime", "zed"]
+        .iter()
+        .any(|key| lower.contains(key))
+    {
+        "development"
+    } else if ["slack", "messages", "whatsapp", "teams", "mail", "discord", "telegram", "signal"]
+        .iter()
+        .any(|key| lower.contains(key))
+    {
+        "communication"
+    } else if ["notes", "obsidian", "notion", "word", "pages", "evernote", "bear"]
+        .iter()
+        .any(|key| lower.contains(key))
+    {
+        "productivity"
+    } else if ["music", "spotify", "tv", "quicktime", "vlc", "podcast"]
+        .iter()
+        .any(|key| lower.contains(key))
+    {
+        "media"
+    } else if ["finder", "system settings", "activity monitor", "preview"]
+        .iter()
+        .any(|key| lower.contains(key))
+    {
+        "system"
+    } else {
+        "other"
+    }
+}
+
+/// Mirrors the clipboard watcher's redaction: never surface content that looks
+/// like a password, token or key. The result is a short, safe preview.
+fn redact_clipboard(text: &str) -> String {
+    const MARKERS: [&str; 11] = [
+        "password", "senha", "secret", "token", "api_key", "apikey", "api-key",
+        "private key", "begin rsa", "begin private", "credential",
+    ];
+    let lower = text.to_lowercase();
+    if MARKERS.iter().any(|marker| lower.contains(marker)) {
+        return "[redacted]".to_string();
+    }
+    text.to_string()
+}
+
+/// Number of missions that are still open (`active`, `waiting_approval` or
+/// `blocked`). Completed/cancelled missions are excluded. Plain JSON files,
+/// no subprocess, no network.
+fn active_mission_count() -> usize {
+    let dir = friday_data_dir().join("missions");
+    let mut count = 0usize;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(raw) = std::fs::read_to_string(&path) else { continue };
+            let Ok(value) = serde_json::from_str::<Value>(&raw) else { continue };
+            let status = value.get("status").and_then(Value::as_str).unwrap_or("active");
+            if matches!(status, "active" | "waiting_approval" | "blocked") {
+                count += 1;
+            }
+        }
+    }
+    count
 }
 
 // ---------------------------------------------------------------------------
@@ -253,37 +330,64 @@ fn context_snapshot(ctx: &ToolCtx) -> ToolResult {
         }));
     }
 
+    // The snapshot builder also persists `context-snapshot.json` and
+    // `clipboard-preview.txt`, exactly as this tool did before the refactor.
+    Ok(snapshot_now())
+}
+
+/// Collects a compact, best-effort picture of the current situation without a
+/// [`ToolCtx`], so the reasoning loop can call it directly during a turn.
+///
+/// This is the same snapshot the `context_snapshot` tool returns (including
+/// the two fact files it persists). Every probe is time-boxed and shares a
+/// ~2 s budget; a slow or TCC-blocked source degrades to an empty value plus
+/// a note. Nothing is logged and no network is touched. The clipboard is only
+/// ever exposed as a short, redacted preview.
+pub fn snapshot_now() -> Value {
     let deadline = Instant::now() + SNAPSHOT_BUDGET;
     let mut notes: Vec<String> = Vec::new();
 
     let (active_app, window_title) = frontmost_app(&deadline, &mut notes);
-    let (clipboard_text, clipboard_truncated) = clipboard_text(&deadline, &mut notes);
+    let category = categorize_app(&active_app);
+    let (clip_text, clip_truncated) = clipboard_text(&deadline, &mut notes);
     let (events, calendar_note) = today_events(&deadline, &mut notes);
     let (captured_at, epoch) = local_now(&deadline, &mut notes);
     let mode = current_mode();
+    let autonomy = policy::current_level().label().to_string();
+    let active_missions = active_mission_count();
+    let native_events = crate::watcher_events::native_event_summary();
 
-    // Em dry_run a função já retornou no início; nunca gravamos nesse caso.
-    if !ctx.dry_run {
-        write_context_facts(&active_app, &mode, &clipboard_text);
-    }
+    // Persist the minimal facts the local decision engine reads. The on-disk
+    // preview stays a short clipboard excerpt, as before; nothing is logged.
+    write_context_facts(&active_app, &mode, &clip_text);
 
-    Ok(json!({
+    // Only a redacted, bounded preview ever leaves this function.
+    let (preview, preview_truncated) =
+        truncate_chars(&redact_clipboard(&clip_text), CLIPBOARD_CHARS);
+
+    json!({
         "ok": true,
-        "captured_at": captured_at,
+        "ts": epoch,
         "epoch": epoch,
+        "captured_at": captured_at,
         "active_app": active_app,
+        "active_app_category": category,
         "window_title": window_title,
         "clipboard": {
-            "text": clipboard_text,
-            "truncated": clipboard_truncated,
+            "text": preview,
+            "truncated": preview_truncated || clip_truncated,
         },
         "calendar": {
             "events": events,
             "note": calendar_note,
         },
+        "mode": mode,
         "friday_mode": mode,
+        "autonomy": autonomy,
+        "active_missions": active_missions,
+        "native_events": native_events,
         "notes": notes,
-    }))
+    })
 }
 
 /// Runs a short subprocess. Never waits longer than `cap` or the shared

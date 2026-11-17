@@ -305,6 +305,31 @@ pub fn load_run(id: &str) -> Option<RunArtifact> {
     dir.is_dir().then(|| RunArtifact { id: id.to_string(), dir })
 }
 
+/// Keep only the last `max` characters (on a char boundary) of `text`.
+fn tail_chars(text: &str, max: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max {
+        return text.to_string();
+    }
+    chars[chars.len() - max..].iter().collect()
+}
+
+/// Append the main Friday's consolidated synthesis to a run's `synthesis.md`.
+///
+/// The file is bounded to the last 4000 characters and written atomically, so a
+/// partially written synthesis is never observed.
+pub fn append_synthesis(id: &str, text: &str) -> Result<(), String> {
+    let run = load_run(id).ok_or_else(|| "execução não encontrada".to_string())?;
+    let path = run.dir.join("synthesis.md");
+    let mut content = fs::read_to_string(&path).unwrap_or_default();
+    if !content.trim().is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str(text);
+    let capped = tail_chars(&content, 4000);
+    atomic_write(&path, capped.as_bytes())
+}
+
 /// Latest verification `(status, note)` for a run, when available.
 pub fn verification_status(id: &str) -> Option<(String, String)> {
     let run = load_run(id)?;
@@ -353,6 +378,60 @@ pub fn list_runs(limit: usize) -> Vec<Value> {
                 "verification": verification.get("status").and_then(Value::as_str).unwrap_or("unknown"),
                 "note": verification.get("note").and_then(Value::as_str).unwrap_or(""),
                 "findings": findings,
+            }));
+        }
+    }
+    runs.sort_by(|a, b| {
+        let a_id = a.get("id").and_then(Value::as_str).unwrap_or("");
+        let b_id = b.get("id").and_then(Value::as_str).unwrap_or("");
+        b_id.cmp(a_id)
+    });
+    runs.truncate(limit);
+    runs
+}
+
+/// Newest-first, bounded overview of runs for the orchestrator review.
+///
+/// Each entry is `{id, verification, note, findings_count, tools_count}`.
+/// Missing/corrupt files degrade to empty counts and `unknown` verification.
+pub fn run_summary(limit: usize) -> Vec<Value> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut runs: Vec<Value> = Vec::new();
+    if let Ok(entries) = fs::read_dir(runs_dir()) {
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let id = dir.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+            if id.is_empty() || !safe_id(&id) {
+                continue;
+            }
+            let verification = fs::read_to_string(dir.join("verification.json"))
+                .ok()
+                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                .unwrap_or_else(|| json!({ "status": "unknown", "note": "" }));
+            let findings_count = fs::read_to_string(dir.join("findings.jsonl"))
+                .map(|raw| raw.lines().filter(|line| !line.trim().is_empty()).count())
+                .unwrap_or(0);
+            let tools_count = fs::read_dir(dir.join("tool-results"))
+                .ok()
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|entry| {
+                    let path = entry.path();
+                    path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("json")
+                })
+                .count();
+            runs.push(json!({
+                "id": id,
+                "verification": verification.get("status").and_then(Value::as_str).unwrap_or("unknown"),
+                "note": verification.get("note").and_then(Value::as_str).unwrap_or(""),
+                "findings_count": findings_count,
+                "tools_count": tools_count,
             }));
         }
     }

@@ -18,6 +18,7 @@ use serde_json::json;
 
 mod automation;
 mod mobile;
+mod power_hud;
 mod presence;
 mod approval_queue;
 mod decision_panel;
@@ -575,6 +576,9 @@ impl FridayApp {
         app.connect(cx);
         // Voice-first: open the microphone as soon as the HUD is up.
         app.start_listen(cx);
+        {
+            let _ = friday_tools::watcher_events::start_native_sources();
+        }
         if friday_tools::decision::has_token() {
             log("sistema de decisão: chave Jev carregada · decisões via TypeSafe");
         }
@@ -1193,6 +1197,30 @@ impl FridayApp {
                 if app.tick % 100 == 0 {
                     std::thread::spawn(voice::prune_utterances);
                 }
+                if app.tick % 11 == 0 {
+                    for event in friday_tools::watcher_events::take_native_events(8) {
+                        let source = event
+                            .get("event")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("change");
+                        let text = event.to_string();
+                        let fact = friday_tools::decision::facts_from_context(
+                            &format!("native:{source}"),
+                            &text,
+                        );
+                        let now_secs = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let result = app.decision_engine.evaluate(&fact, now_secs);
+                        app.route_trigger(
+                            format!("native:{source}"),
+                            text,
+                            result.decision,
+                            cx,
+                        );
+                    }
+                }
                 let mode = app.presence.mode().to_string();
                 // `app.level` comes from the MICROPHONE. `voice::speech_level()`
                 // is the amplitude of OUR OWN synthesized voice; using it here
@@ -1718,6 +1746,30 @@ impl FridayApp {
                     Status::Online
                 };
                 self.last_activity = std::time::Instant::now();
+                {
+                    let registry = friday_tools::Registry::with_defaults();
+                    let tool_ctx = friday_tools::ToolCtx::new(friday_tools::AuditLog::discover());
+                    if let Ok(value) = registry.call(
+                        "orchestrator_review",
+                        &serde_json::json!({ "limit": 10 }),
+                        &tool_ctx,
+                    ) {
+                        let needs = value
+                            .get("needs_attention")
+                            .and_then(|items| items.as_array())
+                            .map(|items| items.len())
+                            .unwrap_or(0);
+                        if needs > 0 {
+                            self.push_activity(
+                                format!("orquestração · {needs} ponto(s) de atenção"),
+                                StepState::Completed,
+                            );
+                            if let Some(summary) = value.get("synthesis").and_then(|v| v.as_str()) {
+                                self.last_answer = summary.to_string();
+                            }
+                        }
+                    }
+                }
                 self.dispatch_pending(cx);
                 self.scroll.scroll_to_bottom();
                 if status == "interrupted" {
@@ -2050,6 +2102,7 @@ impl FridayApp {
 
     fn submit(&mut self, cx: &mut Context<Self>) {
         let text = self.input.trim().to_string();
+        let _ = friday_tools::tools::self_knowledge::learn_from_text(&text);
         if let Some(name) = self.assistant_selected.clone() {
             if text.is_empty() {
                 self.assistant_selected = None;
@@ -3205,6 +3258,15 @@ impl Render for FridayApp {
                             .text_color(rgb(0x85848c))
                             .child(SharedString::from(state_sub)),
                     )
+                    // Power HUD: one fixed red line, no colour changes and no blinking.
+                    .child({
+                        let power = power_hud::snapshot();
+                        div()
+                            .font_family("SF Mono")
+                            .text_size(sx(10.0))
+                            .text_color(rgb(power_hud::ACCENT))
+                            .child(SharedString::from(power.status_line))
+                    })
                     .when(busy && !steps.is_empty(), |panel| {
                         let blink = self.blink;
                         let mut list = div()
@@ -4867,7 +4929,7 @@ fn main() {
     let mobile_port = std::env::var("FRIDAY_MOBILE_PORT")
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(3000);
+        .unwrap_or(9999);
     match mobile::start(mobile_port) {
         Some(code) => log(format!(
             "mobile: servidor em http://127.0.0.1:{mobile_port} · código {code}"

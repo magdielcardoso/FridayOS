@@ -16,13 +16,13 @@
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 struct Proc {
     child: Child,
@@ -38,6 +38,36 @@ static EVENT_RX: Mutex<Option<Receiver<Value>>> = Mutex::new(None);
 /// waits for the status reply) are queued here and returned first by the next
 /// [`next_event`] call, so no event is lost.
 static PENDING: Mutex<VecDeque<Value>> = Mutex::new(VecDeque::new());
+
+/// Bounded memory of recently observed native events. This is populated by the
+/// stdout reader thread (see `ensure_proc`), so it reflects activity even when
+/// nobody drains the event channel. It never grows past [`RING_CAP`].
+static NATIVE_RING: Mutex<VecDeque<Value>> = Mutex::new(VecDeque::new());
+const RING_CAP: usize = 50;
+/// Event kinds forwarded to live reasoning. Protocol chatter (`status`,
+/// `error`, `watching`, `dropped`, `quit`) is deliberately excluded.
+const NATIVE_KINDS: [&str; 5] = ["change", "app", "clipboard", "imessage", "mail"];
+
+fn is_native_event(value: &Value) -> bool {
+    value
+        .get("event")
+        .and_then(Value::as_str)
+        .map_or(false, |event| NATIVE_KINDS.contains(&event))
+}
+
+/// Records an interesting event in the bounded ring. Best-effort: a poisoned
+/// lock simply drops the observation instead of panicking.
+fn record_event(value: &Value) {
+    if !is_native_event(value) {
+        return;
+    }
+    if let Ok(mut ring) = NATIVE_RING.lock() {
+        if ring.len() >= RING_CAP {
+            ring.pop_front();
+        }
+        ring.push_back(value.clone());
+    }
+}
 
 fn proc_lock() -> Result<MutexGuard<'static, Option<Proc>>, String> {
     PROC.lock().map_err(|e| format!("watcher_events lock envenenado: {e}"))
@@ -74,6 +104,9 @@ fn ensure_proc<'a>(guard: &'a mut MutexGuard<'static, Option<Proc>>) -> Result<&
                     Ok(value) => value,
                     Err(_) => continue,
                 };
+                // Observe every event as it arrives, independently of who
+                // drains the channel. Keeps `native_event_summary()` live.
+                record_event(&value);
                 if tx.send(value).is_err() {
                     break;
                 }
@@ -180,6 +213,130 @@ pub fn start_imessage() -> Result<(), String> {
     send_command("watch-imessage")
 }
 
+/// Starts the full set of native sources used for live context: application
+/// activations, clipboard changes, iMessage database changes and an FSEvents
+/// watch over the local knowledge folder.
+///
+/// Every source is attempted even if an earlier one fails; the first (or all)
+/// failures are returned joined. The helper itself is started lazily by
+/// [`send_command`]; unavailable OS sources only emit an `error` event and do
+/// not make this call fail.
+pub fn start_native_sources() -> Result<(), String> {
+    let home = std::env::var_os("HOME").unwrap_or_default();
+    let knowledge = PathBuf::from(home)
+        .join("Library/Application Support/FridayOS/knowledge");
+    // An FSEvents stream on a missing directory delivers nothing, so make sure
+    // the folder exists before watching it.
+    let _ = std::fs::create_dir_all(&knowledge);
+
+    let mut errors: Vec<String> = Vec::new();
+    if let Err(error) = start_apps() {
+        errors.push(error);
+    }
+    if let Err(error) = start_clipboard() {
+        errors.push(error);
+    }
+    if let Err(error) = start_imessage() {
+        errors.push(error);
+    }
+    if let Err(error) = start_files(&[knowledge.as_path()]) {
+        errors.push(error);
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+/// Drains up to `limit` native events from [`next_event`] with a zero timeout.
+///
+/// The whole call is capped at ~20 ms: it never waits for events to arrive and
+/// stops early if the channel is momentarily empty. `status`/`error` and other
+/// protocol chatter are skipped; only `change`, `app`, `clipboard`, `imessage`
+/// and `mail` are returned. Events are *not* re-recorded here — the stdout
+/// reader already feeds the bounded summary ring.
+pub fn take_native_events(limit: usize) -> Vec<Value> {
+    let mut events = Vec::new();
+    if limit == 0 {
+        return events;
+    }
+    // Absorb the one-off helper build/spawn cost before starting the clock.
+    if ensure_started().is_err() {
+        return events;
+    }
+    let deadline = Instant::now() + Duration::from_millis(20);
+    for _ in 0..limit {
+        if Instant::now() >= deadline {
+            break;
+        }
+        match next_event(0) {
+            Ok(Some(value)) => {
+                if is_native_event(&value) {
+                    events.push(value);
+                }
+            }
+            // No event ready (or helper disconnected): don't spin waiting.
+            Ok(None) | Err(_) => break,
+        }
+    }
+    events
+}
+
+/// Compact, bounded summary of the most recent native activity.
+///
+/// Reads the 50-event ring maintained by the stdout reader. `count` is the
+/// number of observations currently retained; the other fields describe the
+/// newest matching event of each kind. Never blocks on the helper.
+pub fn native_event_summary() -> Value {
+    let mut count = 0usize;
+    let mut last_app = String::new();
+    let mut last_clipboard_chars = Value::Null;
+    let mut last_paths: Vec<String> = Vec::new();
+
+    if let Ok(ring) = NATIVE_RING.lock() {
+        count = ring.len();
+        for event in ring.iter().rev() {
+            match event.get("event").and_then(Value::as_str).unwrap_or("") {
+                "app" if last_app.is_empty() => {
+                    last_app = event
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                }
+                "clipboard" if last_clipboard_chars.is_null() => {
+                    if let Some(chars) = event.get("chars").and_then(Value::as_i64) {
+                        last_clipboard_chars = json!(chars);
+                    }
+                }
+                "change" | "imessage" => {
+                    if let Some(path) = event.get("path").and_then(Value::as_str) {
+                        if !path.is_empty()
+                            && last_paths.len() < 5
+                            && !last_paths.iter().any(|seen| seen == path)
+                        {
+                            last_paths.push(path.to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+            if !last_app.is_empty() && !last_clipboard_chars.is_null() && last_paths.len() >= 5 {
+                break;
+            }
+        }
+    }
+
+    json!({
+        "count": count,
+        "last_app": last_app,
+        "last_clipboard_chars": last_clipboard_chars,
+        "last_paths": last_paths,
+    })
+}
+
 /// Stops one watcher. `kind` is one of `files`, `apps`, `clipboard`, `mail`,
 /// `imessage` or `all`. Stopping when the helper is not running is a no-op.
 pub fn stop(kind: &str) -> Result<(), String> {
@@ -254,5 +411,8 @@ pub fn shutdown() {
     }
     if let Ok(mut pending) = PENDING.lock() {
         pending.clear();
+    }
+    if let Ok(mut ring) = NATIVE_RING.lock() {
+        ring.clear();
     }
 }

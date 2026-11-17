@@ -1,7 +1,9 @@
 //! Reason-adjacent, read-only tools built on top of Friday's own state.
 //!
 //! - `mission_sweep` turns the active missions into one compact spoken line
-//!   ("status geral").
+//!   ("status geral"), with the pending-approval count and the next action.
+//! - `mission_auto` is the read-only preview of the deterministic intent parser
+//!   used by `missions::mission_from_request`.
 //! - `timeline_query` merges the action journal with mission findings into a
 //!   single chronological timeline.
 //! - `watcher_triage` is a local, deterministic pre-filter for watcher events:
@@ -20,6 +22,7 @@ use serde_json::{json, Value};
 use crate::artifact;
 use crate::delivery::{self, PresenceContext};
 use crate::policy::Risk;
+use crate::tools::missions::parse_mission_request;
 use crate::registry::{Registry, Tool, ToolCtx, ToolError, ToolResult, ToolSpec};
 
 const MAX_MISSIONS: usize = 256;
@@ -32,6 +35,8 @@ const DEFAULT_SINCE_SECS: u64 = 3600;
 const DEFAULT_LIMIT: usize = 50;
 const MAX_LIMIT: usize = 200;
 const NOTIFY_THRESHOLD: f64 = 0.5;
+const ORCHESTRATOR_CHARS: usize = 1200;
+const ORCHESTRATOR_DEFAULT_LIMIT: usize = 10;
 
 // ---------------------------------------------------------------------------
 // Paths / time / small helpers
@@ -267,6 +272,83 @@ fn read_run_findings() -> Vec<(String, i64, String)> {
     out
 }
 
+/// Directory holding permanent assistant records and their hidden active state.
+fn assistants_dir() -> PathBuf {
+    data_dir().join("assistants")
+}
+
+fn assistant_active_path(slug: &str) -> PathBuf {
+    assistants_dir().join(format!(".{slug}.active.json"))
+}
+
+/// `assistant_list`-style records: `assistants/*.json` enriched with the hidden
+/// `.active.json` state (run_id, depth, status, verification, goal, condition).
+fn load_assistant_records() -> Vec<Value> {
+    let mut list = Vec::new();
+    if let Ok(entries) = fs::read_dir(assistants_dir()) {
+        for entry in entries.flatten() {
+            let file = entry.file_name().to_string_lossy().to_string();
+            if file.starts_with('.') || entry.path().extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(raw) = fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            let Ok(mut value) = serde_json::from_str::<Value>(&raw) else {
+                continue;
+            };
+            let Some(slug) = field_str(&value, "slug").map(str::to_string) else {
+                continue;
+            };
+            value["status"] = json!("unknown");
+            if let Ok(active_raw) = fs::read_to_string(assistant_active_path(&slug)) {
+                if let Ok(active) = serde_json::from_str::<Value>(&active_raw) {
+                    value["run_id"] = active.get("run_id").cloned().unwrap_or(Value::Null);
+                    value["depth"] = active.get("depth").cloned().unwrap_or(json!(0));
+                    value["status"] = active.get("status").cloned().unwrap_or(json!("unknown"));
+                    if let Some(verification) = field_str(&active, "verification") {
+                        value["verification"] = json!(verification);
+                    }
+                    value["goal"] = active.get("goal").cloned().unwrap_or(Value::Null);
+                    value["condition"] = active.get("condition").cloned().unwrap_or(Value::Null);
+                }
+            }
+            list.push(value);
+        }
+    }
+    list
+}
+
+/// Hidden `.active.json` records, paired with their slug. Includes orphans
+/// (an active worker whose assistant record is missing) as `(slug, state)`.
+fn load_active_records() -> Vec<(String, Value)> {
+    let mut list = Vec::new();
+    if let Ok(entries) = fs::read_dir(assistants_dir()) {
+        for entry in entries.flatten() {
+            let file = entry.file_name().to_string_lossy().to_string();
+            if !file.starts_with('.') || !file.ends_with(".active.json") {
+                continue;
+            }
+            let Ok(raw) = fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+                continue;
+            };
+            let Some(slug) = file
+                .strip_prefix('.')
+                .and_then(|name| name.strip_suffix(".active.json"))
+                .filter(|slug| !slug.is_empty())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            list.push((slug, value));
+        }
+    }
+    list
+}
+
 // ---------------------------------------------------------------------------
 // Tool plumbing
 // ---------------------------------------------------------------------------
@@ -283,8 +365,10 @@ impl Tool for ReasonTool {
     fn call(&self, args: &Value, ctx: &ToolCtx) -> ToolResult {
         match self.spec.name {
             "mission_sweep" => mission_sweep(),
+            "mission_auto" => mission_auto(args),
             "timeline_query" => timeline_query(args),
             "watcher_triage" => watcher_triage(args, ctx),
+            "orchestrator_review" => orchestrator_review(args),
             other => Err(ToolError::NotFound(other.to_string())),
         }
     }
@@ -306,6 +390,18 @@ pub fn register(registry: &mut Registry) {
         "mission_sweep",
         "Resumo falado e compacto de todas as missões ativas ou aguardando aprovação: nome, status, último achado, idade e quantas estão bloqueadas. Use para `status geral`.",
         json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+    ));
+    registry.add(tool(
+        "mission_auto",
+        "Prévia determinística e somente leitura do que `mission_from_request` criaria: interpreta objetivo, fonte, condição, silêncio e orçamento sem criar nada nem chamar modelo/rede.",
+        json!({
+            "type": "object",
+            "required": ["request"],
+            "additionalProperties": false,
+            "properties": {
+                "request": { "type": "string", "description": "Pedido do usuário a ser interpretado (ex.: 'acompanha a build ...')." }
+            }
+        }),
     ));
     registry.add(tool(
         "timeline_query",
@@ -332,6 +428,17 @@ pub fn register(registry: &mut Registry) {
                 "source": { "type": "string", "description": "Fonte do evento (shell, file, url, clipboard, imessage, email...)." },
                 "text": { "type": "string", "description": "Conteúdo/detalhe do evento a avaliar." },
                 "mission": { "type": "string", "description": "Id opcional da missão cujo objetivo/condição devem ser usados na pontuação." }
+            }
+        }),
+    ));
+    registry.add(tool(
+        "orchestrator_review",
+        "Revisão compacta da orquestração após cada turno: cruza workers ativos, verificações dos artifacts e missões; aponta o que precisa de atenção e uma síntese curta para decidir se pergunta ao usuário ou continua.",
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 10, "description": "Número máximo de itens de atenção e de execuções consideradas." }
             }
         }),
     ));
@@ -455,15 +562,54 @@ fn mission_sweep() -> ToolResult {
         String::new()
     };
 
+    // Count every mission actually waiting on a human decision, then give the
+    // agent one unambiguity next action for the spoken flow.
+    let pending_approvals = missions
+        .iter()
+        .filter(|mission| {
+            field_str(mission, "status").unwrap_or("active").eq_ignore_ascii_case("waiting_approval")
+                || mission.get("needs_approval").and_then(Value::as_bool).unwrap_or(false)
+        })
+        .count();
+    let next_action = if waiting > 0 || pending_approvals > 0 {
+        "Perguntar ao usuário agora"
+    } else {
+        "Nenhuma ação"
+    };
+
     Ok(json!({
         "ok": true,
         "summary": summary,
         "active": active,
         "waiting_approval": waiting,
+        "pending_approvals": pending_approvals,
+        "next_action": next_action,
         "blocked": blocked,
         "missions_loaded": missions.len(),
         "proactive_hint": proactive_hint,
         "runs": runs,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// mission_auto (dry preview of mission_from_request)
+// ---------------------------------------------------------------------------
+
+fn mission_auto(args: &Value) -> ToolResult {
+    let request = arg(args, "request").ok_or_else(|| ToolError::invalid("informe `request`"))?;
+    let mut parsed = parse_mission_request(request);
+    // `mission_from_request` defaults silence to true unless the caller says
+    // otherwise; mirror that default so the preview matches the real result.
+    if let Some(value) = args.get("silent_until_approval").and_then(Value::as_bool) {
+        parsed["silent_until_approval"] = json!(value);
+    } else {
+        parsed["silent_until_approval"] = json!(true);
+    }
+    Ok(json!({
+        "ok": true,
+        "dry_run": true,
+        "would_create": true,
+        "parsed": parsed,
     }))
 }
 
@@ -855,4 +1001,221 @@ fn watcher_triage(args: &Value, ctx: &ToolCtx) -> ToolResult {
         "matched_keywords": matched_keywords,
         "dry_run": ctx.dry_run,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// orchestrator_review
+// ---------------------------------------------------------------------------
+
+fn attention_item(kind: &str, name: &str, reason: &str, action: &str) -> Value {
+    json!({
+        "kind": kind,
+        "name": truncate_chars(name, 24),
+        "reason": truncate_chars(reason, 90),
+        "action": truncate_chars(action, 90),
+    })
+}
+
+/// Merges worker state, hidden active records, run artifacts and mission
+/// statuses into one short review the app calls after each turn.
+fn orchestrator_review(args: &Value) -> ToolResult {
+    let limit = match args.get("limit") {
+        None | Some(Value::Null) => ORCHESTRATOR_DEFAULT_LIMIT,
+        Some(Value::Number(number)) => number
+            .as_u64()
+            .ok_or_else(|| ToolError::invalid("`limit` deve ser um inteiro positivo"))?
+            .clamp(1, MAX_LIMIT as u64) as usize,
+        Some(_) => return Err(ToolError::invalid("`limit` deve ser um inteiro positivo")),
+    };
+
+    let assistants = load_assistant_records();
+    let active_records = load_active_records();
+    let runs = artifact::run_summary(limit);
+    let missions = load_missions();
+
+    let mut items: Vec<Value> = Vec::new();
+    let mut active_workers = 0usize;
+    let mut failed = 0usize;
+    let mut waiting_approval = 0usize;
+    let mut covered_runs: Vec<String> = Vec::new();
+
+    // Active workers and the verification state left by their last run.
+    for (slug, active) in &active_records {
+        let status = field_str(active, "status").unwrap_or("unknown").to_lowercase();
+        let verification = field_str(active, "verification").unwrap_or("");
+        let run_id = field_str(active, "run_id").unwrap_or("");
+        let display = assistants
+            .iter()
+            .find(|record| field_str(record, "slug") == Some(slug.as_str()))
+            .and_then(|record| field_str(record, "name"))
+            .unwrap_or(slug.as_str());
+
+        if status == "running" || status == "replanning" {
+            active_workers += 1;
+            continue;
+        }
+
+        if status == "error" || verification == "fail" {
+            failed += 1;
+            if !run_id.is_empty() {
+                covered_runs.push(run_id.to_string());
+            }
+            items.push(attention_item(
+                "failed_worker",
+                display,
+                if status == "error" {
+                    "worker terminou com erro"
+                } else {
+                    "verificação falhou"
+                },
+                "ver evidências e replanejar com assistant_replan",
+            ));
+        } else if status == "done" && verification == "unknown" {
+            if !run_id.is_empty() {
+                covered_runs.push(run_id.to_string());
+            }
+            items.push(attention_item(
+                "needs_retry",
+                display,
+                "verificação inconclusiva",
+                "sintetizar saída e decidir se replaneja",
+            ));
+        }
+    }
+
+    // Missions blocked on a user decision.
+    for mission in &missions {
+        if field_str(mission, "status").unwrap_or("active").to_lowercase() != "waiting_approval" {
+            continue;
+        }
+        waiting_approval += 1;
+        let name = field_str(mission, "name")
+            .or_else(|| field_str(mission, "id"))
+            .unwrap_or("missão");
+        items.push(attention_item(
+            "waiting_approval",
+            name,
+            "missão aguardando aprovação",
+            "perguntar ao usuário (sim/não)",
+        ));
+    }
+
+    // Runs whose artifact verification still needs the main Friday's review.
+    for run in &runs {
+        let verification = field_str(run, "verification").unwrap_or("unknown");
+        let findings = field_i64(run, "findings_count").unwrap_or(0);
+        let run_id = field_str(run, "id").unwrap_or("");
+        if findings == 0 || (verification != "fail" && verification != "unknown") {
+            continue;
+        }
+        if covered_runs.iter().any(|covered| covered == run_id) {
+            continue;
+        }
+        failed += 1;
+        items.push(attention_item(
+            "failed_run",
+            run_id,
+            if verification == "fail" {
+                "run com verificação falha"
+            } else {
+                "run sem verificação conclusiva"
+            },
+            "revisar artifact e consolidar síntese",
+        ));
+    }
+
+    // Approvals and failures first, inconclusive output last.
+    let priority = |kind: &str| match kind {
+        "waiting_approval" => 0,
+        "failed_worker" => 1,
+        "failed_run" => 2,
+        _ => 3,
+    };
+    items.sort_by(|a, b| {
+        priority(field_str(a, "kind").unwrap_or(""))
+            .cmp(&priority(field_str(b, "kind").unwrap_or("")))
+    });
+    items.truncate(limit);
+
+    let attention_count = items.len();
+    let mut synthesis = if attention_count == 0 {
+        format!(
+            "Sem atenção necessária: {} worker(s) ativo(s), {} execução(ões) registrada(s).",
+            active_workers,
+            runs.len()
+        )
+    } else {
+        format!(
+            "{} worker(s) ativo(s), {} falha(s), {} aprovação(ões), {} execução(ões). Atenção: ",
+            active_workers,
+            failed,
+            waiting_approval,
+            runs.len()
+        )
+    };
+    if attention_count > 0 {
+        for item in &items {
+            let piece = format!(
+                "{} ({}) — {}",
+                field_str(item, "name").unwrap_or("?"),
+                field_str(item, "kind").unwrap_or("?"),
+                field_str(item, "reason").unwrap_or("")
+            );
+            if synthesis.chars().count() + piece.chars().count() + 2 > 420 {
+                break;
+            }
+            synthesis.push_str(&piece);
+            synthesis.push_str("; ");
+        }
+    }
+    let synthesis = truncate_chars(&synthesis, 420);
+
+    let mut result = json!({
+        "ok": true,
+        "needs_attention": items,
+        "synthesis": synthesis,
+        "counts": {
+            "active_workers": active_workers,
+            "failed": failed,
+            "waiting_approval": waiting_approval,
+            "runs": runs.len(),
+        },
+    });
+
+    // Keep the payload small: drop low-priority items, then shrink the
+    // synthesis, until the serialized result fits the ~1200 char budget.
+    let mut guard = 0usize;
+    loop {
+        let encoded = serde_json::to_string(&result).unwrap_or_default();
+        if encoded.chars().count() <= ORCHESTRATOR_CHARS || guard >= 32 {
+            break;
+        }
+        guard += 1;
+        let popped = result
+            .get_mut("needs_attention")
+            .and_then(Value::as_array_mut)
+            .and_then(|list| {
+                if list.is_empty() {
+                    None
+                } else {
+                    list.pop().map(|_| ())
+                }
+            })
+            .is_some();
+        if !popped {
+            let current: String = result
+                .get("synthesis")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let len = current.chars().count();
+            if len == 0 {
+                break;
+            }
+            let shorter: String = current.chars().take(len.saturating_sub(60)).collect();
+            result["synthesis"] = json!(shorter);
+        }
+    }
+
+    Ok(result)
 }

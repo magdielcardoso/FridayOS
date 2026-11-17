@@ -54,6 +54,54 @@ fn normalize(text: &str) -> String {
         .join(" ")
 }
 
+/// Um caractere normalizado por vez (minúsculo, sem acento). Mantém o mesmo
+/// índice de caractere do texto original para que possamos capturar o valor
+/// preservando caixa e acentos.
+fn norm_char(ch: char) -> char {
+    fold(ch.to_lowercase().next().unwrap_or(ch))
+}
+
+/// Encontra um padrão já normalizado no texto original, respeitando fronteiras
+/// de palavra. Devolve os índices de bytes onde o padrão começa e termina.
+fn find_pattern(text: &str, pattern: &str) -> Option<(usize, usize)> {
+    let original: Vec<char> = text.chars().collect();
+    let normalized: Vec<char> = original.iter().copied().map(norm_char).collect();
+    let pat: Vec<char> = pattern.chars().collect();
+    if pat.is_empty() || pat.len() > normalized.len() {
+        return None;
+    }
+    for start in 0..=normalized.len() - pat.len() {
+        if &normalized[start..start + pat.len()] != &pat[..] {
+            continue;
+        }
+        let end = start + pat.len();
+        let before_ok = start == 0 || !original[start - 1].is_alphanumeric();
+        let after_ok = end == original.len() || !original[end].is_alphanumeric();
+        if before_ok && after_ok {
+            let byte_start: usize = original[..start].iter().map(|c| c.len_utf8()).sum();
+            let byte_end: usize = original[..end].iter().map(|c| c.len_utf8()).sum();
+            return Some((byte_start, byte_end));
+        }
+    }
+    None
+}
+
+/// Captura o valor que vem depois do primeiro padrão encontrado.
+fn capture(text: &str, patterns: &[&str]) -> Option<String> {
+    for pattern in patterns {
+        if let Some((_start, end)) = find_pattern(text, pattern) {
+            let value = text[end..]
+                .trim()
+                .trim_end_matches(|ch: char| matches!(ch, '.' | ',' | '!' | '?' | ';' | ':'))
+                .trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
 fn default_self() -> Value {
     json!({
         "name": "Friday",
@@ -146,6 +194,168 @@ fn upsert_fact(model: &mut Value, text: &str, source: &str) -> bool {
         facts.drain(0..extra);
     }
     true
+}
+
+/// Atualiza um dos modelos (self/user) com um fato durável.
+fn update_model(
+    is_self: bool,
+    text: &str,
+    name: Option<&str>,
+    role: Option<&str>,
+    source: &str,
+) -> Result<bool, String> {
+    let path = if is_self { self_path() } else { user_path() };
+    let mut model = load(&path, if is_self { default_self } else { default_user });
+    if let Some(name) = name {
+        let clean = name.trim();
+        if (1..=48).contains(&clean.chars().count()) {
+            model["name"] = json!(clean);
+        }
+    }
+    if let Some(role) = role {
+        let clean = role.trim();
+        if (1..=160).contains(&clean.chars().count()) {
+            model["role"] = json!(clean);
+        }
+    }
+    let added = upsert_fact(&mut model, text, source);
+    model["updated_at"] = json!(now());
+    write(&path, &model).map_err(|error| error.to_string())?;
+    Ok(added)
+}
+
+fn update_from_capture(
+    text: &str,
+    patterns: &[&str],
+    is_self: bool,
+    fact_template: &str,
+    confirm_template: &str,
+    set_name: bool,
+    out: &mut Vec<String>,
+) -> Result<(), String> {
+    if let Some(value) = capture(text, patterns) {
+        let fact = fact_template.replace("{v}", &value);
+        let name = if set_name { Some(value.as_str()) } else { None };
+        update_model(is_self, &fact, name, None, "user")?;
+        out.push(confirm_template.replace("{v}", &value));
+    }
+    Ok(())
+}
+
+/// Aprende com um texto em português ou inglês, de forma determinística e
+/// local (sem rede). Reconhece declarações sobre o usuário, sobre a Friday e
+/// pedidos explícitos de memória, atualizando os modelos automaticamente.
+///
+/// Devolve confirmações curtas em português. O conteúdo bruto nunca é logado e
+/// o texto é limitado a 300 caracteres.
+pub fn learn_from_text(text: &str) -> Result<Vec<String>, String> {
+    let capped: String = text.trim().chars().take(300).collect();
+    if capped.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+
+    // Usuário.
+    update_from_capture(
+        &capped, &["me chame de", "meu nome e"], false,
+        "O nome do usuário é {v}.", "Registrei que seu nome é {v}.", true, &mut out,
+    )?;
+    update_from_capture(
+        &capped, &["trabalho com", "trabalho em"], false,
+        "O usuário trabalha com {v}.", "Registrei que você trabalha com {v}.", false, &mut out,
+    )?;
+    update_from_capture(
+        &capped, &["nao gosto de"], false,
+        "O usuário não gosta de {v}.", "Registrei que você não gosta de {v}.", false, &mut out,
+    )?;
+    update_from_capture(
+        &capped, &["prefiro"], false,
+        "O usuário prefere {v}.", "Registrei que você prefere {v}.", false, &mut out,
+    )?;
+    update_from_capture(
+        &capped, &["eu sou", "sou"], false,
+        "O usuário é {v}.", "Registrei que você é {v}.", false, &mut out,
+    )?;
+
+    // Friday.
+    update_from_capture(
+        &capped, &["seu nome e"], true,
+        "Meu nome é {v}.", "Registrei que meu nome é {v}.", true, &mut out,
+    )?;
+    update_from_capture(
+        &capped, &["voce deve"], true,
+        "A Friday deve {v}.", "Registrei que devo {v}.", false, &mut out,
+    )?;
+    update_from_capture(
+        &capped, &["nao faca"], true,
+        "A Friday não deve fazer {v}.", "Registrei que não devo fazer {v}.", false, &mut out,
+    )?;
+    update_from_capture(
+        &capped, &["pare de"], true,
+        "A Friday deve parar de {v}.", "Registrei que devo parar de {v}.", false, &mut out,
+    )?;
+    update_from_capture(
+        &capped, &["voce e"], true,
+        "A Friday é {v}.", "Registrei que eu sou {v}.", false, &mut out,
+    )?;
+
+    // Memória explícita. A confirmação é genérica para não repetir conteúdo
+    // possivelmente sensível.
+    if let Some(value) = capture(&capped, &["lembre-se de", "guarda isso:", "guarda isto:"]) {
+        let _ = crate::tools::memory::remember(&value);
+        out.push("Guardei isso na memória.".to_string());
+    }
+
+    Ok(out)
+}
+
+/// Aplica uma correção do usuário ("não, eu disse X"): o fato antigo é mantido
+/// e marcado como superado; o novo é inserido. Nada é apagado.
+pub fn apply_correction(kind: &str, old: &str, new: &str) -> Result<(), String> {
+    let is_self = matches!(kind, "self" | "self_update" | "friday" | "assistant");
+    let path = if is_self { self_path() } else { user_path() };
+    let mut model = load(&path, if is_self { default_self } else { default_user });
+
+    let old_key = normalize(old);
+    if !old_key.is_empty() {
+        if model
+            .get("name")
+            .and_then(Value::as_str)
+            .map(normalize)
+            .map(|value| value == old_key)
+            .unwrap_or(false)
+        {
+            model["name"] = json!(new);
+        }
+        if model
+            .get("role")
+            .and_then(Value::as_str)
+            .map(normalize)
+            .map(|value| value == old_key)
+            .unwrap_or(false)
+        {
+            model["role"] = json!(new);
+        }
+        if let Some(facts) = model.get_mut("facts").and_then(Value::as_array_mut) {
+            for fact in facts.iter_mut() {
+                let matches = fact
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(normalize)
+                    .map(|value| value == old_key)
+                    .unwrap_or(false);
+                if matches {
+                    fact["superseded"] = json!(true);
+                    fact["superseded_by"] = json!(new);
+                    fact["ts"] = json!(now());
+                }
+            }
+        }
+    }
+
+    upsert_fact(&mut model, new, "user");
+    model["updated_at"] = json!(now());
+    write(&path, &model).map_err(|error| error.to_string())
 }
 
 fn summary(model: &Value) -> String {
@@ -252,6 +462,63 @@ impl Tool for ToolSpecified {
                 write(&path, &model)?;
                 Ok(json!({ "ok": true, "added": added, "model": model }))
             }
+            "learn_fact" => {
+                let text = args
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| ToolError::invalid("informe `text`"))?;
+                let kind = args
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("auto");
+                if ctx.dry_run {
+                    return Ok(json!({ "dry_run": true, "would_learn": text, "kind": kind }));
+                }
+                match kind {
+                    "auto" => {
+                        let confirmations = learn_from_text(text).map_err(ToolError::failed)?;
+                        Ok(json!({ "ok": true, "confirmations": confirmations }))
+                    }
+                    "user" | "self" => {
+                        let added = update_model(kind == "self", text, None, None, "user")
+                            .map_err(ToolError::failed)?;
+                        Ok(json!({ "ok": true, "added": added, "kind": kind }))
+                    }
+                    "memory" => {
+                        let entry = crate::tools::memory::remember(text).map_err(ToolError::failed)?;
+                        Ok(json!({ "ok": true, "kind": "memory", "memory": entry }))
+                    }
+                    other => Err(ToolError::invalid(format!("kind inválido: {other}"))),
+                }
+            }
+            "correct_fact" => {
+                let old = args
+                    .get("old")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| ToolError::invalid("informe `old`"))?;
+                let new = args
+                    .get("new")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| ToolError::invalid("informe `new`"))?;
+                let kind = args
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("user");
+                if ctx.dry_run {
+                    return Ok(json!({
+                        "dry_run": true,
+                        "would_correct": { "old": old, "new": new, "kind": kind },
+                    }));
+                }
+                apply_correction(kind, old, new).map_err(ToolError::failed)?;
+                Ok(json!({ "ok": true, "corrected": true, "kind": kind }))
+            }
             other => Err(ToolError::NotFound(other.to_string())),
         }
     }
@@ -278,6 +545,18 @@ fn register_tool(
                 },
             }),
         },
+    });
+}
+
+fn add_tool(
+    registry: &mut Registry,
+    name: &'static str,
+    summary: &'static str,
+    risk: crate::policy::Risk,
+    args: Value,
+) {
+    registry.add(ToolSpecified {
+        spec: ToolSpec { name, summary, risk, args },
     });
 }
 
@@ -311,5 +590,40 @@ pub fn register(registry: &mut Registry) {
         "metacognition",
         "Visão condensada de quem a Friday é, quem é o usuário e do estado atual do sistema.",
         crate::policy::Risk::ReadOnly,
+    );
+    add_tool(
+        registry,
+        "learn_fact",
+        "Aprende um fato durável de um texto: atualiza self/user automaticamente ou guarda na memória (kind: auto|user|self|memory).",
+        crate::policy::Risk::Reversible,
+        json!({
+            "type": "object",
+            "required": ["text"],
+            "additionalProperties": false,
+            "properties": {
+                "text": { "type": "string" },
+                "kind": {
+                    "type": "string",
+                    "enum": ["auto", "user", "self", "memory"],
+                    "default": "auto"
+                }
+            }
+        }),
+    );
+    add_tool(
+        registry,
+        "correct_fact",
+        "Corrige um fato: marca o antigo como superado (sem apagá-lo) e insere o novo.",
+        crate::policy::Risk::Reversible,
+        json!({
+            "type": "object",
+            "required": ["old", "new"],
+            "additionalProperties": false,
+            "properties": {
+                "kind": { "type": "string", "enum": ["auto", "user", "self"], "default": "user" },
+                "old": { "type": "string" },
+                "new": { "type": "string" }
+            }
+        }),
     );
 }

@@ -141,16 +141,66 @@ private struct FSEventRecord {
     let flag: String
 }
 
-/// Retained as the FSEvents stream context `info`; the C callback cannot capture.
+/// Owns one stream's delivery closure. The C callback cannot capture, so the
+/// handler is kept in a global registry and referenced by an integer token.
+/// `active` lets `stop()` invalidate in-flight callbacks: a queued FSEvents
+/// block may still run after the stream is torn down, and must not emit then.
 private final class FSEventHandler {
     let sink: ([FSEventRecord]) -> Void
+    private let lock = NSLock()
+    private var active = true
+
     init(_ sink: @escaping ([FSEventRecord]) -> Void) { self.sink = sink }
-    func deliver(_ records: [FSEventRecord]) { sink(records) }
+
+    func deliver(_ records: [FSEventRecord]) {
+        lock.lock()
+        let isActive = active
+        lock.unlock()
+        guard isActive else { return }
+        sink(records)
+    }
+
+    func close() {
+        lock.lock()
+        active = false
+        lock.unlock()
+    }
+}
+
+// A token -> handler registry keeps handlers alive for as long as the stream
+// may call back. The lookup returns a strong reference, so even if `stop()`
+// removes the entry concurrently a callback in flight cannot use freed memory.
+private let handlerLock = NSLock()
+private var handlerRegistry: [UInt: FSEventHandler] = [:]
+private var handlerNextToken: UInt = 1
+
+private func registerHandler(_ handler: FSEventHandler) -> UInt {
+    handlerLock.lock()
+    let token = handlerNextToken
+    handlerNextToken &+= 1
+    handlerRegistry[token] = handler
+    handlerLock.unlock()
+    return token
+}
+
+private func lookupHandler(_ token: UInt) -> FSEventHandler? {
+    handlerLock.lock()
+    let handler = handlerRegistry[token]
+    handlerLock.unlock()
+    return handler
+}
+
+private func unregisterHandler(_ token: UInt) {
+    handlerLock.lock()
+    let handler = handlerRegistry.removeValue(forKey: token)
+    handlerLock.unlock()
+    handler?.close()
 }
 
 private let fsEventCallback: FSEventStreamCallback = { _, info, count, eventPaths, eventFlags, _ in
     guard let info = info else { return }
-    let handler = Unmanaged<FSEventHandler>.fromOpaque(info).takeUnretainedValue()
+    let token = UInt(bitPattern: info)
+    guard let handler = lookupHandler(token) else { return }
     let cfPaths = Unmanaged<CFArray>.fromOpaque(eventPaths).takeUnretainedValue()
     let paths = cfPaths as? [String] ?? []
 
@@ -177,13 +227,16 @@ private let fsEventCallback: FSEventStreamCallback = { _, info, count, eventPath
 /// Owns one FSEvents stream. All methods are called on the main thread.
 private final class FSEventsWatch {
     private var stream: FSEventStreamRef?
-    private var info: UnsafeMutableRawPointer?
+    private var token: UInt?
 
     init?(paths: [String], latency: TimeInterval, sink: @escaping ([FSEventRecord]) -> Void) {
         guard !paths.isEmpty else { return nil }
 
-        let handler = FSEventHandler(sink)
-        let ptr = Unmanaged.passRetained(handler).toOpaque()
+        let token = registerHandler(FSEventHandler(sink))
+        guard let ptr = UnsafeMutableRawPointer(bitPattern: token) else {
+            unregisterHandler(token)
+            return nil
+        }
         var context = FSEventStreamContext(version: 0, info: ptr, retain: nil, release: nil, copyDescription: nil)
         let flags = FSEventStreamCreateFlags(kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagNoDefer)
 
@@ -196,12 +249,12 @@ private final class FSEventsWatch {
             latency,
             flags
         ) else {
-            Unmanaged<FSEventHandler>.fromOpaque(ptr).release()
+            unregisterHandler(token)
             return nil
         }
 
         self.stream = created
-        self.info = ptr
+        self.token = token
         // Deliver callbacks on the main queue (avoids the deprecated run-loop
         // scheduling API while keeping all watcher state on one thread).
         FSEventStreamSetDispatchQueue(created, DispatchQueue.main)
@@ -212,15 +265,17 @@ private final class FSEventsWatch {
 
     func stop() {
         guard let stream = stream else { return }
+        // Invalidate the sink first: any callback already queued on the main
+        // queue will see `active == false` and emit nothing.
+        if let token = token {
+            unregisterHandler(token)
+            self.token = nil
+        }
         FSEventStreamStop(stream)
         FSEventStreamSetDispatchQueue(stream, nil)
         FSEventStreamInvalidate(stream)
         FSEventStreamRelease(stream)
         self.stream = nil
-        if let info = info {
-            Unmanaged<FSEventHandler>.fromOpaque(info).release()
-            self.info = nil
-        }
     }
 
     deinit { stop() }

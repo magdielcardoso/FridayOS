@@ -52,6 +52,12 @@ fn write_active(name: &str, value: &Value) {
     }
 }
 
+/// Read the hidden `.active.json` record for an assistant (by name or slug).
+fn load_active(name: &str) -> Option<Value> {
+    let raw = std::fs::read_to_string(active_path(name)).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
 fn truncate_chars(text: &str, max: usize) -> String {
     let mut out = String::new();
     for (index, ch) in text.chars().enumerate() {
@@ -209,6 +215,51 @@ fn live_append(path: &PathBuf, kind: &str, text: &str) {
         "text": text.chars().take(4000).collect::<String>(),
     });
     let _ = writeln!(file, "{record}");
+}
+
+/// Last `limit` parsed records from an assistant's live feed, oldest first.
+fn live_tail(name: &str, limit: usize) -> Vec<Value> {
+    let raw = match std::fs::read_to_string(live_path(name)) {
+        Ok(raw) => raw,
+        Err(_) => return Vec::new(),
+    };
+    let lines: Vec<&str> = raw.lines().filter(|line| !line.trim().is_empty()).collect();
+    let start = lines.len().saturating_sub(limit);
+    lines[start..]
+        .iter()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect()
+}
+
+/// Find an active worker record by its run id (used when only `run_id` is given).
+fn active_by_run(run_id: &str) -> Option<(String, Value)> {
+    if run_id.is_empty() {
+        return None;
+    }
+    let entries = std::fs::read_dir(dir()).ok()?;
+    for entry in entries.flatten() {
+        let file = entry.file_name().to_string_lossy().to_string();
+        if !file.starts_with('.') || !file.ends_with(".active.json") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        if value.get("run_id").and_then(Value::as_str) == Some(run_id) {
+            let slug = file
+                .strip_prefix('.')
+                .and_then(|s| s.strip_suffix(".active.json"))
+                .unwrap_or("")
+                .to_string();
+            if !slug.is_empty() {
+                return Some((slug, value));
+            }
+        }
+    }
+    None
 }
 
 /// Turns one `codex exec --json` event into a short human-readable line.
@@ -539,6 +590,198 @@ impl Tool for AssistantTool {
                 }
                 Ok(json!({ "ok": true, "count": list.len(), "assistants": list }))
             }
+            "assistant_verify" => {
+                let name_arg = args
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                let run_arg = args
+                    .get("run_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                if name_arg.is_none() && run_arg.is_none() {
+                    return Err(ToolError::invalid("informe `name` ou `run_id`"));
+                }
+
+                // Resolve the assistant key (slug) and the hidden active record.
+                let (display_name, key, active): (String, String, Option<Value>) =
+                    if let Some(name) = name_arg {
+                        let record = load(name)?;
+                        let key = record
+                            .get("slug")
+                            .and_then(Value::as_str)
+                            .unwrap_or(name)
+                            .to_string();
+                        (name.to_string(), key, load_active(name))
+                    } else if let Some(run_id) = run_arg {
+                        match active_by_run(run_id) {
+                            Some((key, active)) => (key.clone(), key, Some(active)),
+                            None => (String::new(), String::new(), None),
+                        }
+                    } else {
+                        unreachable!("name or run_id is required")
+                    };
+
+                let active = active.unwrap_or_else(|| json!({}));
+                let run_id = run_arg
+                    .map(str::to_string)
+                    .or_else(|| {
+                        active
+                            .get("run_id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_default();
+                let status = active
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string();
+                let active_verification = active
+                    .get("verification")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let verification = if run_id.is_empty() {
+                    active_verification.unwrap_or_else(|| "unknown".to_string())
+                } else {
+                    artifact::verification_status(&run_id)
+                        .map(|(status, _)| status)
+                        .or(active_verification)
+                        .unwrap_or_else(|| "unknown".to_string())
+                };
+                let evidence = if key.is_empty() {
+                    Vec::new()
+                } else {
+                    live_tail(&key, 8)
+                };
+                // A running/replanning worker is in flight; an errored one and a
+                // finished one with fail/unknown verification need the main
+                // Friday's attention (and possibly a replan).
+                let needs_retry = match status.as_str() {
+                    "running" | "replanning" => false,
+                    "error" => true,
+                    _ => verification == "fail" || verification == "unknown",
+                };
+
+                Ok(json!({
+                    "ok": true,
+                    "name": display_name,
+                    "run_id": run_id,
+                    "status": status,
+                    "verification": verification,
+                    "evidence": evidence,
+                    "needs_retry": needs_retry,
+                }))
+            }
+            "assistant_replan" => {
+                let name = args
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| ToolError::invalid("informe `name`"))?;
+                let goal = args
+                    .get("goal")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| ToolError::invalid("informe `goal`"))?;
+                let condition = args
+                    .get("condition")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| ToolError::invalid("informe `condition`"))?;
+                let budget_chars = args
+                    .get("budget_chars")
+                    .and_then(Value::as_u64)
+                    .filter(|&value| value > 0);
+
+                let record = load(name)?;
+                let key = record
+                    .get("slug")
+                    .and_then(Value::as_str)
+                    .unwrap_or(name)
+                    .to_string();
+                let previous = load_active(name).unwrap_or_else(|| json!({}));
+                let run_id = args
+                    .get("run_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .or_else(|| {
+                        previous
+                            .get("run_id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    });
+
+                if ctx.dry_run {
+                    return Ok(json!({
+                        "dry_run": true,
+                        "would_replan": key,
+                        "run_id": run_id,
+                        "goal": goal,
+                        "condition": condition,
+                        "budget_chars": budget_chars,
+                    }));
+                }
+
+                // Metadata-only replan: no process kill, no new spawn. The main
+                // Friday sends the returned prompt back to the same worker.
+                let meta = json!({
+                    "goal": goal,
+                    "condition": condition,
+                    "run_id": run_id,
+                    "budget_chars": budget_chars,
+                });
+                let mut active = previous;
+                active["status"] = json!("replanning");
+                active["goal"] = json!(goal);
+                active["condition"] = json!(condition);
+                active["replanned"] = json!(now_secs());
+                if let Some(run_id) = run_id.as_deref() {
+                    active["run_id"] = json!(run_id);
+                }
+                if let Some(budget) = budget_chars {
+                    active["budget_chars"] = json!(budget);
+                }
+                write_active(name, &active);
+
+                live_append(
+                    &live_path(name),
+                    "meta",
+                    &serde_json::to_string(&meta).unwrap_or_default(),
+                );
+
+                if let Some(run_id) = run_id.as_deref() {
+                    if let Some(run) = artifact::load_run(run_id) {
+                        let _ = run.append_finding(&format!(
+                            "replanejamento de `{key}`: objetivo={goal}; critério={condition}"
+                        ));
+                    }
+                }
+
+                let budget_line = budget_chars
+                    .map(|budget| format!("Limite de resposta: {budget} caracteres."))
+                    .unwrap_or_default();
+                let prompt = format!(
+                    "Replano da Friday para o worker `{key}`.\n\
+                     Objetivo revisado: {goal}\n\
+                     Critério de conclusão: {condition}\n\
+                     {budget_line}\n\
+                     Retome a tarefa anterior com este novo plano, registre achados e reporte verificação (pass/fail/unknown)."
+                );
+
+                Ok(json!({
+                    "ok": true,
+                    "prompt": prompt,
+                    "assistant": key,
+                    "run_id": run_id,
+                    "status": "replanning",
+                }))
+            }
             "assistant_task" => {
                 let name = args
                     .get("name")
@@ -675,7 +918,26 @@ impl Tool for AssistantTool {
                             summary = truncate_chars(preview, 400)
                         ));
                         let _ = run.record_tool("assistant_task", &meta);
-                        let _ = run.set_verification(&verification, "worker concluído");
+                        if verification == "fail" || verification == "unknown" {
+                            // Do not auto-retry: flag the run as needing review
+                            // so the main Friday can verify, synthesise and
+                            // decide whether to replan.
+                            let note = if verification == "fail" {
+                                format!(
+                                    "worker `{}` concluiu com verificação falha; requer revisão/replanejamento",
+                                    slug(name)
+                                )
+                            } else {
+                                format!(
+                                    "worker `{}` concluiu sem verificação conclusiva; requer revisão",
+                                    slug(name)
+                                )
+                            };
+                            let _ = run.append_finding(&note);
+                            let _ = run.set_verification("unknown", &note);
+                        } else {
+                            let _ = run.set_verification(&verification, "worker concluído");
+                        }
                     }
                 }
 
@@ -793,6 +1055,36 @@ pub fn register(registry: &mut Registry) {
         "Lista os assistentes permanentes criados pela Friday.",
         crate::policy::Risk::ReadOnly,
         json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+    ));
+    registry.add(tool(
+        "assistant_verify",
+        "Verifica a saída de um worker: lê o feed ao vivo e a verificação do artifact; devolve status, evidências e se precisa de replanejamento.",
+        crate::policy::Risk::ReadOnly,
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "name": { "type": "string", "description": "Nome do assistente a verificar (ou informe `run_id`)." },
+                "run_id": { "type": "string", "description": "Id da execução a verificar (ou informe `name`)." }
+            }
+        }),
+    ));
+    registry.add(tool(
+        "assistant_replan",
+        "Replaneja um worker sem matar nem criar processos: atualiza metadados, registra um achado e devolve o prompt para a Friday reenviar.",
+        crate::policy::Risk::Reversible,
+        json!({
+            "type": "object",
+            "required": ["name", "goal", "condition"],
+            "additionalProperties": false,
+            "properties": {
+                "name": { "type": "string" },
+                "goal": { "type": "string", "description": "Objetivo revisado para o worker." },
+                "condition": { "type": "string", "description": "Critério de conclusão revisado." },
+                "run_id": { "type": "string", "description": "Id da execução (opcional; inferido do worker)." },
+                "budget_chars": { "type": "integer", "minimum": 1, "description": "Limite de caracteres da resposta do worker." }
+            }
+        }),
     ));
     registry.add(tool(
         "assistant_task",

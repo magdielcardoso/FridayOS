@@ -40,6 +40,21 @@ fn normalize(content: &str) -> String {
         .to_string()
 }
 
+/// Remove partículas de negação de um texto já normalizado e informa se havia
+/// alguma. Usado para detectar contradições ("prefiro X" vs "não prefiro X").
+fn strip_negation(normalized: &str) -> (String, bool) {
+    let mut negated = false;
+    let mut words = Vec::new();
+    for word in normalized.split_whitespace() {
+        if matches!(word, "nao" | "nunca" | "never" | "not") {
+            negated = true;
+        } else {
+            words.push(word);
+        }
+    }
+    (words.join(" "), negated)
+}
+
 fn write_all(memories: &[Value]) -> Result<(), ToolError> {
     let body = memories
         .iter()
@@ -68,6 +83,96 @@ fn load_limited(max_lines: usize) -> Vec<Value> {
         .take(max_lines)
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .collect()
+}
+
+/// Grava (ou reconcilia) uma memória. Reaproveitado por `memory_save` e pelo
+/// helper público `remember`. Não reindexa: quem chama decide quando indexar.
+fn save_memory(content: &str, tags: Vec<String>) -> Result<Value, ToolError> {
+    let existing = load();
+    let key = normalize(content);
+
+    // 1) Fato idêntico: refreshes the existing entry instead of duplicating it.
+    if let Some(index) = existing.iter().position(|memory| {
+        memory
+            .get("content")
+            .and_then(|value| value.as_str())
+            .map(|old| normalize(old) == key)
+            .unwrap_or(false)
+    }) {
+        let mut updated = existing[index].clone();
+        updated["ts"] = json!(now_secs());
+        if !tags.is_empty() {
+            updated["tags"] = json!(tags);
+        }
+        let mut memories = existing.clone();
+        memories[index] = updated.clone();
+        write_all(&memories)?;
+        return Ok(updated);
+    }
+
+    // 2) Contradição: mesmo texto com/sem negação. O registro antigo é mantido
+    //    e marcado como superado; o novo é acrescentado. Nenhuma linha é
+    //    removida do diário (append-only).
+    let (base, negated) = strip_negation(&key);
+    if !base.is_empty() {
+        if let Some(index) = existing.iter().position(|memory| {
+            memory
+                .get("content")
+                .and_then(|value| value.as_str())
+                .map(|old| {
+                    let (old_base, old_neg) = strip_negation(&normalize(old));
+                    old_base == base && old_neg != negated
+                })
+                .unwrap_or(false)
+        }) {
+            let new_id = format!("mem-{}", now_ms());
+            let old_id = existing[index].get("id").cloned().unwrap_or(Value::Null);
+            let entry = json!({
+                "id": new_id.clone(),
+                "ts": now_secs(),
+                "content": content,
+                "tags": tags,
+                "supersedes": old_id,
+            });
+            let mut memories = existing.clone();
+            memories[index]["superseded"] = json!(true);
+            memories[index]["superseded_by"] = json!(new_id);
+            memories.push(entry.clone());
+            write_all(&memories)?;
+            return Ok(entry);
+        }
+    }
+
+    // 3) Fato novo: acrescenta ao final do diário.
+    let entry = json!({
+        "id": format!("mem-{}", now_ms()),
+        "ts": now_secs(),
+        "content": content,
+        "tags": tags,
+    });
+    if let Some(parent) = path().parent() {
+        std::fs::create_dir_all(parent).map_err(|e| ToolError::failed(e.to_string()))?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path())
+        .map_err(|e| ToolError::failed(e.to_string()))?;
+    writeln!(file, "{entry}").map_err(|e| ToolError::failed(e.to_string()))?;
+    Ok(entry)
+}
+
+/// Grava uma memória persistente de forma programática (usada pelo parser de
+/// aprendizado). Reusa a dedupe/normalização de `memory_save` e reindexa o
+/// grafo de conhecimento para que relações sejam inferidas imediatamente.
+pub fn remember(text: &str) -> Result<Value, String> {
+    let content = text.trim();
+    if content.is_empty() {
+        return Err("conteúdo vazio".to_string());
+    }
+    let entry = save_memory(content, Vec::new()).map_err(|error| error.to_string())?;
+    let _ = friday_brain::index_all();
+    Ok(entry)
 }
 
 /// Conjunto de palavras normalizado (minúsculas, sem acentos).
@@ -130,51 +235,9 @@ impl Tool for MemoryTool {
                 if ctx.dry_run {
                     return Ok(json!({ "dry_run": true, "would_save": content }));
                 }
-                // Repeating a fact refreshes the existing memory instead of
-                // filling the graph with near-duplicates.
-                let existing = load();
-                if let Some(found) = existing.iter().find(|memory| {
-                    memory
-                        .get("content")
-                        .and_then(|value| value.as_str())
-                        .map(|old| normalize(old) == normalize(content))
-                        .unwrap_or(false)
-                }) {
-                    let id = found.get("id").cloned().unwrap_or(Value::Null);
-                    let mut updated = found.clone();
-                    updated["ts"] = json!(now_secs());
-                    if !tags.is_empty() {
-                        updated["tags"] = json!(tags);
-                    }
-                    let mut memories = existing.clone();
-                    for memory in memories.iter_mut() {
-                        if memory.get("id") == Some(&id) {
-                            *memory = updated.clone();
-                        }
-                    }
-                    write_all(&memories)?;
-                    let _ = friday_brain::index_all();
-                    return Ok(json!({
-                        "ok": true,
-                        "deduped": true,
-                        "memory": updated,
-                    }));
-                }
-                let entry = json!({
-                    "id": format!("mem-{}", now_ms()),
-                    "ts": now_secs(),
-                    "content": content,
-                    "tags": tags,
-                });
-                if let Some(parent) = path().parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| ToolError::failed(e.to_string()))?;
-                }
-                let mut file = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path())
-                    .map_err(|e| ToolError::failed(e.to_string()))?;
-                writeln!(file, "{entry}").map_err(|e| ToolError::failed(e.to_string()))?;
+                // Repeating a fact refreshes it; a negation supersedes it while
+                // keeping the old line. Both live in `save_memory`.
+                let entry = save_memory(content, tags)?;
                 // Keep the knowledge graph in sync: new memories get inferred
                 // relations immediately.
                 let _ = friday_brain::index_all();
@@ -326,6 +389,29 @@ impl Tool for MemoryTool {
                     .map_err(|e| ToolError::failed(e.to_string()))?;
                 Ok(json!({ "ok": true, "removed": removed }))
             }
+            "memory_forget" => {
+                let id = args
+                    .get("id")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| ToolError::invalid("informe `id`"))?;
+                if ctx.dry_run {
+                    return Ok(json!({ "dry_run": true, "would_forget": id }));
+                }
+                let mut memories = load();
+                let Some(memory) = memories
+                    .iter_mut()
+                    .find(|memory| memory.get("id").and_then(|value| value.as_str()) == Some(id))
+                else {
+                    return Err(ToolError::failed(format!("memória `{id}` não existe")));
+                };
+                // Exclusão lógica: a linha permanece no diário, apenas marcada.
+                memory["forgotten"] = json!(true);
+                memory["ts"] = json!(now_secs());
+                let updated = memory.clone();
+                write_all(&memories)?;
+                let _ = friday_brain::index_all();
+                Ok(json!({ "ok": true, "memory": updated }))
+            }
             other => Err(ToolError::NotFound(other.to_string())),
         }
     }
@@ -410,6 +496,17 @@ pub fn register(registry: &mut Registry) {
     registry.add(tool(
         "memory_delete",
         "Apaga uma memória pelo id.",
+        crate::policy::Risk::Sensitive,
+        json!({
+            "type": "object",
+            "required": ["id"],
+            "additionalProperties": false,
+            "properties": { "id": { "type": "string" } }
+        }),
+    ));
+    registry.add(tool(
+        "memory_forget",
+        "Marca uma memória como esquecida (exclusão lógica; a linha permanece no diário) e reindexa o grafo.",
         crate::policy::Risk::Sensitive,
         json!({
             "type": "object",
