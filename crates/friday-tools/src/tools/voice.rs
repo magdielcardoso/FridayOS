@@ -32,7 +32,19 @@ use crate::registry::{Registry, Tool, ToolCtx, ToolError, ToolResult, ToolSpec};
 /// the input volume is 20 or 100. These are only fallbacks/caps.
 pub const SPEECH_THRESHOLD: f32 = 0.012;
 /// RMS above this while Friday is speaking triggers barge-in.
-pub const BARGE_THRESHOLD: f32 = 0.10;
+///
+/// With AEC active (the default) Friday's own voice is cancelled from the mic
+/// before the VAD sees it, so the gate can be low enough to catch a normal
+/// speaking voice. The dynamic `echo_ref * factor` bar still protects against
+/// echo when AEC is unavailable. Tunable via `FRIDAY_BARGE_THRESHOLD`.
+pub fn barge_threshold() -> f32 {
+    std::env::var("FRIDAY_BARGE_THRESHOLD")
+        .ok()
+        .and_then(|value| value.parse::<f32>().ok())
+        .map(|value| value.clamp(0.01, 0.5))
+        .unwrap_or(0.045)
+}
+pub const BARGE_THRESHOLD: f32 = 0.045;
 /// Set when audible playback actually starts. The capture loop consumes it to
 /// restart the echo grace period there — not at first token, when synthesis
 /// still needs ~1 s and the grace would already be half spent.
@@ -561,15 +573,21 @@ impl VadState {
             // Her own voice through the speakers sets the reference. A real
             // interruption has to be clearly louder than the echo we measured.
             let echo_bar = (self.echo_ref * 1.3).min(0.95);
-            let barge_gate = BARGE_THRESHOLD.max(echo_bar);
+            let barge_gate = barge_threshold().max(echo_bar);
             if rms >= barge_gate {
                 self.barge_run += 1;
             } else {
                 self.barge_run = 0;
             }
-            // ~2 s grace from the first audible sample, then two loud frames in
-            // a row (~0.5 s) so a transient cannot cut her sentence.
-            if self.speaking_frames > 8 && self.barge_run >= 2 {
+            // Short grace from the first audible sample (AEC already removed her
+            // voice), then two loud frames in a row so a transient cannot cut
+            // her sentence. Tunable via FRIDAY_BARGE_GRACE_FRAMES.
+            let grace = std::env::var("FRIDAY_BARGE_GRACE_FRAMES")
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok())
+                .map(|value| value.clamp(1, 40))
+                .unwrap_or(3);
+            if self.speaking_frames > grace && self.barge_run >= 2 {
                 if !self.barge_sent {
                     self.barge_sent = true;
                     // Start capturing right away: the words that interrupted

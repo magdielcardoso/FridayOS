@@ -158,6 +158,9 @@ pub fn play(path: &Path) -> Result<(), String> {
         return Err(format!("arquivo de áudio não encontrado: {}", path.display()));
     }
     let command = format!("play {}", path.display());
+    // Reset the barge-in echo grace exactly when audible playback is about to
+    // start, not at first token (synthesis adds ~1 s of silence).
+    crate::tools::voice::mark_audible_playback();
     // Respawn once on a dead helper (device change / AVAudioEngine error).
     for attempt in 0..2 {
         let result = (|| -> Result<(), String> {

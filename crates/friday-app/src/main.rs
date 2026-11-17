@@ -2099,6 +2099,25 @@ impl FridayApp {
                 continue;
             }
             self.agent_running = kind != "done" && kind != "error";
+            // Delegation updates must reach the agent already in progress as
+            // barge-in guidance, not wait in `external_pending` until Done.
+            // Only actionable kinds steer; heartbeat/status noise stays in the
+            // monitor. When no turn is running, queue normally for the next one.
+            let actionable = matches!(kind.as_str(), "finding" | "done" | "error");
+            if actionable && (self.status == Status::Thinking || self.turn_started.is_some()) {
+                let guidance = format!("[delegação:{}] {}", kind, text);
+                if let Some(codex) = self.codex.as_ref() {
+                    codex.steer(guidance.clone());
+                }
+                self.messages.push(Line {
+                    role: Role::User,
+                    text: guidance,
+                });
+                self.push_activity("delegação · orientação enviada ao turno", StepState::Completed);
+            } else if actionable {
+                self.external_pending
+                    .push_back(("delegação".into(), format!("[{kind}] {text}")));
+            }
             self.agent_log.push((kind, text));
         }
         if self.agent_log.len() > 200 {
