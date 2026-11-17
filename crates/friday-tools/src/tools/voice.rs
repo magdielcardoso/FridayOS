@@ -49,6 +49,14 @@ pub const BARGE_THRESHOLD: f32 = 0.045;
 /// restart the echo grace period there — not at first token, when synthesis
 /// still needs ~1 s and the grace would already be half spent.
 static ECHO_RESET: AtomicBool = AtomicBool::new(false);
+/// Set when capture runs through AVAudioEngine voice processing. In that case
+/// Friday's voice is already cancelled, so user speech during playback is
+/// captured normally (full-duplex / double-talk) instead of being gated out.
+static AEC_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+pub fn aec_active() -> bool {
+    AEC_ACTIVE.load(Ordering::Relaxed)
+}
 
 /// Restarts the echo grace period. Call it when the first audible sample is
 /// about to play, so Friday's own voice through the speakers is not mistaken
@@ -256,6 +264,7 @@ pub fn start_aec() -> Result<VoiceHandle, String> {
             .unwrap_or(0)
     ));
     crate::voice_engine::start_stream(&raw)?;
+    AEC_ACTIVE.store(true, Ordering::Relaxed);
     let join = thread::Builder::new()
         .name("friday-voice-aec".into())
         .spawn(move || {
@@ -293,6 +302,7 @@ pub fn start_aec() -> Result<VoiceHandle, String> {
                 thread::sleep(Duration::from_millis(20));
             }
             let _ = crate::voice_engine::stop_stream();
+            AEC_ACTIVE.store(false, Ordering::Relaxed);
             let _ = std::fs::remove_file(&raw);
         })
         .map_err(|error| format!("aec voice thread: {error}"))?;
@@ -554,7 +564,7 @@ impl VadState {
         // While Friday speaks, the microphone also hears her. Never treat that
         // as an utterance: only a much louder voice after a short grace period
         // counts as barge-in, so she never transcribes her own tail.
-        if speaking && !self.barge_capturing {
+        if speaking && !self.barge_capturing && !aec_active() {
             // Audible playback just (re)started: the echo grace restarts here,
             // where the speakers actually make sound — not at first token.
             if ECHO_RESET.swap(false, Ordering::Relaxed) {
@@ -610,6 +620,16 @@ impl VadState {
         }
         if !speaking {
             self.speaking_frames = 0;
+        }
+
+        // Full-duplex barge-in: with AEC, a normal voiced frame while Friday is
+        // speaking is the start of a user turn. Notify immediately; the frames
+        // continue into the normal capture path below so STT gets the words.
+        if speaking && !self.barge_capturing && aec_active() && rms >= gate {
+            if !self.barge_sent {
+                self.barge_sent = true;
+                let _ = tx.send(VoiceEvent::BargeIn);
+            }
         }
 
         // Hysteresis: while already in a sentence, quieter trailing syllables
