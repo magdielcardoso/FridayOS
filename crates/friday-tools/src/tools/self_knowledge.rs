@@ -424,7 +424,7 @@ impl Tool for ToolSpecified {
                         "autonomy": autonomy,
                         "missions": missions,
                         "voice": "Piper Dii (local)",
-                        "reasoning": "Codex (gpt-6-luna)",
+                        "reasoning": "Codex (gpt-6.1-terra, low)",
                     },
                 }))
             }

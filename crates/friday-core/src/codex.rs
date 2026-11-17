@@ -1311,7 +1311,7 @@ pub fn prepare_isolated_home(mcp_command: Option<&std::path::Path>) -> std::io::
     #[cfg(not(unix))]
     std::fs::copy(&auth, &link)?;
 
-    let model = std::env::var("FRIDAY_MODEL").unwrap_or_else(|_| "gpt-6-luna".into());
+    let model = std::env::var("FRIDAY_MODEL").unwrap_or_else(|_| "gpt-6.1-terra".into());
     let mut config = format!(
         "model = \"{model}\"\n\
          model_reasoning_effort = \"low\"\n\
