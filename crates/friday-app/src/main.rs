@@ -516,9 +516,11 @@ impl FridayApp {
             warming: false,
             prewarmed: false,
             last_activity: std::time::Instant::now(),
+            // One TTS request for the whole answer preserves intonation.
+            // Opt in to early chunking with FRIDAY_TTS_MODE=stream.
             tts_stream: std::env::var("FRIDAY_TTS_MODE")
-                .map(|mode| mode != "single")
-                .unwrap_or(true),
+                .map(|mode| mode == "stream")
+                .unwrap_or(false),
             speaking_since: None,
             wake: false,
             wake_flag: None,
@@ -886,29 +888,22 @@ impl FridayApp {
             self.begin_speech(cx);
         }
         self.speech_pending.push_str(delta);
-        let sentences = take_sentences_with(&mut self.speech_pending, 24);
-        if let Some(tx) = self.speech_tx.as_ref() {
-            for sentence in sentences {
-                // Punctuation-only chunks ("!", "…") have nothing to say and
-                // used to consume a whole TTS request each.
-                if !speakable(&sentence) {
-                    continue;
-                }
-                // One request starts the voice immediately; everything else is
-                // batched to respect ChatGPT's hourly TTS request limit.
-                if !self.speech_sent_first {
-                    self.speech_sent_first = true;
-                    let mut sentence = sentence;
-                    if std::env::var("FRIDAY_SIGNATURE").map(|value| value != "0").unwrap_or(true)
-                        && !sentence.trim_start().to_lowercase().starts_with("senhor")
-                    {
-                        sentence = format!("Senhor. {sentence}");
-                    }
-                    let _ = tx.send(sentence);
-                } else {
-                    self.speech_batch.push_str(&sentence);
-                    self.speech_batch.push(' ');
-                }
+        // Wait for a real sentence boundary before speaking. Sending a clause
+        // early produced two separate TTS requests ("... até o ponto" + resto),
+        // each with its own intonation. One complete sentence request preserves
+        // the model's prosody end-to-end.
+        let ready = take_complete_sentences(&mut self.speech_pending);
+        if !ready.is_empty() {
+            let mut combined = ready.join(" ");
+            if !self.speech_sent_first
+                && std::env::var("FRIDAY_SIGNATURE").map(|value| value != "0").unwrap_or(true)
+                && !combined.trim_start().to_lowercase().starts_with("senhor")
+            {
+                combined = format!("Senhor. {combined}");
+            }
+            if let Some(tx) = self.speech_tx.as_ref() {
+                let _ = tx.send(combined);
+                self.speech_sent_first = true;
             }
         }
     }
@@ -935,34 +930,17 @@ impl FridayApp {
         }
 
         let rest = self.speech_pending.trim().to_string();
-        if !rest.is_empty() && speakable(&rest) {
-            if !self.speech_sent_first {
-                self.speech_sent_first = true;
-                if let Some(tx) = self.speech_tx.as_ref() {
-                    let _ = tx.send(rest);
-                }
-            } else {
-                self.speech_batch.push_str(&rest);
+        if speakable(&rest) {
+            let mut text = rest;
+            if !self.speech_sent_first
+                && std::env::var("FRIDAY_SIGNATURE").map(|value| value != "0").unwrap_or(true)
+                && !text.trim_start().to_lowercase().starts_with("senhor")
+            {
+                text = format!("Senhor. {text}");
             }
-        }
-        let mut batch = self.speech_batch.trim().to_string();
-        let long_turn = self
-            .turn_started
-            .map(|started| started.elapsed() > Duration::from_secs(8))
-            .unwrap_or(false);
-        if long_turn
-            && std::env::var("FRIDAY_SIGNATURE").map(|value| value != "0").unwrap_or(true)
-        {
-            if !batch.is_empty() {
-                batch.push_str(" À disposição.");
-            } else if speakable(&self.stream) {
-                // No batch? the whole answer was one chunk; append as a new one.
-                let _ = self.speech_tx.as_ref().map(|tx| tx.send("À disposição.".to_string()));
-            }
-        }
-        if speakable(&batch) {
             if let Some(tx) = self.speech_tx.as_ref() {
-                let _ = tx.send(batch);
+                let _ = tx.send(text);
+                self.speech_sent_first = true;
             }
         }
         self.speech_batch.clear();
@@ -3576,6 +3554,36 @@ fn decision_path() -> std::path::PathBuf {
 /// A chunk is worth a TTS request only if it carries letters or digits.
 fn speakable(text: &str) -> bool {
     text.chars().any(|ch| ch.is_alphanumeric())
+}
+
+/// Pulls out complete sentences (ending in `.`, `!`, `?`, `…`). Unlike the old
+/// clause flusher this never cuts mid-sentence, so TTS gets one natural unit.
+fn take_complete_sentences(buffer: &mut String) -> Vec<String> {
+    let mut out = Vec::new();
+    loop {
+        let mut cut = None;
+        for (index, ch) in buffer.char_indices() {
+            if matches!(ch, '.' | '!' | '?' | '…') {
+                let after = index + ch.len_utf8();
+                let rest = &buffer[after..];
+                if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+                    cut = Some(after);
+                    break;
+                }
+            }
+        }
+        match cut {
+            Some(at) if at > 0 => {
+                let sentence = buffer[..at].trim().to_string();
+                buffer.replace_range(..at, "");
+                if speakable(&sentence) {
+                    out.push(sentence);
+                }
+            }
+            _ => break,
+        }
+    }
+    out
 }
 
 fn take_sentences(buffer: &mut String) -> Vec<String> {
