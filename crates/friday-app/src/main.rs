@@ -2799,6 +2799,41 @@ impl Render for FridayApp {
                     .items_center()
                     .child(corner_wave),
             )
+            // Live transcription of the user's speech, directly under the
+            // waveform in the top-right corner. Fixed red, no blink, no colour
+            // changes. Only visible when there is a recent transcript.
+            .when(!self.transcript.trim().is_empty(), |root| {
+                let text: String = self.transcript.chars().take(180).collect();
+                root.child(
+                    div()
+                        .absolute()
+                        .right(lx(28.0))
+                        .top(ly(84.0))
+                        .w(sx(320.0))
+                        .flex()
+                        .flex_col()
+                        .gap(sx(4.0))
+                        .p(sx(10.0))
+                        .border_1()
+                        .border_color(rgb(0x3b0d0d))
+                        .rounded(sx(8.0))
+                        .bg(rgba(0x080608f0))
+                        .child(
+                            div()
+                                .font_family("SF Mono")
+                                .text_size(sx(8.0))
+                                .text_color(rgb(0x7a1a1a))
+                                .child(SharedString::from("VOCÊ · TRANSCRIÇÃO")),
+                        )
+                        .child(
+                            div()
+                                .font_family("SF Mono")
+                                .text_size(sx(11.0))
+                                .text_color(rgb(RED))
+                                .child(SharedString::from(text)),
+                        ),
+                )
+            })
             // Transient command line (only while typing, no permanent field)
             .when(!self.input.is_empty() || self.assistant_selected.is_some(), |root| {
                 root.child(
