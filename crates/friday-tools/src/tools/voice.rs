@@ -72,22 +72,22 @@ pub fn mark_audible_playback() {
     ECHO_RESET.store(true, Ordering::Relaxed);
 }
 /// Silence that ends a short command (~0.75 s).
-pub const SHORT_HANGOVER_FRAMES: u32 = 3;
+pub const SHORT_HANGOVER_FRAMES: u32 = 4;
 /// Silence that ends a long thought (~1.5 s), where natural pauses are common.
-pub const LONG_HANGOVER_FRAMES: u32 = 6;
+pub const LONG_HANGOVER_FRAMES: u32 = 8;
 /// Utterances longer than this get the long hangover (~2 s of speech).
 pub const LONG_UTTERANCE_FRAMES: usize = 8;
 /// Kept for compatibility with callers that referenced the old constant.
 pub const SILENCE_FRAMES_TO_END: u32 = SHORT_HANGOVER_FRAMES;
 /// Hard cap on an utterance (~8 s). Longer clips make the on-device
 /// recognizer silently return no text and were almost always speaker echo.
-pub const MAX_FRAMES: usize = 24;
+pub const MAX_FRAMES: usize = 40;
 /// A barge-in turn must get its final transcript back fast, so it closes after
 /// only two silent frames (~0.5 s) instead of the normal hangover.
 pub const BARGE_HANGOVER_FRAMES: u32 = 2;
 /// ~4 s cap for a barge-in utterance, so the user is not kept waiting while
 /// Friday is still talking and STT cannot start on the final WAV.
-pub const BARGE_MAX_FRAMES: usize = 16;
+pub const BARGE_MAX_FRAMES: usize = 32;
 /// Samples per VAD frame.
 pub const FRAME_SIZE: usize = 4096;
 /// Rate we hand to the STT layer.

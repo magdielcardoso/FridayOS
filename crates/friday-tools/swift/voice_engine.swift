@@ -93,6 +93,7 @@ final class VoiceEngineHost {
     let resampler = LinearResampler()
 
     var voiceProcessing = false
+    var voiceProcessingConfigured = false
     var voiceProcessingNote = "not-initialized"
     var capturePath: String?
     var pcm = Data()
@@ -110,27 +111,22 @@ final class VoiceEngineHost {
     }
 
     func prepare() throws {
+        // Keep ONE engine for the whole helper lifetime. Rebuilding it after
+        // every playback kills the capture tap and truncates utterances.
+        // Voice processing stays configured once; we only restart the engine
+        // if the OS actually stopped it (device change / interruption).
         if !started {
-            // Never rebuild while a capture tap is live: removing the engine
-            // under an active tap caused AVAudioEngine error -66784 and killed
-            // the helper. Stop the tap first, then rebuild for the new device.
-            if tapInstalled {
-                engine.inputNode.removeTap(onBus: 0)
-                tapInstalled = false
-            }
-            if engine.isRunning { engine.stop() }
-            engine = AVAudioEngine()
-            player = AVAudioPlayerNode()
-            engine.attach(player)
-            engine.connect(player, to: engine.mainMixerNode, format: nil)
             if #available(macOS 10.15, *) {
-                do {
-                    try engine.inputNode.setVoiceProcessingEnabled(true)
-                    voiceProcessing = true
-                    voiceProcessingNote = "enabled"
-                } catch {
-                    voiceProcessing = false
-                    voiceProcessingNote = "unavailable: \(error.localizedDescription)"
+                if !voiceProcessingConfigured {
+                    do {
+                        try engine.inputNode.setVoiceProcessingEnabled(true)
+                        voiceProcessing = true
+                        voiceProcessingNote = "enabled"
+                        voiceProcessingConfigured = true
+                    } catch {
+                        voiceProcessing = false
+                        voiceProcessingNote = "unavailable: \(error.localizedDescription)"
+                    }
                 }
             } else {
                 voiceProcessing = false
