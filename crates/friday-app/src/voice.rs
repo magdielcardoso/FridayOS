@@ -544,9 +544,24 @@ fn play_wav(path: &Path, cancel: &AtomicBool) -> Result<(), String> {
                 }
                 set_speech_level(0.0);
             });
-            let mut command = Command::new("/usr/bin/afplay");
-            command.arg(path);
-            let result = run_playback(&mut command, cancel);
+            // Route playback through the SAME AVAudioEngine as the AEC capture.
+            // This gives the voice processor the far-end reference it needs.
+            let aec = std::env::var("FRIDAY_AEC").map(|v| v != "0").unwrap_or(true);
+            let result = if aec {
+                match friday_tools::voice_engine::play(path) {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        vlog(format!("AEC play falhou ({error}); usando afplay"));
+                        let mut command = Command::new("/usr/bin/afplay");
+                        command.arg(path);
+                        run_playback(&mut command, cancel)
+                    }
+                }
+            } else {
+                let mut command = Command::new("/usr/bin/afplay");
+                command.arg(path);
+                run_playback(&mut command, cancel)
+            };
             stop.store(true, Ordering::Relaxed);
             set_speech_level(0.0);
             return result;
@@ -1173,14 +1188,23 @@ fn synthesize_file(
         }
         e.to_string()
     })?;
-    let samples: Vec<i16> = pcm
-        .mono_f32()
+    let mono = pcm.mono_f32();
+    let peak = mono.iter().fold(0.0f32, |acc, s| acc.max(s.abs()));
+    // Bring quiet TTS up to ~-1 dBFS. Never amplify silence or push loud
+    // clips past full scale (that would distort the voice).
+    let gain = if peak > 0.001 && peak < 0.90 {
+        (0.89 / peak).min(4.0)
+    } else {
+        1.0
+    };
+    let samples: Vec<i16> = mono
         .iter()
-        .map(|s| (s.clamp(-1.0, 1.0) * 32_767.0).round() as i16)
+        .map(|s| ((s * gain).clamp(-1.0, 1.0) * 32_767.0).round() as i16)
         .collect();
     if samples.is_empty() {
         return Err("áudio vazio".into());
     }
+    vlog(format!("tts: pico {peak:.3} · ganho {gain:.2}"));
     let bytes = encode_pcm16_wav(&samples, pcm.sample_rate.max(8_000));
     let path = temp_audio_path();
     std::fs::write(&path, &bytes).map_err(|e| format!("não foi possível gravar o áudio: {e}"))?;
