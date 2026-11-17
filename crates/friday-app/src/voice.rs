@@ -309,6 +309,7 @@ pub fn piper_ready() -> bool {
 /// Synthesizes WAV with Piper. `rate` is a multiplier around 1.0; Piper's
 /// `length_scale` is inverse (higher = slower), so it is inverted here.
 fn synthesize_piper(text: &str, rate: f32) -> Result<PathBuf, String> {
+    let started = std::time::Instant::now();
     let python = piper_python();
     let model = piper_model();
     let rate = rate.clamp(0.7, 1.4);
@@ -317,6 +318,12 @@ fn synthesize_piper(text: &str, rate: f32) -> Result<PathBuf, String> {
         std::process::id(),
         stamp()
     ));
+    let input = temp_dir().join(format!(
+        "piper-input-{}-{}.txt",
+        std::process::id(),
+        stamp()
+    ));
+    std::fs::write(&input, text).map_err(|error| format!("piper: {error}"))?;
     let status = Command::new(python)
         .arg("-m")
         .arg("piper")
@@ -324,18 +331,26 @@ fn synthesize_piper(text: &str, rate: f32) -> Result<PathBuf, String> {
         .arg(model)
         .arg("-f")
         .arg(&out)
+        .arg("-i")
+        .arg(&input)
         .arg("--length-scale")
         .arg((1.0 / rate).to_string())
         .arg("--sentence-silence")
         .arg("0.15")
-        .stdin(std::process::Stdio::piped())
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .map_err(|error| format!("piper: {error}"))?;
+    let _ = std::fs::remove_file(&input);
     if !status.success() || !out.is_file() {
         return Err("piper falhou ao sintetizar".to_string());
     }
+    vlog(format!(
+        "piper: sintetizado {}ms · {}",
+        started.elapsed().as_millis(),
+        &text.chars().take(40).collect::<String>()
+    ));
     Ok(out)
 }
 
