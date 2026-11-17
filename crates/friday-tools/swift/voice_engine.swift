@@ -408,7 +408,11 @@ func cmdPlay(_ path: String) {
         applyFade(buffer, sampleRate: file.processingFormat.sampleRate)
 
         host.player.stop()
-        host.player.volume = 1.0
+        // AVAudioEngine's voice-processing path applies its own gain to the
+        // far-end signal; a little headroom compensation keeps the voice at
+        // the same level as afplay had before AEC was introduced.
+        let gain = Float(min(max(Double(ProcessInfo.processInfo.environment["FRIDAY_AEC_GAIN"] ?? "1.8") ?? 1.8, 1.0), 4.0))
+        host.player.volume = gain
 
         let doneLock = NSLock()
         var finished = false
