@@ -743,9 +743,17 @@ fn normalize_for_stt(bytes: &[u8]) -> Result<Vec<u8>, String> {
         resample_linear(&mono, rate, 16_000)
     };
 
+    // Normalise to ~-3 dBFS so the on-device recogniser receives a strong
+    // signal even when the user speaks quietly. Silence stays silence.
+    let peak = samples.iter().fold(0.0f32, |acc, s| acc.max(s.abs()));
+    let gain = if peak > 0.01 && peak < 0.70 {
+        (0.68 / peak).min(6.0)
+    } else {
+        1.0
+    };
     let pcm16: Vec<i16> = samples
         .iter()
-        .map(|s| (s.clamp(-1.0, 1.0) * 32_767.0).round() as i16)
+        .map(|s| ((s * gain).clamp(-1.0, 1.0) * 32_767.0).round() as i16)
         .collect();
     if pcm16.is_empty() {
         return Err("o áudio ficou vazio após a conversão".to_string());

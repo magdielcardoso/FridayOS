@@ -111,15 +111,18 @@ final class VoiceEngineHost {
 
     func prepare() throws {
         if !started {
-            // AVAudioEngine voice processing (-66784) fails intermittently when
-            // the default output device changes (headphones <-> speakers).
-            // Rebuild the engine so the AEC graph matches the current device.
+            // Never rebuild while a capture tap is live: removing the engine
+            // under an active tap caused AVAudioEngine error -66784 and killed
+            // the helper. Stop the tap first, then rebuild for the new device.
+            if tapInstalled {
+                engine.inputNode.removeTap(onBus: 0)
+                tapInstalled = false
+            }
             if engine.isRunning { engine.stop() }
             engine = AVAudioEngine()
             player = AVAudioPlayerNode()
             engine.attach(player)
             engine.connect(player, to: engine.mainMixerNode, format: nil)
-            tapInstalled = false
             if #available(macOS 10.15, *) {
                 do {
                     try engine.inputNode.setVoiceProcessingEnabled(true)
